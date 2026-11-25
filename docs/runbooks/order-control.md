@@ -45,13 +45,16 @@ Build in a fresh clone of this repository, checked out at the Core `<commit>` wh
 where `git status --porcelain --ignored` prints nothing. The build reads `docker/Dockerfile.order-control` and
 copies `tasksets/` from its context, the clone's working tree, not from `<commit>`: a changed, untracked or ignored
 file there (a `build/` or `*.egg-info` that an earlier install left in a taskset) would go into the image, and
-`.build-revision` (below) would not show it.
+`.build-revision` (below) would not show it. The four commands are joined by `&&`, so that none runs after one that
+fails: run one by one, a failed clone (into a directory that already exists, say) would leave
+`git checkout --detach` to run in another repository, that directory's or the one the shell is in, and detach its
+HEAD.
 
 ```bash
-git clone https://github.com/reliquadotai/reliquary.git <new directory>
-cd <new directory>
-git checkout --detach <commit>
-git status --porcelain --ignored
+git clone https://github.com/reliquadotai/reliquary.git <new directory> &&
+  cd <new directory> &&
+  git checkout --detach <commit> &&
+  git status --porcelain --ignored
 ```
 
 Then, in that clone, `docker buildx imagetools inspect` prints the Digest of the base, the validator image the
@@ -61,7 +64,7 @@ of the image to check and to switch to:
 ```bash
 docker buildx imagetools inspect \
   "ghcr.io/reliquadotai/reliquary-validator:sha-$(git rev-parse <commit> | cut -c1-7)-logic"
-docker build -f docker/Dockerfile.order-control \
+docker build -f docker/Dockerfile.order-control --progress=plain \
   --build-arg BASE_IMAGE=ghcr.io/reliquadotai/reliquary-validator@sha256:<that digest> \
   --build-context envs=<directory holding exactly the four reviewed wheels> \
   -t <registry>/<repository>:<tag> . &&
@@ -70,9 +73,18 @@ docker build -f docker/Dockerfile.order-control \
 
 The build needs network to github.com (the `git+` installs); `ENVS`, `TELECOM_ENVS` and `SBX` are build args. Keep
 the build and the push joined by `&&`: run as two commands, a failed build leaves the tag on the image an earlier
-build gave it, and the push publishes that image, prints its digest and ends 0. Put no comment after a command in
-these blocks: zsh leaves `interactivecomments` off by default, so it passes `#` and the words after it to the
-command as arguments, and `docker push` and `imagetools inspect` each take exactly one name.
+build gave it, and the push publishes that image, prints its digest and ends 0. Joined, the push having run is the
+proof that the build passed its two checks, `reliquary corpus order-control-check` and the episodes check (which
+prints `ORDER_CONTROL_EPISODES_OK`): each is a `RUN` step, and a step that fails fails the build. So pipe nothing
+out of the build before that `&&`: in `docker build ... 2>&1 | tee build.log && docker push ...` the `&&` reads the
+status of `tee`, and a failed build still pushes. To keep a copy that way, run `set -o pipefail` first (bash or
+zsh), which makes the pipeline fail with the build. `--progress=plain` prints the output of each step and leaves it
+on the screen, where the default display on a terminal shows a step's output only while the step runs; a step
+taken from the build cache prints `CACHED` instead, having passed in the build that cached it.
+
+Put no comment in a block of this runbook, after a command or on a line of its own: zsh leaves
+`interactivecomments` off by default, so it passes `#` and the words after it to the command as arguments
+(`docker push` and `imagetools inspect` each take exactly one name), and runs a comment line as a command named `#`.
 
 The validator image workflow (`.github/workflows/docker-image.yml`) tags each build that includes Logic
 `sha-<the commit's first 7 characters>-logic` (`${GITHUB_SHA::7}`): `git rev-parse <commit> | cut -c1-7` prints
@@ -123,8 +135,10 @@ as one-shot containers that replace its entrypoint with `python` or `cat`, start
 (`--rm`) and are given no setting but the bucket variables of `$R2_ENV` (step 2); the running admin is checked
 with `docker exec`. The one exception is in step 3, on a non-production host.
 
-1. **The build's checks.** Keep the build's output: `reliquary corpus order-control-check` passes, including
-   `rl_environments`, and the episodes check prints `ORDER_CONTROL_EPISODES_OK`. Then, in the pushed image:
+1. **The build's checks.** The push ran: the Image block's `&&` runs it only after a build that passed both checks,
+   `reliquary corpus order-control-check` (its report, `rl_environments` included, is in the build's output) and
+   the episodes check, which prints `ORDER_CONTROL_EPISODES_OK` (a step taken from the build cache prints `CACHED`
+   instead: it passed in the build that cached it). Then, in the pushed image:
    ```bash
    docker run --rm --network none --entrypoint cat "$IMG" /opt/reliquary/.build-revision
    docker run --rm --network none --entrypoint python "$IMG" -m pip check
@@ -197,11 +211,11 @@ with `docker exec`. The one exception is in step 3, on a non-production host.
      suggestion, not a measured need. A scoring child killed for lack of memory reads
      `grader_error: BrokenProcessPool: ...` (after one retry in a fresh child), and a script killed for it ends
      the container with exit status 137. Rerun with more memory before concluding anything.
-   - **What this container lacks.** GPQA (`verifiers-gpqa-ab6f143e1-r0-n198`) and HLE-Diamond
-     (`hle_diamond_text_det`) read gated Hub datasets with the `HF_TOKEN` of an account each dataset admits.
-     GPQA's taskset (research-environments `f2e0d709`, `gpqa/taskset.py`) loads `Idavidrein/gpqa` and the image
-     holds no copy, so here its row reads `grader_error: DatasetNotFoundError: Dataset 'Idavidrein/gpqa' is a
-     gated dataset on the Hub. ...`. A LiveCodeBench or SciCode program runs in a grading service, reached
+   - **What this container lacks.** The GPQA and HLE-Diamond tasksets (`gpqa` and `hle_diamond_text_det`) read
+     gated Hub datasets with the `HF_TOKEN` of an account each dataset admits. GPQA's (research-environments
+     `f2e0d709`, `gpqa/taskset.py`) loads `Idavidrein/gpqa` and the image holds no copy, so here the row of its set
+     (`verifiers-gpqa-ab6f143e1-r0-n198`) reads `grader_error: DatasetNotFoundError: Dataset 'Idavidrein/gpqa' is
+     a gated dataset on the Hub. ...`. A LiveCodeBench or SciCode program runs in a grading service, reached
      through a socket mount and its variable ("Code-execution grading" and "SciCode" below). This container has
      neither, so these `grader_error`s never mean that the set does not grade: never withdraw a set for one.
      Grade their row on a non-production host instead, which holds none of the admin's settings: start the
@@ -238,29 +252,73 @@ with `docker exec`. The one exception is in step 3, on a non-production host.
    stamp) or back to one (which never reads the kept stamp) still ends in `export_timeout`. Nor does it cover
    shard bytes that change for another reason: a void between the two attempts, or another output layout or
    pyarrow version (Parquet shards) in the new image.
+
+   The admin also exports the platform's subnet task runs (delivery `subnet-<run id>`, `worker/subnet-tasks.ts` in
+   reliquary-platform) to the same create-only store, which takes a run's objects only while it is `exporting`, and
+   the next admin starts an interrupted one again too. That export is v2: its Parquet shards carry no stamp, and a
+   restarted one reuses the stamp of a `report.json` already uploaded, but shard bytes that change between the two
+   attempts (a void, another output layout or pyarrow version in the new image) get 409 `delivery_conflict` all the
+   same. So when `SUBNET_TASKS_MODE` is `enabled` in production, or was when a run started (the cron goes on
+   advancing a run already dispatched, whatever the mode), this read-only query must list none too:
+   ```bash
+   pnpm exec wrangler d1 execute reliquary-platform --remote --command "
+     SELECT id, status FROM subnet_task_runs WHERE status = 'exporting'"
+   ```
+   Run the queries immediately before the stop, and again if more than a minute passes before it: the platform's
+   cron runs every minute, and one tick can start an export the queries let through (an `exporting` order waiting
+   for settlement starts its own once its job is final).
 6. **Switch to `$IMG` itself**, the digest every step above checked: never to a tag, nor to another build of the
    same commit. Switch only once you have seen every output below. A check that ends 0 has only run: the seal
    check prints its comparisons and ends 0 whatever they find, and `grade` returns a failing row's detail instead
    of raising, so a one-row grade script that prints it ends 0 too, as does the subshell around either.
-   - Step 1: the build passed `order-control-check` and printed `ORDER_CONTROL_EPISODES_OK`, `.build-revision`
-     is the Core commit you meant, and `pip check` is clean.
+   - Step 1: the push ran, so the build passed both checks, `.build-revision` is the Core commit you meant, and
+     `pip check` is clean.
    - Step 2, in the rebuilt image: a card for every set (no `"card": null`) and, on every sealed card,
      `card_grader_sha256` equal to `grader_sha256_here`, `"grader_ok": true` and `"taskset_ok": true`.
    - Step 3: one row of every single-turn set the platform offers grades (an empty detail or `format_failure`),
      GPQA and HLE-Diamond with a read-only `HF_TOKEN`, LiveCodeBench and SciCode with their grading services,
      these four on the non-production host.
-   - Step 5, just before the admin stops: no single-turn evaluation in flight, and the query lists no order.
+   - Step 5, immediately before the admin stops (again if more than a minute has passed): no single-turn
+     evaluation in flight, and the queries list nothing.
 
    Before the switch, write down the image the old container runs, by its registry digest, and keep that image on
-   the host and in the registry: a rollback starts it again, with the old container's settings.
+   the host and in the registry:
    ```bash
    docker inspect --format '{{.Config.Image}} {{.Image}}' <old container>
    docker image inspect --format '{{json .RepoDigests}}' <the image ID it printed>
    ```
-   Then stop the old container, and only then start one from `$IMG` with its settings: the two never run at once
-   (two admins, or two order controls, on the production bucket and registry). A stopped container keeps its
-   name: rename it, which keeps its settings for a rollback, before giving the new one that name. A rollback is
-   the same switch, back to the digest written down, step 5 included.
+   An image built on the host and never pushed or pulled has no registry digest: `RepoDigests` prints `[]`, or,
+   with the containerd image store, a digest for each name of the image, which no registry holds
+   (`docker buildx imagetools inspect <name>@<digest>` finds none). Then keep its image ID as the record (the
+   second word the first command printed), with the image tagged (`docker tag <image ID> <name>:<tag>`) or pushed
+   first. Either way, the rollback is the old container itself, stopped and renamed at the switch (Switch, below),
+   which holds that image and its settings.
+
+## Switch
+
+Once you have seen every output step 6 lists, switch on the host of the old container, the admin or the order
+control:
+
+1. Stop the old container (the admin within the minute after step 5's queries listed nothing).
+2. Read its restart policy, and write it down:
+   ```bash
+   docker inspect --format '{{json .HostConfig.RestartPolicy}}' <old container>
+   ```
+   Unless its `Name` is `no` (or empty) or `unless-stopped`, set it to `no`:
+   ```bash
+   docker update --restart=no <old container>
+   ```
+   A restart of the Docker daemon (a reboot, an upgrade) starts a stopped container again if its policy is
+   `always`, or `on-failure` and it ended with a non-zero status, as a stop can end it: the old container would
+   then run beside the new one.
+3. A stopped container keeps its name: rename it, which keeps it and its settings for a rollback, and only then
+   start one from `$IMG` with its settings, under that name. The two never run at once (two admins, or two order
+   controls, on the production bucket and registry).
+
+A rollback is the same switch, back: stop the new container as in steps 1 and 2 (step 5's queries first, for the
+admin) and rename it, then give the old one its name back and its restart policy, with
+`docker update --restart=<Name> <old container>` (`on-failure:<MaximumRetryCount>` in place of `<Name>` when that
+count is not 0), and start it again.
 
 ## Run
 
@@ -322,11 +380,12 @@ docker run -d --name eval-grader --restart unless-stopped --init --privileged --
   --network none -v /run/reliquary-grader:/run/reliquary-grader --entrypoint python <admin image> \
   -m reliquary.environment.grader.server --use-runsc \
   --socket /run/reliquary-grader/grader.sock --pool-size 16 --metrics-port 0
-# the admin container: the socket (mode 0660, root) and a persistent Hugging Face cache
-#   -v /run/reliquary-grader:/run/reliquary-grader \
-#   -e RELIQUARY_EVAL_GRADER_SOCKET=/run/reliquary-grader/grader.sock \
-#   -v <disk with ~12 GB free>:/root/.cache/huggingface
 ```
+
+The admin container then gets the socket (mode 0660, root) and a persistent Hugging Face cache, with these among
+its own options: `-v /run/reliquary-grader:/run/reliquary-grader`,
+`-e RELIQUARY_EVAL_GRADER_SOCKET=/run/reliquary-grader/grader.sock` and
+`-v <disk with ~12 GB free>:/root/.cache/huggingface`.
 
 The taskset loads `livecodebench/code_generation_lite` (v6, ~4.5 GB, plus its Arrow cache) the first time a
 grading opens it. Without the sidecar, rows grade as `grader_error` (`unreachable`), never as wrong answers.
@@ -342,14 +401,19 @@ one per step position (1..15 on the test split), each built from the graded answ
 from that grading, publishes it to the subnet bucket and answers its id and prompt lengths; the last position
 graded, `combine` with `"chain": "scicode-steps"` adds the main-problem and sub-step rates to the report.
 
-Only the first position is published by hand, once (it is the catalog set):
+Only the first position is published by hand, once (it is the catalog set). `build-set` makes
+`verifiers-scicode-steps-a024c0a1e-r0-n64` (64 problems, prompts_sha256 `b8dda24b...7410`), and `publish-set`
+publishes it to the subnet bucket, which the jobs and the grading read:
 
 ```bash
 echo '{"split": "test", "step": 1, "previous": {}}' > args-1.json
 reliquary eval build-set verifiers:scicode-steps --out sets/scicode-p1 --taskset-args @args-1.json
-# verifiers-scicode-steps-a024c0a1e-r0-n64, 64 problems, prompts_sha256 b8dda24b...7410
-reliquary eval publish-set sets/scicode-p1          # subnet bucket (the jobs and the grading read it)
-# The platform copy (verifyOrderSets): prompts.jsonl and a public set.json with `order`
+reliquary eval publish-set sets/scicode-p1
+```
+
+Then the platform copy, which `verifyOrderSets` reads: `prompts.jsonl` and a public `set.json` with `order`,
+
+```bash
 python - <<'PY'
 import asyncio, json, pathlib
 from reliquary.eval.storage import PlatformEvalStore, platform_key
@@ -370,10 +434,11 @@ Its tests need numpy/scipy/sympy/h5py and the 1 GB reference targets, so its pro
 service whose sandbox root is the SciCode grading image (`docker/scicode-grader`, stored by digest in the
 Hippius registry, bucket `reliquary-task-images`, `reliquary/scicode-grader@sha256:484ab5f18a608c5a7568f2afcc145458d6e02f08632ba9fb0d46d831dc498488`,
 0.57 GB; the raw targets file is `datasets/scicode/test_data-48b0272a88b1.h5` in the same bucket). Pull it through a
-local `registry:2.8.3` on that bucket (the settings of the image mirror runbook). On the eval host:
+local `registry:2.8.3` on that bucket (the settings of the image mirror runbook). On the eval host, build the
+bundle (the image's filesystem as the rootfs, with this checkout's worker and bundle config), then start the
+service:
 
 ```bash
-# the bundle: the image's filesystem as the rootfs, this checkout's worker and bundle config
 sudo install -d /opt/scicode-bundle
 sudo install -m 0644 docker/scicode-grader/bundle-config.json /opt/scicode-bundle/config.json
 sudo BUNDLE_DIR=/opt/scicode-bundle WORKER_SRC=reliquary/environment/grader/worker.py \
@@ -384,10 +449,11 @@ docker run -d --name eval-grader-scicode --restart unless-stopped --init --privi
   -v /opt/scicode-bundle:/opt/scicode-bundle:ro -e GRADER_BUNDLE_PATH=/opt/scicode-bundle \
   --entrypoint python <admin image> -m reliquary.environment.grader.server --use-runsc \
   --socket /run/reliquary-grader-scicode/grader.sock --pool-size 16 --metrics-port 0 --stdio-max-seconds 600
-# the admin container:
-#   -v /run/reliquary-grader-scicode:/run/reliquary-grader-scicode \
-#   -e RELIQUARY_EVAL_SCICODE_GRADER_SOCKET=/run/reliquary-grader-scicode/grader.sock
 ```
+
+The admin container then gets, among its own options,
+`-v /run/reliquary-grader-scicode:/run/reliquary-grader-scicode` and
+`-e RELIQUARY_EVAL_SCICODE_GRADER_SOCKET=/run/reliquary-grader-scicode/grader.sock`.
 
 A step has 300 s of wall clock (upstream: 1800 s) and 8 GiB of address space (10.11's reference needs ~4), one
 BLAS thread: size `--pool-size` to the host's memory. Without
