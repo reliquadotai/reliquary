@@ -10,14 +10,18 @@ In a rebuilt image, before switching to it, run it only in a one-shot container 
 starts no service and is given nothing but ``R2_ENV``: a mode-600 file holding exactly what the ``grep`` below
 keeps, of the six variables ``R2_ACCOUNT_ID``, ``R2_ACCESS_KEY_ID``, ``R2_SECRET_ACCESS_KEY``, ``R2_BUCKET_ID``,
 ``R2_ENDPOINT_URL`` and ``R2_REGION`` those the admin sets, and never an ``R2_PUBLIC_*`` one. It is created right
-before the check, and the traps remove it on exit, interrupted or not. That ``grep`` copies the admin's own keys, so
-it runs on the admin's host only; anywhere else, write the same variables by hand, and the keys must be those of an
-R2 token that can only read the bucket. ``IMG`` is the rebuilt image by the digest its one push printed, the image
-the switch then runs::
+before the check, and the ``EXIT`` trap removes it, interrupted or not: the ``INT``, ``TERM`` and ``HUP`` traps make
+the shell run it on an interrupt and end the check with status 130, 143 or 129, not 0 (in bash, a Ctrl-C that the
+running command survives runs no ``INT`` trap, and the check goes on if that command exits 0). Run the subshell on
+its own: chained with ``&&``, ``||`` or ``if``, the shell ignores its ``set -e``. That ``grep`` copies the admin's
+own keys, so it runs on the admin's host only; anywhere else, write the same variables by hand, and the keys must be
+those of an R2 token that can only read the bucket. ``IMG`` is the rebuilt image by the digest its one push printed,
+the image the switch then runs::
 
     (
       set -e -o pipefail
-      R2_ENV="$(mktemp)"; trap 'rm -f "$R2_ENV"' EXIT; trap exit INT TERM HUP
+      R2_ENV="$(mktemp)"; trap 'rm -f "$R2_ENV"' EXIT
+      trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
       docker exec <admin-container> env |
         grep -E '^R2_(ACCOUNT_ID|ACCESS_KEY_ID|SECRET_ACCESS_KEY|BUCKET_ID|ENDPOINT_URL|REGION)=' > "$R2_ENV"
       git show <commit>:scripts/seal_check_admin.py |

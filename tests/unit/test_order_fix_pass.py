@@ -648,9 +648,10 @@ def _docker_commands(code):
 
 
 def _flags(options):
-    """pflag-style: whether docker options detach, set a variable or leave the container after exit, and the
-    values of their --env-file and --entrypoint."""
-    detached, variables, removed = False, False, False
+    """pflag-style: whether docker options detach, set a variable, leave the container after exit, come from a
+    variable or a substitution (the values of --env-file and --entrypoint aside), or mount anything or run
+    privileged, and the values of their --env-file and --entrypoint."""
+    detached, variables, removed, hidden, host = False, False, False, False, False
     values, i = {"--env-file": [], "--entrypoint": []}, 0
     while i < len(options):
         name, eq, value = options[i].partition("=")
@@ -663,14 +664,17 @@ def _flags(options):
             detached |= name == "--detach"
             variables |= name == "--env"
             removed = removed if name != "--rm" else not eq or value.lower() in ("true", "1")
+            host |= name in ("--volume", "--mount", "--volumes-from", "--privileged")
         elif name.startswith("-"):
             for flag in options[i][1:]:
                 detached |= flag == "d"
                 variables |= flag == "e"
+                host |= flag == "v"
                 if flag in "acehlmpuvw":  # takes a value: the rest of the word, or the next one
                     break
+        hidden |= name not in values and bool(set(options[i]) & set("$`"))
         i += 1
-    return detached, variables, removed, values
+    return detached, variables, removed, hidden, host, values
 
 
 def _starts_a_service(words):
@@ -681,8 +685,8 @@ def _starts_a_service(words):
 def _not_one_shot(command):
     """Why this docker command could start the rebuilt image as a service, or give it more than ``$R2_ENV``:
     nothing when it starts no container, or runs ``"$IMG"`` removed on exit, attached, its entrypoint
-    replaced by ``python`` (a script on stdin, ``pip check`` or ``pip freeze``) or ``cat``, and given no
-    variable but ``--env-file "$R2_ENV"``."""
+    replaced by ``python`` (a script on stdin, ``pip check`` or ``pip freeze``) or ``cat``, given no
+    variable but ``--env-file "$R2_ENV"``, no mount and no privilege, every option written out."""
     if command[:1] != ["docker"]:
         return ["not a plain docker command"]
     words = command[1:]
@@ -701,10 +705,11 @@ def _not_one_shot(command):
     if "$IMG" not in words:
         return ['runs no "$IMG"']
     options, program = words[:words.index("$IMG")], words[words.index("$IMG") + 1:]
-    detached, variables, removed, values = _flags(options)
+    detached, variables, removed, hidden, host, values = _flags(options)
     entrypoint = values["--entrypoint"][-1] if values["--entrypoint"] else None
     plain = program[:1] == ["-"] or (program[:2] == ["-m", "pip"] and program[2:3] in (["check"], ["freeze"]))
     return (["not removed on exit"] * (not removed) + ["detached"] * detached + ["sets a variable"] * variables
+            + ["options from a variable or substitution"] * hidden + ["mounts or runs privileged"] * host
             + [f"--env-file {name}" for name in values["--env-file"] if name != "$R2_ENV"]
             + [f"entrypoint {entrypoint}"] * (entrypoint not in ("python", "cat"))
             + ["python runs neither stdin nor pip check/freeze"] * (entrypoint == "python" and not plain)
@@ -737,9 +742,11 @@ def _runbook_and_seal_docstring():
 def test_a_rebuilt_order_control_image_is_checked_only_in_one_shot_containers():
     """The image's entrypoint is the order control itself: before the switch, every container of it the runbook's
     "Before switching" section or the seal check's docstring starts, in any code block or inline code, is removed
-    on exit, attached, runs python or cat in place of that entrypoint, starts no service and is given no variable
-    but the bucket ones of ``$R2_ENV``, so no second control or admin starts on the production bucket. The next
-    tests show the check refusing each way out."""
+    on exit, attached, runs python or cat in place of that entrypoint, starts no service, mounts nothing, is not
+    privileged and is given no variable but those of ``--env-file "$R2_ENV"``, its options written out, so no
+    second control or admin starts on the production bucket. The next tests show the check refusing each of
+    these ways out. It does not read what a container gets on stdin (a script, a heredoc, a here-string), nor
+    how ``$IMG`` and ``$R2_ENV`` are set and filled."""
     runs, violations = _one_shot_violations(*_runbook_and_seal_docstring())
     assert all(runs), runs
     assert violations == {}
@@ -799,6 +806,14 @@ def test_the_docstring_check_refuses_a_container_that_could_start_a_service(comm
     ('docker run --rm --entrypoint python "$IMG" -m uvicorn reliquary.admin.service:app',
      "python runs neither stdin nor pip check/freeze"),
     ('docker run --rm --entrypoint python <the rebuilt image> -', 'runs no "$IMG"'),
+    ('OPTS="-d -e RELIQUARY_ORDER_CAP_SIZING=on"; docker run --rm $OPTS --entrypoint python --env-file "$R2_ENV"'
+     ' "$IMG" -', "options from a variable or substitution"),
+    ('docker run --rm `cat opts` --entrypoint python "$IMG" -', "options from a variable or substitution"),
+    ('docker run --rm -iv /var/run/docker.sock:/var/run/docker.sock --entrypoint python "$IMG" -',
+     "mounts or runs privileged"),
+    ('docker run --rm --mount type=bind,src=/srv,dst=/srv --entrypoint python "$IMG" -', "mounts or runs privileged"),
+    ('docker run --rm --volumes-from <admin container> --entrypoint python "$IMG" -', "mounts or runs privileged"),
+    ('docker run --rm --privileged --entrypoint python "$IMG" -', "mounts or runs privileged"),
     ('docker container run -d --rm --entrypoint python "$IMG" -', "detached"),
     ('docker --context prod run -d --rm --entrypoint python "$IMG" -', "detached"),
     ('sudo docker run -d --rm --entrypoint python "$IMG" -', "detached"),

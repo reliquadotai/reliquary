@@ -44,7 +44,7 @@ Mount a persistent Hugging Face cache so the corpora are fetched once.
 ```bash
 # the base: the validator image the image workflow built from Core <commit>
 docker buildx imagetools inspect \
-  "ghcr.io/reliquadotai/reliquary-validator:sha-$(git rev-parse --short=7 <commit>)-logic"   # prints its Digest
+  "ghcr.io/reliquadotai/reliquary-validator:sha-$(git rev-parse <commit> | cut -c1-7)-logic"   # prints its Digest
 docker build -f docker/Dockerfile.order-control \
   --build-arg BASE_IMAGE=ghcr.io/reliquadotai/reliquary-validator@sha256:<that digest> \
   --build-context envs=<directory holding exactly the four reviewed wheels> \
@@ -54,10 +54,12 @@ docker push <registry>/<repository>:<tag>   # prints the digest of the image to 
 ```
 
 The validator image workflow (`.github/workflows/docker-image.yml`) tags each build of main
-`sha-<the commit's first 7 characters>-logic`: `git rev-parse --short=7 <commit>` prints them (more only when 7
-are ambiguous in your clone; the tag keeps the first 7). A commit whose changes are all under `docs/` or in `.md`
-files has no image (the workflow's `paths-ignore`), and one whose build a later push to main cancelled may have
-none: when `imagetools inspect` finds no such tag, take another commit.
+`sha-<the commit's first 7 characters>-logic` (`${GITHUB_SHA::7}`): `git rev-parse <commit> | cut -c1-7` prints
+exactly those 7, where `git rev-parse --short=7` prints more when 7 are ambiguous in your clone. Only the commit at
+the tip of a push to main gets an image, and only when that push changes a file that is neither under `docs/` nor a
+`.md` file (the workflow's `paths-ignore`): the commits under it, such as a pull request's own commits under its
+merge commit, get none. A build that a later run of the workflow cancelled may have pushed none. When
+`imagetools inspect` finds no such tag, take another commit.
 
 Pin `BASE_IMAGE` by digest, never by tag: `latest` moves with main, and a new run of the workflow on a commit
 pushes its tag again. Build the image once, on a non-production host, and push it: the checks before the switch
@@ -110,12 +112,17 @@ with `docker exec`. The one exception is in step 3, on a non-production host.
    running containers (`docker exec <container> python -m pip freeze`).
 2. **Seal check** (field level, read-only), in the running admin API container **and** in the rebuilt image, both
    reading the script from the same Core `<commit>`, whatever the checkout holds. `$R2_ENV` lives only as long as
-   the check: the subshell creates it right before (`mktemp`, mode 600) and its traps remove it on exit, whether
-   the check passes, fails or is interrupted (zsh runs no `EXIT` trap on Ctrl-C without the second one).
+   the check: the subshell creates it right before (`mktemp`, mode 600) and its `EXIT` trap removes it, whether
+   the check passes, fails or is interrupted. The `INT`, `TERM` and `HUP` traps are what make bash and zsh run
+   that `EXIT` trap on an interrupt, and they end the interrupted check with status 130, 143 or 129, not 0. In
+   bash, a Ctrl-C that the running command survives runs no `INT` trap: the check stops if that command fails, and
+   goes on if it exits 0. Run the subshell as a command of its own: chained (`( ... ) && ...`, `||`, `if`), both
+   shells ignore its `set -e`.
    ```bash
    (
      set -e -o pipefail
-     R2_ENV="$(mktemp)"; trap 'rm -f "$R2_ENV"' EXIT; trap exit INT TERM HUP
+     R2_ENV="$(mktemp)"; trap 'rm -f "$R2_ENV"' EXIT
+     trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
      docker exec <admin container> env |
        grep -E '^R2_(ACCOUNT_ID|ACCESS_KEY_ID|SECRET_ACCESS_KEY|BUCKET_ID|ENDPOINT_URL|REGION)=' > "$R2_ENV"
      git show <commit>:scripts/seal_check_admin.py | docker exec -i <admin container> python -
@@ -150,7 +157,8 @@ with `docker exec`. The one exception is in step 3, on a non-production host.
    ```bash
    (
      set -e -o pipefail
-     R2_ENV="$(mktemp)"; trap 'rm -f "$R2_ENV"' EXIT; trap exit INT TERM HUP
+     R2_ENV="$(mktemp)"; trap 'rm -f "$R2_ENV"' EXIT
+     trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
      docker exec <admin container> env |
        grep -E '^R2_(ACCOUNT_ID|ACCESS_KEY_ID|SECRET_ACCESS_KEY|BUCKET_ID|ENDPOINT_URL|REGION)=' > "$R2_ENV"
      docker run --rm -i --memory 4g --entrypoint python --env-file "$R2_ENV" "$IMG" - <set ids> < <your script>
