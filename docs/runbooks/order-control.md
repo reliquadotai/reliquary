@@ -42,11 +42,18 @@ What these envs need at run time:
 Mount a persistent Hugging Face cache so the corpora are fetched once.
 
 ```bash
+docker buildx imagetools inspect ghcr.io/reliquadotai/reliquary-validator:sha-<short commit>-logic   # its digest
 docker build -f docker/Dockerfile.order-control \
-  --build-arg BASE_IMAGE=<the validator image, a -logic one> \
+  --build-arg BASE_IMAGE=ghcr.io/reliquadotai/reliquary-validator@sha256:<that digest> \
   --build-context envs=<directory holding exactly the four reviewed wheels> .
 # the build needs network to github.com (the git+ installs); ENVS, TELECOM_ENVS, SBX are build args
 ```
+
+Pin `BASE_IMAGE` by digest, never by tag: `latest` moves with main, and the trial build (below) and the production
+build must start from the same base. In the built image, `/opt/reliquary/.build-revision` is the Core commit that
+base was built from: the root `Dockerfile` writes its `RELIQUARY_BUILD_REVISION` there (the validator image
+workflow sets it to the commit; `unknown` when unset), and the order-control layers do not change it. It does not
+cover this image's own tasksets, copied from the build context's `tasksets/`.
 
 For signed episode orders (SWE, TMax, Terminal-Bench 2.1, DeepSWE, SWE-bench Pro) the image also carries
 reliquary-sandbox with its verifiers bridge at `SANDBOX_COMMIT`, `reliquary-swe` and `reliquary-terminal` at the
@@ -61,18 +68,49 @@ AutomationBench orders are suite episodes this control replays: `reliquary-autom
 ## Before switching the admin or the order control
 
 A rebuilt image grades only what its installed packages and grader fingerprint allow. Do these before switching
-the admin or the order control to an image built from this Dockerfile:
+the admin or the order control to an image built from this Dockerfile.
 
-1. **Trial build** on a non-production host with the intended `BASE_IMAGE`. Keep its output:
+**Before the switch, never start the rebuilt image with production settings**, neither through its entrypoint nor
+as `admin serve`. Its `ENTRYPOINT` is the order control itself (`reliquary corpus order-control`): a second order
+control beside the running one, on the production bucket and registry. As `admin serve` it is a second admin, and
+with `RELIQUARY_ORDER_CAP_SIZING=on` a second cap resizer writing the registry's caps. No setting makes the bucket
+read-only: the store uses whatever `R2_*` credentials it is given. So until the switch the rebuilt image runs only
+as one-shot containers that replace its entrypoint, start no service and are removed on exit (`--rm`); the running
+admin is checked with `docker exec`.
+
+```bash
+IMG=<the rebuilt image, by ID or digest>
+R2_ENV="$(mktemp)"   # mode 600
+# on the admin's host, from the running admin (elsewhere, write the same lines by hand)
+docker exec <admin container> env |
+  grep -E '^R2_(ACCOUNT_ID|ACCESS_KEY_ID|SECRET_ACCESS_KEY|BUCKET_ID|ENDPOINT_URL|REGION)=' > "$R2_ENV"
+```
+
+`$R2_ENV` holds the admin's `R2_*` variables and none of its other settings. `R2_BUCKET_ID`, `R2_ENDPOINT_URL` and
+`R2_REGION` must be in it whenever the admin sets them: without `R2_BUCKET_ID` the store reads the `reliquary`
+bucket. With an R2 token that can only read that bucket, put its `R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY` in
+place of the admin's. Delete the file once the checks are done: `rm -f "$R2_ENV"`.
+
+1. **Trial build** on a non-production host with the intended `BASE_IMAGE`, pinned by digest (see Image above).
+   Keep its output:
    - `reliquary corpus order-control-check` passes, including `rl_environments`;
-   - the episodes check prints `ORDER_CONTROL_EPISODES_OK`;
-   - `pip check` is clean after the `--no-deps` installs.
+   - the episodes check prints `ORDER_CONTROL_EPISODES_OK`.
 
-   Compare `pip freeze` and each env package's and taskset's `direct_url.json` with the running containers.
-2. **Seal check** (field level, read-only), in the running admin API container **and** in the rebuilt image
-   started with the admin's read-only bucket settings:
+   Then, in the built image:
    ```bash
-   docker exec -i <container> python - < scripts/seal_check_admin.py
+   docker run --rm --network none --entrypoint cat "$IMG" /opt/reliquary/.build-revision
+   docker run --rm --network none --entrypoint python "$IMG" -m pip check
+   docker run --rm --network none --entrypoint python "$IMG" -m pip freeze
+   ```
+   `.build-revision` must be the Core commit of the base you meant. `pip check` must be clean after the
+   `--no-deps` installs. Compare `pip freeze` and each env package's and taskset's `direct_url.json` with the
+   running containers (`docker exec <container> python -m pip freeze`).
+2. **Seal check** (field level, read-only), in the running admin API container **and** in the rebuilt image. Both
+   read the script from the same `<commit>`, whatever the checkout holds:
+   ```bash
+   git show <commit>:scripts/seal_check_admin.py | docker exec -i <admin container> python -
+   git show <commit>:scripts/seal_check_admin.py |
+     docker run --rm -i --entrypoint python --env-file "$R2_ENV" "$IMG" -
    ```
    It prints one line per single-turn set. How to read each line:
    - `"sealed": false`: the card has no protocol, so neither comparison applies. Only step 3 tells whether the set
@@ -83,11 +121,20 @@ the admin or the order control to an image built from this Dockerfile:
    - `taskset_ok: false`: the rows come back ungraded and count as failures.
 
    The rebuilt image must print the same `grader_sha256_here` and the same installed triples as the cards.
-3. **One-row grade** (the sufficient check). This step is not shipped as a script: call the grader's own entry
-   points one by one, in this order:
+3. **One-row grade** (the sufficient check). This step is not shipped as a script: write one that calls the
+   grader's own entry points one by one, in this order:
    1. `reliquary.eval.grading.load_sets`;
    2. `require_gradable`, then `require_sandboxes`;
    3. `_Graders(...).grade(...)` on one row of the set's `grading.jsonl`.
+
+   In the rebuilt image, run it like the seal check, the set ids as its arguments; `--memory` keeps it from
+   taking the memory of the services beside it:
+   ```bash
+   docker run --rm -i --memory 4g --entrypoint python --env-file "$R2_ENV" "$IMG" - <set ids> < <your script>
+   ```
+   A LiveCodeBench or SciCode program runs in its grading service, reached only through the socket mount and
+   variable the admin container is given ("Code-execution grading" and "SciCode" below): without them, its row's
+   `grader_error` says nothing about the image.
 
    An empty detail or `format_failure` means the set grades. `grader_error`, `grader_drift` or `source_drift`
    means it does not.

@@ -1,9 +1,21 @@
 #!/usr/bin/env python
 """Read-only seal check of the single-turn evaluation cards against the grader installed here.
 
-Run it where single-turn rows are graded: inside the admin API container, and inside a rebuilt image started
-with the admin's read-only bucket settings, before switching to it (docs/runbooks/order-control.md, "Before
-switching"). For example: ``docker exec -i <admin-container> python - < scripts/seal_check_admin.py``.
+Run it where single-turn rows are graded, every run reading the script from the same Core ``<commit>``
+(docs/runbooks/order-control.md, "Before switching"). In the running admin API container::
+
+    git show <commit>:scripts/seal_check_admin.py | docker exec -i <admin-container> python -
+
+In a rebuilt image, before switching to it, run it only in a one-shot container that replaces the entrypoint and
+starts no service, ``R2_ENV`` being a mode-600 file of the admin's ``R2_*`` variables and nothing else
+(``R2_BUCKET_ID``, ``R2_ENDPOINT_URL`` and ``R2_REGION`` too when the admin sets them), deleted afterwards::
+
+    git show <commit>:scripts/seal_check_admin.py |
+      docker run --rm -i --entrypoint python --env-file "$R2_ENV" "$IMG" -
+
+Never start that image with production settings before the switch: its entrypoint is the order control itself, and
+``admin serve`` would be a second admin (a second cap resizer with ``RELIQUARY_ORDER_CAP_SIZING=on``). No setting
+makes the bucket read-only: the store uses the ``R2_*`` credentials it is given.
 
 It only calls ``SubnetEvalStore.get_bytes`` on each set's ``set.json`` and reads installed package metadata and
 files: no write, no network call of its own beyond the store's read, no subprocess. One JSON line per set:

@@ -591,6 +591,28 @@ def test_the_order_control_image_installs_and_checks_its_runtime():
     assert "order-control" in Path("docs/runbooks/order-control.md").read_text()
 
 
+def test_a_rebuilt_order_control_image_is_checked_only_in_one_shot_containers():
+    """The image's entrypoint is the order control itself: before the switch, every container of it the runbook
+    or the seal check starts is removed on exit and runs a plain program in place of that entrypoint, so no
+    second control or admin starts on the production bucket and registry."""
+    import ast
+    import re
+    from pathlib import Path
+
+    def docker_runs(text):
+        joined = re.sub(r"\\\n\s*", " ", text)
+        return [line[line.index("docker run"):].split() for line in joined.splitlines() if "docker run" in line]
+
+    runbook = Path("docs/runbooks/order-control.md").read_text()
+    section = runbook.split("\n## Before switching the admin or the order control\n", 1)[1].split("\n## ", 1)[0]
+    from_runbook = [run for block in re.findall(r"```bash\n(.*?)```", section, re.S) for run in docker_runs(block)]
+    from_script = docker_runs(ast.get_docstring(ast.parse(Path("scripts/seal_check_admin.py").read_text())))
+    assert from_runbook and from_script
+    for run in from_runbook + from_script:
+        assert "--rm" in run and "--entrypoint" in run, run
+        assert run[run.index("--entrypoint") + 1] in {"python", "cat"}, run
+
+
 # -- M3. reopening is off unless asked -----------------------------------------------
 
 
