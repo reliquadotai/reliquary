@@ -1218,11 +1218,12 @@ class CorpusAuditor:
         return outcome
 
     def _recount_refusal(self, submission_id: str, hotkey: str, outcome: dict) -> dict:
-        """A drift that the re-audit of a quarantined executor's pass repeats (`reaudit_executor`), counted as a
-        judging pass that refused it counts one (`_count_refusal`): the passing audit its judging pass counted
-        becomes a refusal, and the same rule charges it when its hotkey is now refused far more often than the
-        job's other hotkeys. A pass this process never counted (written before a restart) is counted in full.
-        Once per submission, as there: a later re-audit of it gets its outcome back as it is."""
+        """A forced-draw refusal that the re-audit of a quarantined executor's pass repeats (`reaudit_executor`),
+        counted as a judging pass that refused it counts one (`_count_refusal`): the passing audit its judging pass
+        counted becomes a refusal, and the same rule charges a drift when its hotkey is now refused far more often
+        than the job's other hotkeys (a penalised refusal comes back as it is). A pass this process never counted
+        (written before a restart) is counted in full. Once per submission, as there: a later re-audit of it gets
+        its outcome back as it is."""
         if (self._draw_job is None or outcome.get("reason") != "draw_mismatch"
                 or submission_id in self._draw_recounted):
             return outcome
@@ -1823,10 +1824,13 @@ class CorpusAuditor:
         any failed audit is, and its submission is voided: not paid, unless it
         was already settled inside the hold window. A refusal without penalty
         (forced-draw drift) is voided uncharged, as a judging pass refuses it
-        uncharged (`_audit_records_in_pass`), and its slot reopens at once, as
-        that pass reopens a refused sample's (`_write`); it counts as a refusal
-        of its hotkey, and is charged when that pass would charge it for
-        frequent refusals (`_recount_refusal`)."""
+        uncharged (`_audit_records_in_pass`), unless that pass would charge it
+        for frequent refusals; voided uncharged, its slot reopens at once, as
+        that pass reopens a refused sample's (`_write`). The draw counts take
+        what that pass counts: each forced-draw refusal repeated as a refusal
+        of its hotkey (`_recount_refusal`), and each pass confirmed that this
+        process never counted (written before a restart) as a passing audit
+        (`_count_refusal`)."""
         # Its outcomes computed ahead are not taken either: those records are audited again by their pass.
         self._ahead = {sid: outcome for sid, outcome in self._ahead.items()
                        if executor_id not in (outcome.get("scored_by") or ())}
@@ -1854,12 +1858,19 @@ class CorpusAuditor:
                 again = (await self._audit_outcomes([records[sid]], local=True))[0]
                 if isinstance(again, dict) and not again["passed"]:
                     failed[sid] = again
+                    continue
+                outcome = again
+            if isinstance(outcome, dict) and outcome["passed"]:
+                # Counted once per submission, as its judging pass counted it (`_count_refusal`): only a pass this
+                # process never counted (written before a restart) is counted here, as the drifts it repeats are
+                # counted in full below. Without it, a restart would leave the hotkey's drifts counted alone.
+                self._count_refusal(sid, records[sid]["hotkey"], outcome)
         if failed:
             for sid, outcome in failed.items():
-                if not outcome.get("penalty", True):
-                    # Its judging pass counted a pass: a refusal now, charged if its hotkey is refused far more
-                    # often than the job's other hotkeys, as a judging pass that refused it would charge it.
-                    failed[sid] = self._recount_refusal(sid, records[sid]["hotkey"], outcome)
+                # Its judging pass counted a pass: a forced-draw refusal now, as a judging pass that refused it
+                # counts one. A drift is charged if its hotkey is now refused far more often than the job's other
+                # hotkeys, as that pass would charge it; a penalised refusal comes back as it is.
+                failed[sid] = self._recount_refusal(sid, records[sid]["hotkey"], outcome)
             by_hotkey: dict[str, list[str]] = {}
             for sid, outcome in failed.items():
                 # A refusal without penalty (forced-draw drift) is no confirmed failure: no suspicion, no ban,
