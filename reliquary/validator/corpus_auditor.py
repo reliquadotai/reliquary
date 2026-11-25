@@ -1764,9 +1764,11 @@ class CorpusAuditor:
         """Re-audit on this GPU every pass written from a quarantined executor's
         scores that is unsettled or settled inside the hold window. A failure
         (confirmed by a second audit, as §7.2 asks) is charged to its miner as
-        any failed audit is, and its submission is voided so it is not paid. A
-        refusal without penalty (forced-draw drift) is voided uncharged, as a
-        judging pass refuses it uncharged (`_audit_records_in_pass`)."""
+        any failed audit is, and its submission is voided: not paid, unless it
+        was already settled inside the hold window. A refusal without penalty
+        (forced-draw drift) is voided uncharged, as a judging pass refuses it
+        uncharged (`_audit_records_in_pass`), and its slot reopens at once, as
+        that pass reopens a refused sample's (`_write`)."""
         # Its outcomes computed ahead are not taken either: those records are audited again by their pass.
         self._ahead = {sid: outcome for sid, outcome in self._ahead.items()
                        if executor_id not in (outcome.get("scored_by") or ())}
@@ -1811,6 +1813,17 @@ class CorpusAuditor:
                         "hotkey": records[sid]["hotkey"], "executor_id": executor_id,
                         "reason": "executor_quarantined", "voided_at": now, **outcome}
                     await writer(self._job_id, sid, document)
+                    if not outcome.get("penalty", True):
+                        # No forfeit voided it (`_void_forfeited`), so this does what one would: a later forfeit of
+                        # its hotkey or operator must not void it again (a list of the job's voids read later holds
+                        # it), and its slot reopens before the status hears of the void. `_reopen_slot`, not
+                        # `_reopen_slots`: an EvalAuditor reopens every returned id in its own ledger already.
+                        if self._voided_ids is not None:
+                            self._voided_ids.add(sid)
+                        hotkey = records[sid]["hotkey"]
+                        if hotkey in self._paid:
+                            self._paid[hotkey] = [paid for paid in self._paid[hotkey] if paid[1] != sid]
+                        await self._reopen_slot(sid)
                     self._report_voided(sid, document)
         logger.warning("corpus job %s: re-audited %d pass(es) scored by quarantined executor "
                        "%s; %d failed (%d uncharged)", self._job_id, len(ids), executor_id, len(failed),

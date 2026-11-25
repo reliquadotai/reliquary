@@ -639,22 +639,30 @@ def test_a_quarantine_voids_a_repeated_drift_without_charging_its_miner(monkeypa
     assert charged.confirmed_failures and charged.suspect_until is not None and charged.audited_passed == 0
 
 
-def _sampled_reaudit(monkeypatch, refusal):
+def _sampled_reaudit(monkeypatch, refusal, *, voids_listed=False):
     """At q = 0.25, two hotkeys of one coldkey: a pass of 5Drift and one of 5Sib scored by pod-2, then a later
-    pass of 5Drift scored by pod-1. pod-1 is quarantined, and both audits of its pass return ``refusal``."""
+    pass of 5Drift scored by pod-1. pod-1 is quarantined, and both audits of its pass return ``refusal``.
+    ``run.events``: from the re-audit on, each slot reopen and each void the status hears of, in order (with no
+    slot store here, the spies stand for a draw job's ledger). ``voids_listed``: an earlier forfeit of this
+    process has already listed the job's voids (`_void_forfeited`)."""
     from reliquary.corpus.audit_policy import AuditParams
     from reliquary.validator.corpus_auditor import CorpusAuditor
 
     model = _tiny(0)
-    run = SimpleNamespace(earlier="a" * 64, sibling="b" * 64, drift="c" * 64, states=_States(), escalated=[])
+    run = SimpleNamespace(earlier="a" * 64, sibling="b" * 64, drift="c" * 64, states=_States(), escalated=[],
+                          events=[])
     run.records = _VoidingRecords({
         run.earlier: {**_record(model), "hotkey": "5Drift", "received_at": 99_000.0},
         run.sibling: {**_record(model), "hotkey": "5Sib", "received_at": 99_100.0},
         run.drift: {**_record(model), "hotkey": "5Drift", "received_at": 99_200.0}})
     remote = _AlwaysConnected(model, lie_pass=True, executor="pod-2")
-    auditor = CorpusAuditor(job_id="j", records=run.records, model=model, tokenizer=_Tokenizer(), proof=PROOF,
-                            remote=remote, miner_states=run.states, clock=_Clock(100_000.0),
-                            params=AuditParams(q=0.25), operator_of={"5Drift": "5Cold", "5Sib": "5Cold"}.get)
+    run.auditor = auditor = CorpusAuditor(
+        job_id="j", records=run.records, model=model, tokenizer=_Tokenizer(), proof=PROOF, remote=remote,
+        miner_states=run.states, clock=_Clock(100_000.0), params=AuditParams(q=0.25),
+        operator_of={"5Drift": "5Cold", "5Sib": "5Cold"}.get,
+        on_voided=lambda sid, document: run.events.append(("voided", sid)))
+    if voids_listed:
+        auditor._voided_ids = set()
     asyncio.run(auditor.audit_many([run.earlier, run.sibling]))
     remote.executor = "pod-1"
     asyncio.run(auditor.audit_many([run.drift]))
@@ -666,7 +674,16 @@ def _sampled_reaudit(monkeypatch, refusal):
         run.escalated.append(sorted(failures))
         return await escalate(failures, *args, **kwargs)
 
+    async def reopen(submission_ids):
+        if submission_ids:
+            run.events.append(("reopen", sorted(submission_ids)))
+
+    async def reopen_one(submission_id):
+        await reopen([submission_id])
+
     monkeypatch.setattr(auditor, "_escalate", spy)
+    monkeypatch.setattr(auditor, "_reopen_slots", reopen)
+    monkeypatch.setattr(auditor, "_reopen_slot", reopen_one)
     monkeypatch.setattr(auditor, "_judge_many", lambda batch: [dict(refusal) for _ in batch])
     run.voided = asyncio.run(remote.listeners[0]("pod-1"))
     return run
@@ -698,6 +715,65 @@ def test_on_a_sampled_job_a_reaudited_charged_refusal_still_forfeits_its_operato
     # Suspect and forfeiting, but no failure of its own (`after_operator_failure`).
     assert sibling.suspect_until is not None and sibling.forfeit_before == 99_200.0
     assert sibling.confirmed_failures == []
+    # Its slot reopens with the forfeit of its own pass, as before: nothing reopens it a second time.
+    assert [event for event in run.events if event[0] == "reopen"] == [
+        ("reopen", sorted([run.earlier, run.sibling, run.drift]))]
+
+
+def test_on_a_sampled_job_a_reaudited_drift_reopens_its_slot_at_once(monkeypatch):
+    """On a draw job the drift's slot reopens during the re-audit, before the status hears of its void, as a
+    judging pass reopens a refused sample's (`_write`). Its own forfeit used to reopen it (`_void_forfeited`); with
+    none, it would wait for the next start's reconcile, its prompt full without the sample."""
+    run = _sampled_reaudit(monkeypatch, {**_DRAW_REFUSAL, "penalty": False})
+    assert run.events == [("reopen", [run.drift]), ("voided", run.drift)]
+
+
+def test_a_later_forfeit_does_not_void_a_reaudited_drift_again(monkeypatch):
+    """A drift the re-audit voided is out of the forfeit books: a later charged failure of its hotkey forfeits that
+    hotkey's other unpaid pass and its operator's, and leaves the drift's void, slot and status alone. The job's
+    voids were listed before the re-audit (listed after it, they would hold the drift's void anyway)."""
+    run = _sampled_reaudit(monkeypatch, {**_DRAW_REFUSAL, "penalty": False}, voids_listed=True)
+    run.events.clear()
+    later = "d" * 64
+    asyncio.run(run.auditor._escalate({"5Drift": [later]}, 100_000.0, {later: 99_300.0}))
+    assert run.escalated == [["5Drift"]]
+    assert run.records.voided[run.drift]["executor_id"] == "pod-1"  # the re-audit's void, not a forfeit's
+    assert run.records.voided[run.earlier]["reason"] == run.records.voided[run.sibling]["reason"] == "forfeited"
+    assert run.events == [("reopen", [run.earlier, run.sibling]), ("voided", run.earlier), ("voided", run.sibling)]
+
+
+def test_an_eval_auditor_reopens_a_reaudited_drift_in_its_ledger_once(monkeypatch):
+    """The eval auditor reopens every id its re-audit returns in its own ledger (`EvalAuditor.reaudit_executor`):
+    the base re-audit's reopen of a drift adds no second ledger write there."""
+    from reliquary.validator import corpus_service, eval_control
+    from tests.unit.test_eval_draw import _job as draw_job
+
+    job, drift = draw_job(), "c" * 64
+    records = _VoidingRecords({drift: {"hotkey": "5Drift", "token_count": 10, "prompt_index": job.prompt_start,
+                                       "cursor": 0}})
+    ledger = []
+
+    async def record_prompt_failure(store, job, prompt_index, submission_id, **slot):
+        ledger.append(submission_id)
+        return True
+
+    async def record_prompt_failures(store, job, entries):
+        ledger.extend(entry[1] for entry in entries)
+        return {entry[1]: True for entry in entries}
+
+    monkeypatch.setattr(corpus_service, "record_prompt_failure", record_prompt_failure)
+    monkeypatch.setattr(corpus_service, "record_prompt_failures", record_prompt_failures)
+    auditor = eval_control.eval_auditor(job_id=job.job_id, records=records, tokenizer=None, proof=PROOF,
+                                        vocab_size=10, job=job, job_store=object(), reopen_slots=True,
+                                        draw_job=job)
+    auditor._remote_scored["pod-1"] = [drift]
+
+    async def refuse(batch, *, local=False):
+        return [{**_DRAW_REFUSAL, "penalty": False} for _ in batch]
+
+    monkeypatch.setattr(auditor, "_audit_outcomes", refuse)
+    assert asyncio.run(auditor.reaudit_executor("pod-1")) == [drift]
+    assert records.voided[drift]["penalty"] is False and ledger == [drift]
 
 
 def test_without_a_connected_executor_the_auditor_runs_locally():
