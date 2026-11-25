@@ -42,10 +42,12 @@ What these envs need at run time:
 Mount a persistent Hugging Face cache so the corpora are fetched once.
 
 Build in a fresh clone of this repository, checked out at the Core `<commit>` whose validator image is the base,
-where `git status --porcelain --ignored` prints nothing. The build reads `docker/Dockerfile.order-control` and
-copies `tasksets/` from its context, the clone's working tree, not from `<commit>`: a changed, untracked or ignored
-file there (a `build/` or `*.egg-info` that an earlier install left in a taskset) would go into the image, and
-`.build-revision` (below) would not show it. The four commands are joined by `&&`, so that none runs after one that
+where `git status --porcelain --ignored --untracked-files=all` prints nothing. The build reads
+`docker/Dockerfile.order-control` and copies `tasksets/` from its context, the clone's working tree, not from
+`<commit>`: a changed, untracked or ignored file there (a `build/` or `*.egg-info` that an earlier install left in a
+taskset) would go into the image, and `.build-revision` (below) would not show it. `--untracked-files=all` overrides
+the `status.showUntrackedFiles` setting: set to `no` in any git configuration of the host, it makes `git status`
+leave out untracked and ignored files alike. The four commands are joined by `&&`, so that none runs after one that
 fails: run one by one, a failed clone (into a directory that already exists, say) would leave
 `git checkout --detach` to run in another repository, that directory's or the one the shell is in, and detach its
 HEAD.
@@ -54,7 +56,7 @@ HEAD.
 git clone https://github.com/reliquadotai/reliquary.git <new directory> &&
   cd <new directory> &&
   git checkout --detach <commit> &&
-  git status --porcelain --ignored
+  git status --porcelain --ignored --untracked-files=all
 ```
 
 Then, in that clone, `docker buildx imagetools inspect` prints the Digest of the base, the validator image the
@@ -67,11 +69,11 @@ docker buildx imagetools inspect \
 
 The next block builds from that digest and pushes. Its first three commands are a guard, joined to the build by
 `&&`: the build runs only in a repository that holds `<commit>`, whose HEAD is that commit, and where
-`git status --porcelain --ignored` prints nothing. Without it, the block run after a failed clone or checkout
-would build another tree, and `.build-revision` would still say `<commit>`. The first command is what stops the
-block outside any repository, where both sides of the comparison would be empty, and so equal. When the guard
-passes it prints that commit and nothing else, so a block that stops after it, non-zero, with no build output, ran
-at another HEAD or where `git status` shows a file. Keep the wheels' directory outside the clone, where
+`git status --porcelain --ignored --untracked-files=all` prints nothing. Without it, the block run after a failed
+clone or checkout would build another tree, and `.build-revision` would still say `<commit>`. The first command is
+what stops the block outside any repository, where both sides of the comparison would be empty, and so equal. When
+the guard passes it prints that commit and nothing else, so a block that stops after it, non-zero, with no build
+output, ran at another HEAD or where `git status` shows a file. Keep the wheels' directory outside the clone, where
 `git status` would show it. `--load` puts the image in the local image store whatever builder `docker build` uses:
 with a `docker-container` builder, or with `BUILDX_NO_DEFAULT_LOAD=1`, a build without it passes, loads nothing and
 ends 0, and the push then publishes whatever image last had that tag. The push, which runs only after a build that
@@ -80,7 +82,7 @@ succeeded, prints the digest of the image to check and to switch to:
 ```bash
 git rev-parse --verify '<commit>^{commit}' &&
   test "$(git rev-parse HEAD)" = "$(git rev-parse --verify '<commit>^{commit}')" &&
-  test -z "$(git status --porcelain --ignored)" &&
+  test -z "$(git status --porcelain --ignored --untracked-files=all)" &&
   docker build --load -f docker/Dockerfile.order-control --progress=plain \
     --build-arg BASE_IMAGE=ghcr.io/reliquadotai/reliquary-validator@sha256:<that digest> \
     --build-context envs=<directory holding exactly the four reviewed wheels> \
@@ -200,26 +202,34 @@ with `docker exec`. The one exception is in step 3, on a non-production host.
 
    It prints one line per set of its own list, `SETS`, fixed at `<commit>`: the script takes no argument and reads
    nothing from the platform. So its lines can include sets the platform has withdrawn, and miss sets it offers.
-   Only the sets the platform offers count, the rows of its `eval_sets` with `availability = 'qualified'`. Its
-   public catalog, `https://api.reliqua.ai/api/v1/evaluations/catalog`, lists exactly those and needs no key, and
-   so does this read-only query, run in a checkout of reliquary-platform:
+   Only the single-turn sets the platform offers count. The sets it offers are the rows of its `eval_sets` with
+   `availability = 'qualified'`. Its public catalog, `https://api.reliqua.ai/api/v1/evaluations/catalog`, lists
+   exactly those and needs no key. This read-only query, run in a checkout of reliquary-platform, lists them too,
+   but it needs the operator's Cloudflare access, as step 5's queries do: `--remote` reads the production database.
    ```bash
    pnpm exec wrangler d1 execute reliquary-platform --remote --command "
      SELECT set_id, env FROM eval_sets WHERE availability = 'qualified' ORDER BY env, set_id"
    ```
-   How to read the line of a set the platform offers:
+   A set is single-turn when its card's `interaction` is `single_turn` or missing, and every Verifiers card's is
+   `single_turn`. Today the single-turn sets offered are exactly those whose `env` starts with `verifiers:`. The
+   others are agentic (SWE, TMax, Terminal-Bench, DeepSWE, SWE-bench Pro and AutomationBench today), graded from
+   their jobs, and neither this step nor step 3 checks them. A non-null `subnet_episode` in the catalog marks an
+   agentic set, but a null does not mark a single-turn one: with the platform's `EVAL_SUBNET_EPISODES` off, every
+   set has a null `subnet_episode`.
+
+   How to read the line of a single-turn set the platform offers:
    - `"sealed": false`: the card has no protocol, so neither comparison applies. Only step 3 tells whether the set
      grades.
    - `grader_ok: false` on a sealed card: the grader fingerprint is checked first. `/grade` answers 422, and the
      order ends in `grading_timeout` after generation: charged, no report. On an admin carrying #547 the order is
      refused at job creation instead.
-   - `taskset_ok: false`: the rows come back ungraded and count as failures.
+   - `taskset_ok: false` on a sealed card: the rows come back ungraded and count as failures.
 
-   For every set the platform offers, the rebuilt image must print the same `grader_sha256_here` as its sealed card
-   and the same installed triple as its card. An offered set whose card fails either comparison goes through step 4
-   before the switch: a new set id, or its withdrawal. An offered set the list lacks has no line: step 3, whose
-   `load_sets` refuses a card sealed under another fingerprint, is its only check. The lines of sets the platform
-   does not offer do not count.
+   For every single-turn set the platform offers whose card is sealed, the rebuilt image must print the same
+   `grader_sha256_here` as the card and the same installed triple as the card. A single-turn set offered whose card
+   fails either comparison goes through step 4 before the switch: a new set id, or its withdrawal. One the list
+   lacks has no line: step 3, whose `load_sets` refuses a card sealed under another fingerprint, is its only check.
+   The lines of other sets do not count.
 3. **One-row grade** (the sufficient check). This step is not shipped as a script: write one that calls the
    grader's own entry points one by one, in this order:
    1. `reliquary.eval.grading.load_sets`;
@@ -227,8 +237,8 @@ with `docker exec`. The one exception is in step 3, on a non-production host.
    3. `_Graders(...).grade(...)` on one row of the set's `grading.jsonl`, printing what it returns:
       `(score, detail, format_failure)`.
 
-   In the rebuilt image, run it like the seal check, from its file (never through a pipe), with the set ids as its
-   arguments and `$R2_ENV` made as in step 2:
+   In the rebuilt image, run it like the seal check, from its file (never through a pipe), with the ids of the
+   single-turn sets the platform offers (step 2) as its arguments and `$R2_ENV` made as in step 2:
    ```bash
    (
      set -e -o pipefail
@@ -241,8 +251,10 @@ with `docker exec`. The one exception is in step 3, on a non-production host.
    ```
    An empty detail or `format_failure` means the set grades, LiveCodeBench's excepted (below). `grader_error`,
    `grader_drift` or `source_drift` means it does not, as does a refusal by an entry point (`load_sets` raises
-   `set protocol grader drift` for a card sealed under another fingerprint), except for these `grader_error`s,
-   which say nothing about the image:
+   `set protocol grader drift` for a card sealed under another fingerprint), with two exceptions. `require_gradable`
+   refuses an agentic card with `set <id> holds <interaction> tasks: grade it from its job (eval grade)`: that set
+   is not single-turn (step 2), and the refusal never means that it does not grade. And these `grader_error`s say
+   nothing about the image:
    - **Memory.** `--memory` keeps the check from taking the memory of the services beside it; `4g` is a
      suggestion, not a measured need. A scoring child killed for lack of memory reads
      `grader_error: BrokenProcessPool: ...` (after one retry in a fresh child), and a script killed for it ends
@@ -328,10 +340,11 @@ with `docker exec`. The one exception is in step 3, on a non-production host.
    of raising, so a one-row grade script that prints it ends 0 too, as does the subshell around either.
    - Step 1: the push ran, so the guard and both build checks passed, `.build-revision` is the Core commit you
      meant, and `pip check` is clean.
-   - Step 2, in the rebuilt image, for every single-turn set the platform offers (step 2 says how to list them;
-     the lines of other sets do not count): a card (no `"card": null`) and, if it is sealed, `card_grader_sha256`
-     equal to `grader_sha256_here`, `"grader_ok": true` and `"taskset_ok": true`. An offered set whose card fails
-     goes through step 4 first, a new set id or its withdrawal; one the script does not list is left to step 3.
+   - Step 2, in the rebuilt image, for every single-turn set the platform offers (step 2 says how to list and
+     recognise them; the lines of other sets do not count): a card (no `"card": null`) and, if it is sealed,
+     `card_grader_sha256` equal to `grader_sha256_here`, `"grader_ok": true` and `"taskset_ok": true`. Such a set
+     whose card fails goes through step 4 first, a new set id or its withdrawal; one the script does not list is
+     left to step 3.
    - Step 3: one row of every single-turn set the platform offers grades (an empty detail or `format_failure`):
      GPQA's, and HLE-Diamond's if the platform offers it, with a read-only `HF_TOKEN`, LiveCodeBench's and
      SciCode's with their grading services, these on the non-production host, and LiveCodeBench's with a fenced
@@ -368,13 +381,15 @@ control:
 2. Set its restart policy to `no` while it still runs, then stop it (the admin a few seconds after step 5's
    queries listed nothing that forbids the stop):
    ```bash
-   docker update --restart=no <old container>
-   docker stop <old container>
+   docker update --restart=no <old container> &&
+     docker stop <old container>
    ```
    A restart of the Docker daemon (a reboot, an upgrade) starts a stopped container again if its policy is
    `always`, or `on-failure` and it ended with a non-zero status, as a stop can end it: the old container would
-   then run beside the new one. Set before the stop, `no` leaves no moment for that. For the admin, run step 5's
-   queries again now, before the new container starts, and write down any new row.
+   then run beside the new one. Set before the stop, `no` leaves no moment for that. Keep the two commands joined
+   by `&&`: the stop then runs only once the update has succeeded. Run as two commands, a failed update would leave
+   the old policy on the stopped container, and step 3's check does not show the policy. For the admin, run step
+   5's queries again now, before the new container starts, and write down any new row.
 3. A stopped container keeps its name: rename it, which keeps it and its settings for a rollback, and check that
    the renamed container is the one step 1 wrote down, and has exited:
    ```bash
@@ -469,7 +484,10 @@ its own options: `-v /run/reliquary-grader:/run/reliquary-grader`,
 `-v <disk with ~12 GB free>:/root/.cache/huggingface`.
 
 The taskset loads `livecodebench/code_generation_lite` (v6, ~4.5 GB, plus its Arrow cache) the first time a
-grading opens it. Without the sidecar, rows grade as `grader_error` (`unreachable`), never as wrong answers.
+grading opens it. Without the sidecar, a row whose answer holds a program, in a fenced code block, grades as
+`grader_error` (`unreachable`), never as a wrong answer. An answer with no fenced code block scores 0.0 before the
+service is called, sidecar or not: step 3 of "Before switching" grades LiveCodeBench's row with a program for that
+reason.
 
 ## SciCode
 
