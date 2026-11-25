@@ -1006,6 +1006,29 @@ class CorpusAuditor:
         bisect.insort(self._forfeitable_at.setdefault(self._operator(hotkey), []),
                       (received_at, self._pay(submission_id), held, submission_id))
 
+    def _unstake(self, submission_id: str) -> None:
+        """A pass voided uncharged (`reaudit_executor`): no failure can forfeit it any more. It leaves its
+        operator's list (it stays in `_staked`, never counted again), and the stakes that may have counted it, of
+        its operator's records received in the hold after it and in its settlement period (each counted once,
+        `_stake_of`), are counted again at their next decision."""
+        if submission_id not in self._meta:
+            return
+        hotkey, received_at, _ = self._meta[submission_id]
+        operator = self._operator(hotkey)
+        entries = self._forfeitable_at.get(operator, [])
+        at = bisect.bisect_left(entries, (received_at,))
+        while at < len(entries) and entries[at][0] == received_at:
+            if entries[at][3] == submission_id:
+                del entries[at]
+                break
+            at += 1
+        period = _settlement_period(received_at)
+        for sid in [sid for sid in self._stake if sid in self._meta]:
+            other, other_at, _ = self._meta[sid]
+            if (received_at < other_at <= received_at + self._params.hold_seconds
+                    and _settlement_period(other_at) == period and self._operator(other) == operator):
+                del self._stake[sid]
+
     def _stake_applies(self, submission_id: str) -> bool:
         """Whether a failure of this record would be charged, and so forfeit its stake: a forced-draw refusal
         is charged per completion, only from EVAL_CHARGE_MIN_POSITIONS positions (or an edit), so a record with
@@ -1845,15 +1868,20 @@ class CorpusAuditor:
                         "reason": "executor_quarantined", "voided_at": now, **outcome}
                     await writer(self._job_id, sid, document)
                     if not outcome.get("penalty", True):
-                        # No forfeit voided it (`_void_forfeited`), so this does what one would: a later forfeit of
-                        # its hotkey or operator must not void it again (a list of the job's voids read later holds
-                        # it), and its slot reopens before the status hears of the void. `_reopen_slot`, not
-                        # `_reopen_slots`: an EvalAuditor reopens every returned id in its own ledger already.
+                        # Uncharged, it forfeits nothing, not even its own pass (`_void_forfeited`): this takes it out
+                        # of the forfeit books (a later forfeit must not void it again; a list of the job's voids read
+                        # later holds it) and out of the stake, and reopens its slot before the status hears of the
+                        # void. A forfeit may have voided it already (a charged failure of its hotkey or operator
+                        # received after it, in this re-audit or in a concurrent judging pass): the void above is
+                        # then refused (create-only), and the reopen is idempotent.
+                        # `_reopen_slot`, not `_reopen_slots`: an EvalAuditor reopens every returned id in its own
+                        # ledger already.
                         if self._voided_ids is not None:
                             self._voided_ids.add(sid)
                         hotkey = records[sid]["hotkey"]
                         if hotkey in self._paid:
                             self._paid[hotkey] = [paid for paid in self._paid[hotkey] if paid[1] != sid]
+                        self._unstake(sid)
                         await self._reopen_slot(sid)
                     self._report_voided(sid, document)
         logger.warning("corpus job %s: re-audited %d pass(es) scored by quarantined executor "

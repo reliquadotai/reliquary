@@ -149,6 +149,33 @@ def test_the_stake_counted_is_forfeited_when_a_drawn_record_fails():
     assert (store.verdicts[held]["passed"], store.verdicts[held]["reason"]) == (False, "forfeited")
 
 
+def test_a_pass_a_reaudit_voids_uncharged_leaves_the_stake():
+    """A forced-draw drift the re-audit of a quarantined executor's pass voids uncharged forfeits nothing, and no
+    failure can forfeit its pass any more: the stake of a record received after it no longer counts it, and that
+    record is audited at its hold's end instead of paid unaudited on a stake it does not hold."""
+    y = _ids(False, 1)[0]
+    x = _ids(False, 1, start=500)[0]
+    store = _Store({y: _rec(0, received_at=T0), x: _rec(0, received_at=T0 + 30)})
+    clock = _Clock(T0)
+    auditor = _auditor(store, clock)
+    auditor._draw_job = object()
+    passing = {"passed": True, "worst_exp": 0, "worst_mant_mean": 0.0, "worst_mant_median": 0.0}
+    outcome = dict(passing)
+    auditor._judge_many = lambda batch: [dict(outcome) for _ in batch]
+    _judge_at(auditor, clock, T0 + 20, [y])
+    auditor._remote_scored["pod-1"] = [y]  # Y's passing audit, as if scored by pod-1
+    _judge_at(auditor, clock, T0 + 40, [x])
+    assert x not in store.verdicts and auditor._stake_of(x, T0 + 40) == 1.0 / Q  # Y's pass at stake: X waits
+    outcome.update(passed=False, reason="draw_mismatch", penalty=False)
+    clock.now = T0 + 50
+    assert asyncio.run(auditor.reaudit_executor("pod-1")) == [y] and store.voided[y]["penalty"] is False
+    assert auditor._stake_of(x, T0 + 50) == 1.0
+    outcome.clear()
+    outcome.update(passing)
+    _judge_at(auditor, clock, T0 + 30 + HOLD + 1, [x])
+    assert (store.verdicts[x]["audited"], store.verdicts[x]["passed"]) == (True, True)
+
+
 def test_the_stake_is_counted_once():
     y = _ids(False, 1)[0]
     sid = _ids(False, 1, start=500)[0]
