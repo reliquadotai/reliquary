@@ -215,10 +215,10 @@ with `docker exec`. The one exception is in step 3, on a non-production host.
    ```
    A set is single-turn when its card's `interaction` is `single_turn` or missing, and every Verifiers card's is
    `single_turn`. Today the single-turn sets offered are exactly those whose `env` starts with `verifiers:`. The
-   others are agentic (SWE, TMax, Terminal-Bench, DeepSWE, SWE-bench Pro and AutomationBench today), graded from
-   their jobs, and neither this step nor step 3 checks them. A non-null `subnet_episode` in the catalog marks an
-   agentic set, but a null does not mark a single-turn one: with the platform's `EVAL_SUBNET_EPISODES` off, every
-   set has a null `subnet_episode`.
+   others are agentic, and neither this step nor step 3 checks them: today SWE, TMax, Terminal-Bench, DeepSWE,
+   SWE-bench Pro and AutomationBench, all graded from their jobs. A non-null `subnet_episode` in the catalog marks
+   an agentic set, but a null does not mark a single-turn one: with the platform's `EVAL_SUBNET_EPISODES` off,
+   every set has a null `subnet_episode`.
 
    How to read the line of a single-turn set the platform offers:
    - `"sealed": false`: the card has no protocol, so neither comparison applies. Only step 3 tells whether the set
@@ -255,9 +255,10 @@ with `docker exec`. The one exception is in step 3, on a non-production host.
    An empty detail or `format_failure` means the set grades, LiveCodeBench's excepted (below). `grader_error`,
    `grader_drift` or `source_drift` means it does not, as does a refusal by an entry point (`load_sets` raises
    `set protocol grader drift` for a card sealed under another fingerprint), with two exceptions. `require_gradable`
-   refuses an agentic card with `set <id> holds <interaction> tasks: grade it from its job (eval grade)`: that set
-   is not single-turn (step 2), and the refusal never means that it does not grade. And these `grader_error`s say
-   nothing about the image:
+   refuses a `swe` or `signed_bridged` card, and an `episode` card with no protocol, with
+   `set <id> holds <interaction> tasks: grade it from its job (eval grade)`: such a set is agentic, not single-turn
+   (step 2), and that refusal never means that it does not grade. And these `grader_error`s say nothing about the
+   image:
    - **Memory.** `--memory` keeps the check from taking the memory of the services beside it; `4g` is a
      suggestion, not a measured need. A scoring child killed for lack of memory reads
      `grader_error: BrokenProcessPool: ...` (after one retry in a fresh child), and a script killed for it ends
@@ -381,6 +382,17 @@ control:
    If `AutoRemove` is `true` (a container started with `--rm`), stop here and ask before going on: `docker stop`
    deletes such a container, and the rollback with it, which would then be a new container from the image ID step
    6 wrote down, with the deployment's options.
+
+   Then, still before anything stops, check that no container holds the name step 3 gives the old one:
+   ```bash
+   docker inspect --format '{{.Id}} {{.State.Status}}' <old container>-before-switch
+   ```
+   It must fail with `Error: No such object: <old container>-before-switch`. A container holding that name makes
+   step 3's rename fail, and only once step 2 has stopped the old container. If it prints an ID and `exited`, that
+   container is most likely the rollback an earlier switch kept, older than the one this switch keeps: rename it to
+   a name no container holds, `docker rename <old container>-before-switch <a free name>`, or, once you no longer
+   need it, remove it, `docker rm <old container>-before-switch`, and run the check again. If it prints anything
+   else (`running`, say), stop here and find out why.
 2. Set its restart policy to `no` while it still runs, then stop it (the admin a few seconds after step 5's
    queries listed nothing that forbids the stop):
    ```bash
@@ -408,7 +420,11 @@ control:
    docker inspect --format '{{.Id}} {{.State.Status}}' <old container>-before-switch
    ```
    It must print the ID step 1 wrote down and `exited`. If it prints anything else, start nothing: rename the
-   container back if the rename succeeded, and find out why. Once it prints both, start the new container from
+   container back if the rename succeeded, `docker rename <old container>-before-switch <old container>`, and find
+   out why. Then, as after a failed step 2 (its last paragraph), fix the cause and run step 2 again, then this step,
+   or call the switch off: `docker update --restart=<Name> <old container> && docker start <old container>`, with
+   `<Name>` as below. Never leave the old container as it is: once step 2's update has run, its policy is `no`, so
+   even running it would stay down after a reboot. Once it prints the ID and `exited`, start the new container from
    `$IMG`, under the old name, with the restart policy step 1 wrote down, not `no`: `--restart=<Name>`, with
    `on-failure:<MaximumRetryCount>` in place of `<Name>` when that count is not 0, and `no` only when the name is
    `no` or empty. Every other setting comes from the deployment's own options and env file, for the admin its
@@ -418,8 +434,11 @@ control:
    bucket and registry).
 
 A rollback is the same switch, back: steps 1 and 2 on the new container (with step 5's queries before and after
-the stop, for the admin), then its rename and check as in step 3, under another free name. Then give the old
-container its name back and the restart policy step 1 wrote down, and start it:
+the stop, for the admin), then its rename and check as in step 3, with another free name in place of
+`<old container>-before-switch`, there and in step 1's check. The old container holds
+`<old container>-before-switch`: it is what the rollback restores, never a container for step 1 to rename or
+remove. Then give the old container its name back and the restart policy step 1 wrote down at the switch, and start
+it:
 ```bash
 docker rename <old container>-before-switch <old container> &&
   docker update --restart=<Name> <old container> &&
