@@ -1194,17 +1194,41 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
     return manifest
 
 
-async def _stored_stamp(sink, report_key: str, *, job, delivery_id: str, clock) -> float:
-    """The creation time of a delivery whose report was written before a crash, else now."""
+async def _delivery_stamp(sink, records, report_key: str, *, job, delivery_id: str, clock) -> float:
+    """The delivery's creation time, the same on every attempt. An OpenAI line embeds it (``created``) and its
+    shard goes up before ``report.json``, to a platform that keeps the first bytes of every delivery object
+    (create-only: other bytes are refused), so an attempt after a restart must write the same shards. It is the
+    report's when one was written, else the one the record store kept for this delivery, else now, kept there
+    before anything is uploaded. A record store without delivery stamps (a test's) stamps each attempt anew."""
+    from reliquary.protocol.release_contract import canonical_sha256
+
     stored_report = await sink.get_json(report_key)
-    if stored_report is None:
+    if stored_report is not None:
+        if (stored_report.get("job_id") != job.job_id or stored_report.get("delivery_id") != delivery_id
+                or stored_report.get("job") != job.to_contract()):
+            raise ValueError("delivery report belongs to another job contract")
+        stamp = stored_report.get("created_at")
+        if not isinstance(stamp, (int, float)) or isinstance(stamp, bool):
+            raise ValueError("delivery report has no creation timestamp")
+        return stamp
+    read, write = getattr(records, "read_delivery_stamp", None), getattr(records, "write_delivery_stamp", None)
+    if read is None or write is None:
         return clock()
-    if (stored_report.get("job_id") != job.job_id or stored_report.get("delivery_id") != delivery_id
-            or stored_report.get("job") != job.to_contract()):
-        raise ValueError("delivery report belongs to another job contract")
-    stamp = stored_report.get("created_at")
+    contract = canonical_sha256(job.to_contract())
+    stored = await read(job.job_id, delivery_id)
+    if stored is None:
+        stamp = clock()
+        if await write(job.job_id, delivery_id, {"job_id": job.job_id, "delivery_id": delivery_id,
+                                                 "job_manifest_sha256": contract, "created_at": stamp}):
+            return stamp
+        # Another attempt kept one first: the delivery is stamped with it.
+        stored = await read(job.job_id, delivery_id)
+    if (not isinstance(stored, Mapping) or stored.get("job_id") != job.job_id
+            or stored.get("delivery_id") != delivery_id or stored.get("job_manifest_sha256") != contract):
+        raise ValueError("delivery stamp belongs to another job contract")
+    stamp = stored.get("created_at")
     if not isinstance(stamp, (int, float)) or isinstance(stamp, bool):
-        raise ValueError("delivery report has no creation timestamp")
+        raise ValueError("delivery stamp has no creation timestamp")
     return stamp
 
 
@@ -1233,7 +1257,7 @@ async def _export_v3(*, job, records, sink, delivery_id: str, grade, filter_note
     if stored is not None:
         validate_cached_delivery(stored, job=job, sink=sink)
         return stored
-    stamp = await _stored_stamp(sink, report_key, job=job, delivery_id=delivery_id, clock=clock)
+    stamp = await _delivery_stamp(sink, records, report_key, job=job, delivery_id=delivery_id, clock=clock)
     root = Path(work_dir) if work_dir is not None else Path(tempfile.gettempdir())
     root.mkdir(parents=True, exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix=f"delivery-{delivery_id}-", dir=root))

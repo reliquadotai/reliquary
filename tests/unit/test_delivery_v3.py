@@ -222,6 +222,113 @@ def test_v3_openai_jsonl_answers_a_chat_request_with_a_chat_completion(tmp_path)
     assert body["choices"][0]["message"] == {"role": "assistant", "content": "p0s0"}
 
 
+class _Restart(Exception):
+    """The admin stops mid-export (a restart, a rollback, an OOM)."""
+
+
+class _PlatformDeliveries:
+    """Delivery objects as the platform keeps them: create-only, the same bytes again accepted and other bytes
+    refused (409 ``delivery_conflict``); only the manifest and the report read back. The admin stops
+    (``_Restart``) right after uploading ``stop_after``, once."""
+
+    def __init__(self, stop_after: str | None = None) -> None:
+        self.objects: dict[str, bytes] = {}
+        self.puts: list[tuple[str, bytes]] = []
+        self.stop_after = stop_after
+
+    def _put(self, key: str, body: bytes) -> None:
+        if self.objects.setdefault(key, body) != body:
+            raise RuntimeError("platform delivery upload refused (409)")
+        self.puts.append((key, body))
+        if self.stop_after is not None and key.rsplit("/", 1)[1] == self.stop_after:
+            self.stop_after = None
+            raise _Restart(key)
+
+    async def put_file(self, key, path):
+        self._put(key, path.read_bytes())
+
+    async def put_json(self, key, document):
+        self._put(key, json.dumps(document, sort_keys=True).encode())
+
+    async def get_json(self, key):
+        assert key.rsplit("/", 1)[1] in ("manifest.json", "report.json")
+        body = self.objects.get(key)
+        return None if body is None else json.loads(body)
+
+
+class _StampedRecords(_Records):
+    """With the record store's delivery stamps, kept in ``bucket``: what outlives an admin restart."""
+
+    def __init__(self, bucket: dict) -> None:
+        super().__init__()
+        self.bucket = bucket
+
+    async def read_delivery_stamp(self, job_id, delivery_id):
+        return self.bucket.get((job_id, delivery_id))
+
+    async def write_delivery_stamp(self, job_id, delivery_id, stamp):
+        if (job_id, delivery_id) in self.bucket:
+            return False
+        self.bucket[(job_id, delivery_id)] = json.loads(json.dumps(stamp))
+        return True
+
+
+def _openai_attempt(tmp_path, platform, records, *, now: float, delivery_id: str = "d-1"):
+    # 500 bytes: each OpenAI line (453, 386 and 386 bytes) in its own shard, the three errors in one.
+    return asyncio.run(export_delivery(
+        job=_job(), records=records, sink=platform, delivery_id=delivery_id, work_dir=tmp_path / "work",
+        schema_version=3, clock=lambda: now, set_rows=SET_ROWS, output_format="openai_jsonl",
+        shard_max_bytes=500))
+
+
+def test_a_v3_export_stopped_after_its_first_shard_uploads_the_same_bytes_again(tmp_path):
+    platform, bucket = _PlatformDeliveries(stop_after="output-00000.jsonl"), {}
+    with pytest.raises(_Restart):
+        _openai_attempt(tmp_path, platform, _StampedRecords(bucket), now=5.0)
+    first = dict(platform.puts)
+    assert list(first) == ["deliveries/d-1/output-00000.jsonl"]
+    # Back an hour later: the stamp kept before the first upload dates the lines again, not the clock.
+    before = len(platform.puts)
+    manifest = _openai_attempt(tmp_path, platform, _StampedRecords(bucket), now=3605.0)
+    again = dict(platform.puts[before:])
+    shard = first["deliveries/d-1/output-00000.jsonl"]
+    assert again["deliveries/d-1/output-00000.jsonl"] == shard
+    assert [s["name"] for s in manifest["shards"]] == [f"output-0000{i}.jsonl" for i in range(3)]
+    assert manifest["shards"][0]["sha256"] == hashlib.sha256(shard).hexdigest()
+    assert manifest["created_at"] == 5.0 and manifest["rows"] == 4
+    assert "deliveries/d-1/manifest.json" in again
+    lines = [json.loads(line) for s in manifest["shards"] for line in platform.objects[s["key"]].splitlines()]
+    assert [line["custom_id"] for line in lines] == ["req-0", "req-1", "req-2"]
+    assert {line["response"]["body"]["created"] for line in lines} == {5}
+    assert json.loads(platform.objects["deliveries/d-1/report.json"])["created_at"] == 5.0
+    assert bucket[("order-gen-x", "d-1")]["created_at"] == 5.0
+
+
+def test_a_v3_export_takes_the_stamp_kept_first_and_refuses_another_contracts(tmp_path):
+    from reliquary.protocol.release_contract import canonical_sha256
+
+    kept = {"job_id": "order-gen-x", "delivery_id": "d-1", "created_at": 42.0,
+            "job_manifest_sha256": canonical_sha256({"job_id": "order-gen-x"})}
+    bucket: dict = {}
+    records = _StampedRecords(bucket)
+    write = records.write_delivery_stamp
+
+    async def raced(job_id, delivery_id, stamp):
+        bucket.setdefault((job_id, delivery_id), kept)  # another attempt keeps its stamp first
+        return await write(job_id, delivery_id, stamp)
+
+    records.write_delivery_stamp = raced
+    platform = _PlatformDeliveries()
+    manifest = _openai_attempt(tmp_path, platform, records, now=5.0)
+    assert manifest["created_at"] == 42.0
+    body = json.loads(platform.objects["deliveries/d-1/output-00000.jsonl"])["response"]["body"]
+    assert body["created"] == 42
+    bucket[("order-gen-x", "d-2")] = {**kept, "delivery_id": "d-2", "job_manifest_sha256": "0" * 64}
+    with pytest.raises(ValueError, match="another job contract"):
+        _openai_attempt(tmp_path, platform, _StampedRecords(bucket), now=5.0, delivery_id="d-2")
+    assert not any(key.startswith("deliveries/d-2/") for key in platform.objects)
+
+
 def test_v3_refuses_a_filter_without_a_grader_and_v2_options_stay_v2(tmp_path):
     with pytest.raises(ValueError, match="grader"):
         _export(tmp_path, _job(), _Records(), filter_mode="annotate")

@@ -62,6 +62,20 @@ def test_settlement_is_compare_and_swap(r2):
     assert run(records.read_settlement("math-v1"))[0] == {"last_window": 2}
 
 
+def test_a_delivery_stamp_is_kept_once_beside_its_job(r2):
+    stamp = {"delivery_id": "dl-1", "created_at": 5.0}
+    assert run(records.read_delivery_stamp("math-v1", "dl-1")) is None
+    assert run(records.write_delivery_stamp("math-v1", "dl-1", stamp)) is True
+    assert run(records.write_delivery_stamp("math-v1", "dl-1", {**stamp, "created_at": 6.0})) is False
+    assert run(records.read_delivery_stamp("math-v1", "dl-1")) == stamp
+    assert run(records.read_delivery_stamp("math-v2", "dl-1")) is None
+    assert list(r2.objects) == ["reliquary/corpus/jobs/math-v1/delivery-stamps/dl-1.json"]
+    assert run(job_store.list_jobs()) == []
+    for bad in ("../dl-1", "dl/1", ""):
+        with pytest.raises(ValueError):
+            run(records.write_delivery_stamp("math-v1", bad, stamp))
+
+
 @pytest.mark.parametrize("bad", ["../x", "C" * 64, "c" * 63, ""])
 def test_an_id_that_is_not_a_digest_never_reaches_a_key(r2, bad):
     with pytest.raises(ValueError):
