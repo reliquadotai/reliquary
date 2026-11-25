@@ -1035,6 +1035,21 @@ def _frequent_drifts(monkeypatch, kind="base", *, q=1.0, settled=False, penalise
     return run
 
 
+@pytest.mark.parametrize("kind, q, settled", [("base", 1.0, False), ("base", 0.25, True),
+                                              ("eval", 1.0, False), ("eval", 0.25, True)])
+def test_a_drift_charged_for_frequent_refusals_reopens_its_slot_as_its_void_lands(monkeypatch, kind, q, settled):
+    """A drift the re-audit charges for frequent refusals is a refused sample like the others: its slot reopens as
+    soon as its void is written, before the status hears of it, as a judging pass reopens every refused sample's
+    (`_write`), charged or not. At q = 1, or settled inside the hold window, no forfeit reopens it; the base auditor
+    used to leave it to the next start's reconcile, the eval auditor to reopen it after every void. Each slot reopens
+    once: the eval auditor does not reopen the charged one again after the loop."""
+    run = _frequent_drifts(monkeypatch, kind, q=q, settled=settled)
+    assert run.voided == run.ids
+    assert run.records.voided[run.ids[2]]["charged_for"] == "frequent_refusals"
+    assert run.states.states["5X"].failure_ids == [run.ids[2]]
+    assert run.events == [event for sid in run.ids for event in (("reopen", [sid]), ("voided", sid))]
+
+
 def test_a_reaudit_counts_a_penalised_refusal_with_its_hotkeys_drifts(monkeypatch):
     """5X's first record is refused with a penalty, the next two as drifts. A judging pass counts all three as
     refusals, and the third, 3 refused in 3 audits, is charged for frequent refusals. The re-audit of the same three
