@@ -1194,12 +1194,25 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
     return manifest
 
 
+class DeliveryStampContended(RuntimeError):
+    """The create of the delivery's stamp was refused and none reads back yet (another attempt's create is still
+    in flight): retry the delivery."""
+
+
+# A stamp create refused while none reads back (another attempt's create is still in flight: R2 answers 409
+# until it lands) is tried this many times, backing off from this delay, as a seen segment's is.
+STAMP_ATTEMPTS = 4
+STAMP_RETRY_DELAY_SECONDS = 0.2
+
+
 async def _delivery_stamp(sink, records, report_key: str, *, job, delivery_id: str, clock) -> float:
-    """The delivery's creation time, the same on every attempt. An OpenAI line embeds it (``created``) and its
-    shard goes up before ``report.json``, to a platform that keeps the first bytes of every delivery object
-    (create-only: other bytes are refused), so an attempt after a restart must write the same shards. It is the
-    report's when one was written, else the one the record store kept for this delivery, else now, kept there
-    before anything is uploaded. A record store without delivery stamps (a test's) stamps each attempt anew."""
+    """The delivery's creation time, the same on every attempt made with this code (an older admin never reads
+    the kept stamp). An OpenAI line embeds it (``created``) and its shard goes up before ``report.json``, to a
+    platform that keeps the first bytes of every delivery object (create-only: other bytes are refused), so a
+    retry must stamp its shards as the first attempt did. It is the report's when one was written, else the one
+    the record store kept for this delivery, else now, kept there before anything is uploaded. A kept stamp is a
+    time, not a contract pin: one kept under another job contract is still used, with a warning. A record store
+    without delivery stamps (a test's) stamps each attempt anew."""
     from reliquary.protocol.release_contract import canonical_sha256
 
     stored_report = await sink.get_json(report_key)
@@ -1213,22 +1226,32 @@ async def _delivery_stamp(sink, records, report_key: str, *, job, delivery_id: s
         return stamp
     read, write = getattr(records, "read_delivery_stamp", None), getattr(records, "write_delivery_stamp", None)
     if read is None or write is None:
+        if getattr(sink, "create_only", False):
+            logger.warning("corpus delivery %s of %s: the record store keeps no delivery stamps, so a retry of "
+                           "this export may be refused by the platform", delivery_id, job.job_id)
         return clock()
     contract = canonical_sha256(job.to_contract())
     stored = await read(job.job_id, delivery_id)
-    if stored is None:
+    for attempt in range(STAMP_ATTEMPTS):
+        if stored is not None:
+            break
+        if attempt:
+            await asyncio.sleep(STAMP_RETRY_DELAY_SECONDS * 2 ** (attempt - 1))
         stamp = clock()
         if await write(job.job_id, delivery_id, {"job_id": job.job_id, "delivery_id": delivery_id,
                                                  "job_manifest_sha256": contract, "created_at": stamp}):
             return stamp
-        # Another attempt kept one first: the delivery is stamped with it.
         stored = await read(job.job_id, delivery_id)
-    if (not isinstance(stored, Mapping) or stored.get("job_id") != job.job_id
-            or stored.get("delivery_id") != delivery_id or stored.get("job_manifest_sha256") != contract):
-        raise ValueError("delivery stamp belongs to another job contract")
-    stamp = stored.get("created_at")
+    if stored is None:
+        raise DeliveryStampContended(f"the stamp of delivery {delivery_id} of {job.job_id} stayed contended "
+                                     "and absent: retry the delivery")
+    stamp = stored.get("created_at") if isinstance(stored, Mapping) else None
     if not isinstance(stamp, (int, float)) or isinstance(stamp, bool):
-        raise ValueError("delivery stamp has no creation timestamp")
+        raise ValueError(f"the stamp kept for delivery {delivery_id} of {job.job_id} has no creation timestamp")
+    if (stored.get("job_id"), stored.get("delivery_id"), stored.get("job_manifest_sha256")) \
+            != (job.job_id, delivery_id, contract):
+        logger.warning("corpus delivery %s of %s: its stamp was kept under another job contract; using it",
+                       delivery_id, job.job_id)
     return stamp
 
 
@@ -1493,6 +1516,8 @@ class HTTPDeliverySink:
     max_file_bytes = 64 * 1024 * 1024
     max_json_bytes = 1024 * 1024
     requires_job_contract_pin = True
+    # The platform keeps the first bytes of every object: the same bytes again are accepted, others refused.
+    create_only = True
     evaluation_supported = False
     _key = re.compile(r"^deliveries/subnet-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
                       r"[89ab][0-9a-f]{3}-[0-9a-f]{12})/([A-Za-z0-9_.()-]{1,100})$")
@@ -1645,6 +1670,7 @@ class HTTPDeliverySink:
 __all__ = [
     "DELIVERY_SCHEMA",
     "DELIVERY_SCHEMA_V3",
+    "DeliveryStampContended",
     "V3_FILTERS",
     "V3_FORMATS",
     "V3_ROW_FIELDS",

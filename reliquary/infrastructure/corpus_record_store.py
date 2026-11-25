@@ -435,8 +435,8 @@ async def read_delivery_stamp(job_id, delivery_id, **client_kwargs) -> dict | No
 
 async def write_delivery_stamp(job_id, delivery_id, stamp, **client_kwargs) -> bool:
     """When a delivery of the job was stamped, kept from before its first upload so
-    that every attempt writes the same bytes (``delivery._delivery_stamp``):
-    create-only; False when one is already written."""
+    that every attempt stamps the same ``created`` (``delivery._delivery_stamp``):
+    create-only; False when another create won or is still in flight."""
     return await _create(_delivery_stamp_key(job_id, delivery_id), stamp, **client_kwargs)
 
 

@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from types import SimpleNamespace
 
 import pyarrow.parquet as pq
 import pytest
 
+from reliquary.corpus import delivery
 from reliquary.corpus.delivery import (
     DELIVERY_SCHEMA_V3,
     V3_ROW_FIELDS,
@@ -20,6 +22,7 @@ from reliquary.corpus.delivery import (
     set_rows_for_job,
 )
 from reliquary.corpus.encoding import token_ids_text
+from reliquary.protocol.release_contract import canonical_sha256
 
 EOS = 99
 
@@ -223,13 +226,15 @@ def test_v3_openai_jsonl_answers_a_chat_request_with_a_chat_completion(tmp_path)
 
 
 class _Restart(Exception):
-    """The admin stops mid-export (a restart, a rollback, an OOM)."""
+    """The admin stops mid-export (a crash, an OOM, a restart on the same build)."""
 
 
 class _PlatformDeliveries:
     """Delivery objects as the platform keeps them: create-only, the same bytes again accepted and other bytes
     refused (409 ``delivery_conflict``); only the manifest and the report read back. The admin stops
     (``_Restart``) right after uploading ``stop_after``, once."""
+
+    create_only = True
 
     def __init__(self, stop_after: str | None = None) -> None:
         self.objects: dict[str, bytes] = {}
@@ -304,9 +309,47 @@ def test_a_v3_export_stopped_after_its_first_shard_uploads_the_same_bytes_again(
     assert bucket[("order-gen-x", "d-1")]["created_at"] == 5.0
 
 
-def test_a_v3_export_takes_the_stamp_kept_first_and_refuses_another_contracts(tmp_path):
-    from reliquary.protocol.release_contract import canonical_sha256
+T1 = 1764048123.4567891  # a time.time() float: the kept stamp must read back as this very float
+T2 = T1 + 3600
 
+
+@pytest.mark.parametrize("output_format, padding, shard_max_bytes", [
+    # A row over half the shard budget: one Parquet row per part shard. One OpenAI line per output shard.
+    ("parquet", 20_000, 40_000), ("openai_jsonl", 0, 500)])
+def test_a_v3_export_stopped_after_any_upload_ends_as_an_uninterrupted_one(tmp_path, output_format, padding,
+                                                                         shard_max_bytes):
+    def records(bucket):
+        stamped = _StampedRecords(bucket)
+        for record in stamped.subs.values():
+            record["completions"][0]["text"] += "x" * padding
+        return stamped
+
+    def attempt(platform, stamped, now):
+        return asyncio.run(export_delivery(
+            job=_job(), records=stamped, sink=platform, delivery_id="d-1", work_dir=tmp_path / "work",
+            schema_version=3, clock=lambda: now, set_rows=SET_ROWS, output_format=output_format,
+            shard_max_bytes=shard_max_bytes))
+
+    reference = _PlatformDeliveries()
+    expected = attempt(reference, records({}), T1)
+    names = [key.rsplit("/", 1)[1] for key, _ in reference.puts]
+    assert len(expected["shards"]) > 1 and names[-2:] == ["report.json", "manifest.json"]
+    # After each upload but the manifest, and (None) after the stamp is kept but before any upload.
+    for stop in (None, *names[:-1]):
+        platform, bucket = _PlatformDeliveries(stop_after=stop), {}
+        first = records(bucket)
+        if stop is None:
+            async def unreadable(job_id):
+                raise OSError("the record store is unreachable")
+
+            first.list_verdict_ids = unreadable
+        with pytest.raises(OSError if stop is None else _Restart):
+            attempt(platform, first, T1)
+        assert attempt(platform, records(bucket), T2) == expected, stop
+        assert platform.objects == reference.objects, stop
+
+
+def test_a_v3_export_takes_the_stamp_kept_first_even_under_another_contract(tmp_path, caplog):
     kept = {"job_id": "order-gen-x", "delivery_id": "d-1", "created_at": 42.0,
             "job_manifest_sha256": canonical_sha256({"job_id": "order-gen-x"})}
     bucket: dict = {}
@@ -319,14 +362,52 @@ def test_a_v3_export_takes_the_stamp_kept_first_and_refuses_another_contracts(tm
 
     records.write_delivery_stamp = raced
     platform = _PlatformDeliveries()
-    manifest = _openai_attempt(tmp_path, platform, records, now=5.0)
-    assert manifest["created_at"] == 42.0
+    with caplog.at_level(logging.WARNING, logger="reliquary.corpus.delivery"):
+        assert _openai_attempt(tmp_path, platform, records, now=5.0)["created_at"] == 42.0
     body = json.loads(platform.objects["deliveries/d-1/output-00000.jsonl"])["response"]["body"]
-    assert body["created"] == 42
+    assert body["created"] == 42 and "another job contract" not in caplog.text
+    # Kept before a change of what the job's contract hashes to: still the delivery's time, with a warning.
     bucket[("order-gen-x", "d-2")] = {**kept, "delivery_id": "d-2", "job_manifest_sha256": "0" * 64}
-    with pytest.raises(ValueError, match="another job contract"):
-        _openai_attempt(tmp_path, platform, _StampedRecords(bucket), now=5.0, delivery_id="d-2")
-    assert not any(key.startswith("deliveries/d-2/") for key in platform.objects)
+    with caplog.at_level(logging.WARNING, logger="reliquary.corpus.delivery"):
+        manifest = _openai_attempt(tmp_path, platform, _StampedRecords(bucket), now=5.0, delivery_id="d-2")
+    assert manifest["created_at"] == 42.0 and "another job contract" in caplog.text
+
+
+class _ContendedRecords(_Records):
+    """Every stamp create refused, as while another attempt's create is in flight; that stamp reads back from
+    read number ``lands`` on (never when None)."""
+
+    def __init__(self, lands: int | None = None) -> None:
+        super().__init__()
+        self.lands, self.reads, self.writes = lands, 0, 0
+
+    async def read_delivery_stamp(self, job_id, delivery_id):
+        self.reads += 1
+        if self.lands is None or self.reads < self.lands:
+            return None
+        return {"job_id": job_id, "delivery_id": delivery_id, "created_at": 42.0,
+                "job_manifest_sha256": canonical_sha256({"job_id": job_id})}
+
+    async def write_delivery_stamp(self, job_id, delivery_id, stamp):
+        self.writes += 1
+        return False
+
+
+def test_a_refused_stamp_create_is_read_back_and_retried_before_the_export_gives_up(tmp_path, monkeypatch):
+    monkeypatch.setattr(delivery, "STAMP_RETRY_DELAY_SECONDS", 0.0)
+    landing = _ContendedRecords(lands=3)
+    assert _openai_attempt(tmp_path, _PlatformDeliveries(), landing, now=5.0)["created_at"] == 42.0
+    assert (landing.reads, landing.writes) == (3, 2)
+    never, platform = _ContendedRecords(), _PlatformDeliveries()
+    with pytest.raises(delivery.DeliveryStampContended, match="contended"):
+        _openai_attempt(tmp_path, platform, never, now=5.0)
+    assert never.writes == delivery.STAMP_ATTEMPTS and platform.puts == []
+
+
+def test_a_create_only_platform_without_kept_stamps_is_warned_of(tmp_path, caplog):
+    with caplog.at_level(logging.WARNING, logger="reliquary.corpus.delivery"):
+        assert _openai_attempt(tmp_path, _PlatformDeliveries(), _Records(), now=5.0)["created_at"] == 5.0
+    assert "keeps no delivery stamps" in caplog.text
 
 
 def test_v3_refuses_a_filter_without_a_grader_and_v2_options_stay_v2(tmp_path):
