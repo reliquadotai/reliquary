@@ -34,7 +34,9 @@ the book) and the corpus thresholds below.
   allocation (MAIN: ``floor``; pooled: its member share and the entity's room), and the fleet's held sessions + 1
   fit within ``C`` less the room the pooled entities were allocated and have not filled yet. A refusal is
   ``quota_live`` (its own allocation, or the fleet) or ``quota_pool`` (its pooled entity), 429 with ``Retry-After``
-  and the hotkey's ``allowance`` in the detail.
+  and the hotkey's ``allowance`` in the detail. A refusal is FLEET-FULL (``fleet_refusals``, per job, for the order
+  control's status) when more capacity would have admitted it: no capacity known, the fleet check, or any refusal
+  of a hotkey outside the low-yield entity while the allocation leaves no whole session unallocated.
 * ALLOWANCE (what the miner is told: on every grant and in every quota refusal): its POTENTIAL, the sessions it
   would get if it asked for the whole fleet, the others' demands as measured (``rl_capacity.potential``; for a pooled
   hotkey, its member share of its entity's potential). The miner grows its live sessions to it.
@@ -43,15 +45,22 @@ the book) and the corpus thresholds below.
   live caps no longer bind: they become safety ceilings (``max_live_per_hotkey`` / ``max_live_per_hotkey_job``,
   by default the fleet's capacity, never below the policy's own). One live session per (hotkey, prompt) and the
   prompt's own slots stay as they were.
+* DECLARED WANT (design ``docs/design/2026-11-13-sandbox-sizing-miner-demand.md``): a corpus open may carry the
+  live sessions the hotkey wants on that job (``SandboxEngagement.want``, signed with the engagement). ``declare``
+  keeps the last one per (job, hotkey) for ``FORECAST_WINDOW_S``; the order control sizes the sandbox fleet from them
+  (``order_sandbox_status.job_demand``). A declaration never changes the allocation or the allowance: it only makes
+  the demand the miner hides behind its allowance visible, so the fleet ``C`` grows to it.
 
 Every method is synchronous and called on the event loop (the issuer calls ``admit`` under its lock)."""
 from __future__ import annotations
 
+import collections
 import math
 import time
 from collections.abc import Callable
 from typing import Any
 
+from reliquary.protocol.sandbox_session import WANT_ACCEPTED
 from reliquary.sandbox.rl_capacity import (
     ALLOCATION_REFRESH_S,
     DEMAND_MEMORY_S,
@@ -93,6 +102,9 @@ NEWCOMER_WEIGHT = 4.0          # the newcomer entity's weight for spare capacity
 GROUP = 1                      # a corpus session is its own group (rl_capacity's ``pool_seeds``)
 
 USEFUL, WASTED, NEUTRAL = "useful", "wasted", "neutral"
+
+FLEET_REFUSALS_WINDOW_S = 600  # the fleet-full refusals kept per job (``fleet_refusals``)
+FORECAST_WINDOW_S = 6 * 3600   # declarations kept (a later job of the same model forecasts from them)
 
 
 def outcome(record: Any) -> str | None:
@@ -182,6 +194,8 @@ class CorpusQuota:
         self._shares: dict[str, float] = {}                 # pooled hotkey -> its member share
         self._weights: dict[str, float] = {}
         self._potentials: dict[str, int] = {}
+        self._fleet_full: dict[str, collections.deque[int]] = {}   # job id -> times of its fleet-full refusals
+        self._declared: dict[str, dict[str, tuple[int, int, int]]] = {}  # job -> hotkey -> (want, when, peak held)
 
     def install(self) -> None:
         """The session book's per-hotkey caps follow the quota from now on."""
@@ -331,10 +345,43 @@ class CorpusQuota:
         return room
 
     # --- admission ---
-    def admit(self, hotkey: str, now: int, *, engagement: str | None = None) -> Refusal | None:
+    def admit(self, hotkey: str, now: int, *, engagement: str | None = None,
+              job_id: str | None = None) -> Refusal | None:
         """None admits. The issuer calls it under its lock for an ADMISSIBLE open (the book's caps and the prompt's
-        slots passed): the ask counts as demand for DEMAND_TTL_S."""
-        hotkey, now = str(hotkey), int(now)
+        slots passed): the ask counts as demand for DEMAND_TTL_S. A fleet-full refusal is counted for ``job_id``."""
+        refusal = self._admit(str(hotkey), int(now), engagement)
+        if refusal is not None and job_id is not None and self._is_fleet_full(refusal):
+            times = self._fleet_full.setdefault(str(job_id), collections.deque())
+            while times and times[0] < int(now) - FLEET_REFUSALS_WINDOW_S:   # bounded even if never read
+                times.popleft()
+            times.append(int(now))
+        return refusal
+
+    def _is_fleet_full(self, refusal: Refusal) -> bool:
+        """Whether more capacity would have admitted it (module docstring)."""
+        detail = refusal.detail or {}
+        if detail.get("why") in ("fleet", "no fleet capacity known yet"):
+            return True
+        alloc = self._alloc
+        if alloc is None or detail.get("standing") == LOW_YIELD:
+            return False
+        allocated = alloc.newcomer + alloc.low_yield + sum(alloc.main.values())
+        return alloc.capacity - allocated < 1.0
+
+    def fleet_refusals(self, job_id: str, now: float | None = None, window_s: float = FLEET_REFUSALS_WINDOW_S) -> int:
+        """The job's fleet-full refusals in the last ``window_s`` (at most FLEET_REFUSALS_WINDOW_S)."""
+        now = int(self._clock() if now is None else now)
+        times = self._fleet_full.get(str(job_id))
+        if not times:
+            return 0
+        while times and times[0] < now - FLEET_REFUSALS_WINDOW_S:
+            times.popleft()
+        if not times:
+            del self._fleet_full[str(job_id)]
+            return 0
+        return sum(1 for at in times if at >= now - window_s)
+
+    def _admit(self, hotkey: str, now: int, engagement: str | None) -> Refusal | None:
         if engagement is not None:
             self._wants.setdefault(hotkey, {})[str(engagement)] = float(now)
         held = self._held_by_hotkey(now)
@@ -345,10 +392,11 @@ class CorpusQuota:
         alloc = self._alloc
         retry = self._policy.retry_after_s
         if alloc is None or alloc.capacity <= 0:
-            return Refusal("quota_live", {"why": "no fleet capacity known yet", "allowance": 0}, retry_after=retry)
+            return Refusal("quota_live", {"why": "no fleet capacity known yet", "allowance": 0, WANT_ACCEPTED: True},
+                           retry_after=retry)
         lane = self._lanes.get(hotkey) or self.lane(hotkey)
         detail = {"standing": lane, "live": mine, "allowance": self.allowance(hotkey),
-                  "fleet_sessions": int(alloc.capacity)}
+                  "fleet_sessions": int(alloc.capacity), WANT_ACCEPTED: True}
         limit = self._limit(hotkey, lane, alloc)
         if mine + 1 > limit:
             return Refusal("quota_live", {**detail, "max": limit}, retry_after=retry)
@@ -364,6 +412,33 @@ class CorpusQuota:
                 return Refusal("quota_pool", {**detail, "pool": lane, "pool_held": pooled, "max": total},
                                retry_after=retry)
         return None
+
+    # --- declared wants ---
+    def declare(self, hotkey: str, job_id: str | None, want: Any, now: float | None = None) -> None:
+        """Keep ``hotkey``'s declared want on ``job_id`` (an authenticated open's ``engagement.want``), and the most
+        sessions it was seen holding there (the forecast's bound: what it showed it can run, not what it says)."""
+        from reliquary.protocol.sandbox_session import MAX_SESSION_WANT
+
+        if job_id is None or isinstance(want, bool) or not isinstance(want, int) or want < 1:
+            return
+        now = int(self._clock() if now is None else now)
+        job_id, hotkey = str(job_id), str(hotkey)
+        holds = sum(1 for r in self._book.of_hotkey(hotkey) if r.job_id == job_id and SessionBook._holds(r, now))
+        before = self._declared.get(job_id, {}).get(hotkey)
+        peak = max(holds, 0 if before is None else before[2])
+        self._declared.setdefault(job_id, {})[hotkey] = (min(int(want), MAX_SESSION_WANT), now, peak)
+
+    def declarations(self, now: float | None = None) -> dict[str, dict[str, tuple[int, int, int]]]:
+        """job id -> hotkey -> (want, when declared, most sessions held there when declaring), the last
+        FORECAST_WINDOW_S (older ones are dropped)."""
+        now = int(self._clock() if now is None else now)
+        for job_id in list(self._declared):
+            kept = {k: v for k, v in self._declared[job_id].items() if v[1] >= now - FORECAST_WINDOW_S}
+            if kept:
+                self._declared[job_id] = kept
+            else:
+                del self._declared[job_id]
+        return {job_id: dict(wants) for job_id, wants in self._declared.items()}
 
     # --- the session book's caps ---
     def ceilings(self, hotkey: str) -> tuple[int, int]:
@@ -391,4 +466,4 @@ class CorpusQuota:
                             for k, lane in self._lanes.items()}}
 
 
-__all__ = ["CorpusQuota", "multiplier", "outcome", "standing", "stats_of", "weight"]
+__all__ = ["FORECAST_WINDOW_S", "CorpusQuota", "multiplier", "outcome", "standing", "stats_of", "weight"]

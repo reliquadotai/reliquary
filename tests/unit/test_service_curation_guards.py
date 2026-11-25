@@ -88,12 +88,15 @@ SLIPPING_FORMS = [
     "AIME_2025", "aime25", "LiveCodeBench/code_generation_lite", "TIGER-Lab/MMLU-Pro", "gorilla-llm/BFCL_v3",
     "allenai/IFBench_test", "sierra-research/tau2-bench", "tau-bench", "SWEBenchVerified", "lcb-v5",
     "AIMEI", "AIMEII", "AIME_I", "aime-ii", "aimei",
+    "MathArena/hmmt_feb_2026", "hmmt-feb-2026", "openai/graphwalks", "graph_walks", "openai/mrcr", "mrcr_v2",
+    "cais/hle-diamond", "hle", "hle-diamond-text-det", "HumanitysLastExam",
 ]
 LEGIT_TRAIN_NAMES = [
     "nvidia/OpenMathInstruct-2", "agentica-org/DeepScaleR-Preview-Dataset", "open-r1/codeforces",
     "PrimeIntellect/verifiable-math-problems", "allenai/tulu-3-sft-mixture", "claimed-rows", "paid-ament",
     "mainstream-slice", "xaime-slice", "ugpqa", "tau2x", "gpqas", "HuggingFaceH4/ultrafeedback_binarized",
     "airbnb/listings", "aimed-dataset", "aimeiser", "aimeinc", "AI-MO/NuminaMath-CoT", "terminal-sessions-train",
+    "handle-rows", "while-loops", "hlek", "graph-reasoning",
 ]
 
 

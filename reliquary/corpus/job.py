@@ -15,6 +15,7 @@ import re
 from typing import Any
 
 # Pure: a prefix test on the prompt source, loading nothing.
+from reliquary.env_catalog import CATALOG as ENV_CATALOG
 from reliquary.eval.prompt_source import is_eval_source
 
 JOB_SCHEMA = "reliquary/corpus-job/v1"
@@ -64,9 +65,10 @@ _JOB_FIELDS = (
 # predates it refuses a manifest carrying it (unknown field): miners and
 # validators of a job with ``prompt_start > 0`` need a build that knows it.
 _OPTIONAL_JOB_FIELDS = ("prompt_start", "seed", "submit", "episode", "judge", "max_prompt_tokens")
-# The longest prompt a job may declare it holds (``max_prompt_tokens``): a long-context job's miners size their
-# engine to it; the wire bounds a completion at the same.
+# Miners size their engine to this allowance plus the completion budget. A single-turn draw can
+# use the remainder of its audit item's sequence for the prompt.
 MAX_JOB_PROMPT_TOKENS = 131072
+MAX_DRAWN_SEQUENCE_TOKENS = 262144
 # A forced-draw job's judge (``corpus.eval_draw.judge``): how far a sample may stray from its draw.
 _JUDGE_FIELDS = ("floor_rate", "grace", "gap_tolerance", "terminal_gap", "edge_margin")
 MIN_JUDGE_FLOOR_RATE = 0.5
@@ -132,8 +134,11 @@ MAX_SUITE_TOKENS_PER_TURN = SUITE_ACTION_BYTES // SUITE_BYTES_PER_TOKEN
 SWE_PACKAGE = "reliquary-swe"
 # Envs served through the sandbox's verifiers bridge that an eval job may run besides
 # reliquary-swe: signed only, eval only, read through `episode.bridge` (the gateway's
-# options and image lock), as an RL run reads its bridged envs.
-BRIDGED_EVAL_PACKAGES = frozenset({"reliquary-terminal"})
+# options and image lock), as an RL run reads its bridged envs. Every process that serves
+# such a job still needs the package installed at the episode's pinned identity
+# (`agentic_swe.sandbox_support_refusal`): naming one here only lets a manifest carry it.
+# The environment catalog's ``bridged`` packages (``reliquary.env_catalog``).
+BRIDGED_EVAL_PACKAGES = frozenset(name for name, env in ENV_CATALOG.items() if env.bridged)
 EPISODE_ENV_PACKAGES = frozenset({SWE_PACKAGE, SUITE_PACKAGE}) | BRIDGED_EVAL_PACKAGES
 EPISODE_HARNESSES = frozenset({"bash", SUITE_HARNESS})
 # The packages each harness runs: never mixed.
@@ -156,7 +161,8 @@ _RENDERER_RE = re.compile(r"\Arenderers:[a-z0-9.]+@\d+\.\d+\.\d+\Z")
 EXECUTION_REPLAY = "replay"
 EXECUTION_SIGNED_SANDBOX = "signed_sandbox"
 EXECUTIONS = frozenset({EXECUTION_REPLAY, EXECUTION_SIGNED_SANDBOX})
-_EPISODE_OPTIONAL_FIELDS = ("execution", "sandbox", "harness_spec", "bridge")
+_EPISODE_OPTIONAL_FIELDS = ("execution", "sandbox", "harness_spec", "bridge", "profile",
+                            "limit_cut_fails")
 # `bridge` (a bridged eval env's only, so every other manifest hashes as before): the
 # options the gateway serves the env with and the digest of its image lock.
 _BRIDGE_FIELDS = ("options", "image_lock_sha256")
@@ -165,6 +171,80 @@ _BRIDGE_FIELDS = ("options", "image_lock_sha256")
 # digest. Absent, the compatibility harness bash-vf-b2e4e81@1. The binaries check it
 # against what they serve (`agentic_swe.harness_pin_refusal`); this module loads nothing.
 _HARNESS_SPEC_FIELDS = ("id", "version", "digest")
+
+
+@dataclass(frozen=True, slots=True)
+class EpisodeProfile:
+    """A named run configuration an eval episode may declare (`episode.profile`, written only
+    when set, so every other manifest hashes as before). It lifts the default turn and context
+    ceilings for one harness on one package, and pins what makes a score comparable."""
+
+    harness: tuple[str, str]          # (id, version) of the reliquary-harness spec
+    package: str
+    max_turns: int
+    max_total_tokens: int
+    per_call_timeout_s: int
+    # The sandbox wall budget at least: an infra limit (a slow GPU, a busy gateway) must not cut
+    # an episode the model would have finished within its own limits. The CPU budget is at least
+    # the wall budget too: CPU time depends on the gateway's hardware, an infra limit.
+    min_wall_s: int
+    # Episodes cut by a model limit (turns, context, the box's call or transcript budget)
+    # score 0 in the headline, as the reference leaderboard counts them. Infra ends (wall time,
+    # a lost miner or gateway) score nothing: the slot is redone, on the same public draw.
+    limit_cut_fails: bool
+
+
+# The SWE-bench bash-only leaderboard (swebench.com, mini-SWE-agent's
+# config/benchmarks/swebench.yaml): step_limit 250, 60 s per command, the model's own context
+# (capped here at 128k), a run that hits a limit submits nothing.
+SWEBENCH_BASH_ONLY = "swebench-bash-only"
+# The Terminal-Bench 2.x leaderboard (harbor-framework/terminal-bench-2-1, Terminus 2): no step
+# cap of its own (the task's agent timeout bounds a trial, 360 to 12,000 s, which the bridge
+# takes from the task as the episode's wall budget), the model's context (capped at 128k), 600 s
+# per command (Terminus never blocks on a command; ours run to completion within one call); 250
+# turns, the corpus wire's ceiling (the 128k context ends a run long before).
+TERMINAL_BENCH_TERMINUS_2 = "terminal-bench-terminus-2"
+EPISODE_PROFILES = {
+    SWEBENCH_BASH_ONLY: EpisodeProfile(harness=("mini-swe", "2"), package="reliquary-swe",
+                                       max_turns=250, max_total_tokens=131072,
+                                       per_call_timeout_s=60, min_wall_s=14400,
+                                       limit_cut_fails=True),
+    TERMINAL_BENCH_TERMINUS_2: EpisodeProfile(harness=("terminus-2", "1"),
+                                              package="reliquary-terminal-bench",
+                                              max_turns=250, max_total_tokens=131072,
+                                              per_call_timeout_s=600, min_wall_s=12000,
+                                              limit_cut_fails=True),
+}
+# The largest bounds any episode may declare (the wire's, `protocol.corpus_submission`).
+EPISODE_TURNS_CEILING = max([MAX_EPISODE_TURNS, *(p.max_turns for p in EPISODE_PROFILES.values())])
+EPISODE_TOKENS_CEILING = max([MAX_EPISODE_TOTAL_TOKENS,
+                              *(p.max_total_tokens for p in EPISODE_PROFILES.values())])
+# Why an episode stopped before the agent submitted: a profile with limit_cut_fails scores it 0.
+LIMIT_STOPS = ("max_turns", "context_length")
+# The machine's budget closes (signed final `budget_exhausted`, stop `episode_closed`) the model's
+# own calls caused: under such a profile a scored 0, never an unpaid redo. Wall time (`expired`)
+# and CPU time (`cpu_s`, which depends on the gateway's hardware) are infra: the slot is redone.
+MODEL_BUDGET_REASONS = frozenset({"max_calls", "transcript_bytes"})
+
+
+def limit_cuts_fail(episode) -> bool:
+    """Whether the episode scores a run cut by a model limit as a failure: its profile says so,
+    or it states its limits directly with `limit_cut_fails` (design 2026-11-14)."""
+    if getattr(episode, "limit_cut_fails", False) is True:
+        return True
+    profile = getattr(episode, "profile", None)
+    return profile is not None and EPISODE_PROFILES[profile].limit_cut_fails
+
+
+def scores_model_closes(episode) -> bool:
+    """Whether a run closed on a model budget (`MODEL_BUDGET_REASONS`) is a scored 0 row."""
+    return limit_cuts_fail(episode)
+
+
+def model_closed(episode, status: Any, reason: Any) -> bool:
+    """A machine final this episode submits as a scored 0: a budget the model spent."""
+    return (scores_model_closes(episode) and status == "budget_exhausted"
+            and reason in MODEL_BUDGET_REASONS)
 _HARNESS_NAME_RE = re.compile(r"\A[a-z0-9][a-z0-9.-]{0,63}\Z")
 _SANDBOX_FIELDS = ("env", "env_package", "tools", "sandbox_commit", "budgets")
 SANDBOX_BUDGET_FIELDS = ("max_calls", "per_call_timeout_s", "cpu_s", "wall_s",
@@ -197,6 +277,20 @@ def _check_split(split: Any, eval_job: bool) -> None:
         raise JobError(f"episode.env.split must be a split name, got {split!r}")
     if not eval_job and split != "train":
         raise JobError(f"episode.env.split must be 'train', got {split!r}")
+
+
+def _check_catalog_split(split: str, eval_job: bool, environment: str) -> None:
+    """``environment`` (a package or a suite env) in the environment catalog: a training job needs live batch
+    rows on its split, and an eval job never runs a split the catalog gives to training only."""
+    entry = ENV_CATALOG.get(environment)
+    if entry is None:
+        return
+    uses = {r.use for r in entry.rows if r.split in (split, "*") and r.live}
+    if not eval_job and "batch" not in uses:
+        raise JobError(f"{environment!r} split {split!r} has no batch rows in the environment catalog")
+    if eval_job and uses and "eval" not in uses:
+        raise JobError(f"{environment!r} split {split!r} is a training split ({', '.join(sorted(uses))}): "
+                       "an eval job never runs it")
 
 
 def _judge(raw) -> DrawJudge:
@@ -245,12 +339,15 @@ def judge_field(partial: Mapping[str, Any]) -> dict[str, Any] | None:
     return None if judge == DEFAULT_DRAW_JUDGE else judge.to_contract()
 
 
-def _max_prompt_tokens(raw) -> int | None:
+def _max_prompt_tokens(raw, sampling: Sampling) -> int | None:
     if "max_prompt_tokens" not in raw:
         return None
     value = _positive_int(raw, "max_prompt_tokens")
-    if value > MAX_JOB_PROMPT_TOKENS:
-        raise JobError(f"max_prompt_tokens must be at most {MAX_JOB_PROMPT_TOKENS}, got {value}")
+    limit = MAX_JOB_PROMPT_TOKENS
+    if sampling.draw is not None and "episode" not in raw:
+        limit = MAX_DRAWN_SEQUENCE_TOKENS - sampling.max_new_tokens
+    if value > limit:
+        raise JobError(f"max_prompt_tokens must be at most {limit} for this job, got {value}")
     return value
 
 
@@ -359,6 +456,11 @@ class EpisodeSpec:
     harness_spec: Mapping[str, str] | None = None
     # A bridged eval env's {"options", "image_lock_sha256"}; None for reliquary-swe and suites.
     bridge: Mapping[str, Any] | None = None
+    # An `EPISODE_PROFILES` name; None: the default ceilings.
+    profile: str | None = None
+    # An eval episode that states its limits directly (no profile): a run cut by a model limit
+    # scores 0, an infra end is redone, and the ceilings are the wire's (written only when True).
+    limit_cut_fails: bool = False
 
     @property
     def is_suite(self) -> bool:
@@ -387,6 +489,10 @@ class EpisodeSpec:
         if self.bridge is not None:
             contract["bridge"] = {"options": dict(self.bridge["options"]),
                                   "image_lock_sha256": self.bridge["image_lock_sha256"]}
+        if self.profile is not None:
+            contract["profile"] = self.profile
+        if self.limit_cut_fails:
+            contract["limit_cut_fails"] = True
         return contract
 
 
@@ -611,7 +717,7 @@ def _bounded_int(raw: Mapping[str, Any], field: str, low: int, high: int, label:
     return value
 
 
-def _parse_sandbox(raw: Any, package: str) -> SandboxSpec:
+def _parse_sandbox(raw: Any, package: str, cpu_ceiling: int | None = None) -> SandboxSpec:
     raw = _fields(raw, _SANDBOX_FIELDS, "episode.sandbox")
     if raw["env"] != package:
         raise JobError(f"episode.sandbox.env must be the episode's package {package!r}")
@@ -628,8 +734,12 @@ def _parse_sandbox(raw: Any, package: str) -> SandboxSpec:
     if not isinstance(commit, str) or not _COMMIT_RE.match(commit):
         raise JobError("episode.sandbox.sandbox_commit must be a 40-hex commit")
     budgets_raw = _fields(raw["budgets"], SANDBOX_BUDGET_FIELDS, "episode.sandbox.budgets")
+    # An eval episode that scores limit cuts (a profile, or `limit_cut_fails`) may raise its CPU
+    # budget to its wall budget (the gateways raise EPISODE_MAX_CPU_S to match): CPU time is an
+    # infra limit, the wall must cut first.
+    bounds = {**_SANDBOX_BUDGET_BOUNDS, **({"cpu_s": cpu_ceiling} if cpu_ceiling else {})}
     budgets = SandboxBudgets(**{
-        name: _bounded_int(budgets_raw, name, 1, _SANDBOX_BUDGET_BOUNDS[name],
+        name: _bounded_int(budgets_raw, name, 1, bounds[name],
                            "episode.sandbox.budgets")
         for name in SANDBOX_BUDGET_FIELDS})
     return SandboxSpec(env=raw["env"], env_package=env_package, tools=tuple(tools),
@@ -685,7 +795,15 @@ def _parse_episode(raw: Any, eval_job: bool = False) -> EpisodeSpec:
         raise JobError(f"episode.renderer must read renderers:<name>@<version>, got {raw['renderer']!r}")
     if not isinstance(raw["verifiers"], str) or not _COMMIT_RE.match(raw["verifiers"]):
         raise JobError("episode.verifiers must be a 40-hex commit")
-    max_total = _bounded_int(raw, "max_total_tokens", 1, MAX_EPISODE_TOTAL_TOKENS, "episode")
+    profile = _episode_profile(raw, env["package"], eval_job)
+    direct = _direct_limits(raw, profile, eval_job)
+    if profile is not None:
+        turns_ceiling, tokens_ceiling = profile.max_turns, profile.max_total_tokens
+    elif direct:
+        turns_ceiling, tokens_ceiling = EPISODE_TURNS_CEILING, EPISODE_TOKENS_CEILING
+    else:
+        turns_ceiling, tokens_ceiling = MAX_EPISODE_TURNS, MAX_EPISODE_TOTAL_TOKENS
+    max_total = _bounded_int(raw, "max_total_tokens", 1, tokens_ceiling, "episode")
     fraction = raw["replay_fraction_failed"]
     if isinstance(fraction, bool) or not isinstance(fraction, (int, float)) or not 0.0 <= fraction <= 1.0:
         raise JobError(f"episode.replay_fraction_failed must be in [0, 1], got {fraction!r}")
@@ -698,7 +816,9 @@ def _parse_episode(raw: Any, eval_job: bool = False) -> EpisodeSpec:
     if execution == EXECUTION_SIGNED_SANDBOX:
         if "sandbox" not in raw:
             raise JobError("a signed_sandbox episode needs episode.sandbox")
-        sandbox = _parse_sandbox(raw["sandbox"], env["package"])
+        sandbox = _parse_sandbox(raw["sandbox"], env["package"],
+                                 profile.min_wall_s if profile else
+                                 _SANDBOX_BUDGET_BOUNDS["wall_s"] if direct else None)
     elif "sandbox" in raw:
         raise JobError("episode.sandbox is only for execution 'signed_sandbox'")
     harness_spec = None
@@ -717,13 +837,87 @@ def _parse_episode(raw: Any, eval_job: bool = False) -> EpisodeSpec:
         env=EpisodeEnv(package=env["package"], version=env["version"], split=env["split"],
                        num_images=_bounded_int(env, "num_images", 1, 1000, "episode.env")),
         harness=raw["harness"], renderer=raw["renderer"], verifiers=raw["verifiers"],
-        max_turns=_bounded_int(raw, "max_turns", 1, MAX_EPISODE_TURNS, "episode"),
+        max_turns=_bounded_int(raw, "max_turns", 1, turns_ceiling, "episode"),
         max_tokens_per_turn=_bounded_int(raw, "max_tokens_per_turn", 1, max_total, "episode"),
         max_total_tokens=max_total,
         replay_fraction_failed=float(fraction),
         execution=execution, sandbox=sandbox, harness_spec=harness_spec, bridge=bridge,
+        profile=raw.get("profile"), limit_cut_fails=direct,
     )
+    if profile is not None:
+        _check_profile(episode, profile)
+    elif direct:
+        _check_limit_budgets(episode, "episode.limit_cut_fails")
     return episode
+
+
+def _direct_limits(raw: Mapping[str, Any], profile: EpisodeProfile | None, eval_job: bool) -> bool:
+    """`episode.limit_cut_fails`: an eval episode that states its limits itself (turns, context,
+    the sandbox's call, CPU and wall budgets) and is scored as a profile is: a run a model limit
+    cut scores 0, an infra end is redone. Written only as true; a profile already implies it."""
+    if "limit_cut_fails" not in raw:
+        return False
+    if raw["limit_cut_fails"] is not True:
+        raise JobError("episode.limit_cut_fails is written only as true")
+    if profile is not None:
+        raise JobError("episode.profile already scores limit cuts as failures: "
+                       "drop episode.limit_cut_fails")
+    if not eval_job:
+        raise JobError("episode.limit_cut_fails is for eval jobs only")
+    return True
+
+
+def _episode_profile(raw: Mapping[str, Any], package: str, eval_job: bool) -> EpisodeProfile | None:
+    if "profile" not in raw:
+        return None
+    name = raw["profile"]
+    if not isinstance(name, str) or name not in EPISODE_PROFILES:
+        raise JobError(f"episode.profile must be one of {sorted(EPISODE_PROFILES)}, got {name!r}")
+    profile = EPISODE_PROFILES[name]
+    if not eval_job:
+        raise JobError(f"episode.profile {name!r} is for eval jobs only")
+    if package != profile.package:
+        raise JobError(f"episode.profile {name!r} runs {profile.package!r}, not {package!r}")
+    return profile
+
+
+def _check_profile(episode: EpisodeSpec, profile: EpisodeProfile) -> None:
+    """What a profile pins besides its ceilings: the harness, the signed sandbox and the
+    per-command timeout."""
+    pin = episode.harness_spec
+    if pin is None or (pin["id"], pin["version"]) != profile.harness:
+        raise JobError(f"episode.profile {episode.profile!r} plays harness "
+                       f"{'@'.join(profile.harness)}: episode.harness_spec must name it")
+    if episode.execution != EXECUTION_SIGNED_SANDBOX:
+        raise JobError(f"episode.profile {episode.profile!r} runs on the signed sandbox")
+    budgets = episode.sandbox.budgets
+    if budgets.per_call_timeout_s != profile.per_call_timeout_s:
+        raise JobError(f"episode.profile {episode.profile!r} times each command out at "
+                       f"{profile.per_call_timeout_s} s: episode.sandbox.budgets.per_call_timeout_s "
+                       f"must be {profile.per_call_timeout_s}")
+    if budgets.max_calls < profile.max_turns:
+        raise JobError(f"episode.profile {episode.profile!r}: the call budget never cuts before its "
+                       f"{profile.max_turns}-step cap (episode.sandbox.budgets.max_calls >= "
+                       f"{profile.max_turns})")
+    if budgets.wall_s < profile.min_wall_s:
+        raise JobError(f"episode.profile {episode.profile!r}: episode.sandbox.budgets.wall_s must be "
+                       f"at least {profile.min_wall_s}")
+    _check_limit_budgets(episode, f"episode.profile {episode.profile!r}")
+
+
+def _check_limit_budgets(episode: EpisodeSpec, label: str) -> None:
+    """An episode that scores limit cuts runs on the signed sandbox, its call budget never cuts
+    before its turn cap (a model that makes one call per turn), and its wall budget, an infra
+    limit, cuts before its CPU budget."""
+    if episode.execution != EXECUTION_SIGNED_SANDBOX:
+        raise JobError(f"{label} runs on the signed sandbox")
+    budgets = episode.sandbox.budgets
+    if budgets.max_calls < episode.max_turns:
+        raise JobError(f"{label}: the call budget never cuts before the {episode.max_turns}-turn cap "
+                       f"(episode.sandbox.budgets.max_calls >= {episode.max_turns})")
+    if budgets.cpu_s < budgets.wall_s:
+        raise JobError(f"{label}: episode.sandbox.budgets.cpu_s must be at "
+                       f"least wall_s ({budgets.wall_s}), so the wall budget cuts first")
 
 
 def _parse_bridge(raw: Any) -> dict[str, Any]:
@@ -801,6 +995,8 @@ def _check_episode_job(job: JobSpec) -> None:
         raise JobError("a suite episode job draws its prompts from its environment "
                        f"or an eval set: prompt_source must be {episode.env.name!r} "
                        "or an eval source")
+    _check_catalog_split(episode.env.split, is_eval_source(job.prompt_source),
+                         episode.env.name if episode.is_suite else episode.env.package)
 
 
 def episode_contract(raw: Any, *, eval_job: bool) -> dict[str, Any]:
@@ -842,6 +1038,7 @@ def parse_job(raw: Mapping[str, Any]) -> JobSpec:
         raise JobError(f"deadline_round must be a non-negative round or null, got {deadline_round!r}")
 
     prompt_source = _text(raw, "prompt_source")
+    sampling = _parse_sampling(raw["sampling"])
     job = JobSpec(
         job_id=job_id,
         checkpoint_repo=_text(raw, "checkpoint_repo"),
@@ -851,7 +1048,7 @@ def parse_job(raw: Mapping[str, Any]) -> JobSpec:
         prompt_count=_positive_int(raw, "prompt_count"),
         renderer_id=_text(raw, "renderer_id"),
         eos_token_id=_non_negative_int(raw, "eos_token_id"),
-        sampling=_parse_sampling(raw["sampling"]),
+        sampling=sampling,
         slots_per_prompt=_positive_int(raw, "slots_per_prompt"),
         filter=_parse_filter(raw["filter"]),
         prompt_order=prompt_order,
@@ -861,7 +1058,7 @@ def parse_job(raw: Mapping[str, Any]) -> JobSpec:
         ),
         seed=_non_negative_int(raw, "seed") if "seed" in raw else None,
         submit=_submit(raw),
-        max_prompt_tokens=_max_prompt_tokens(raw),
+        max_prompt_tokens=_max_prompt_tokens(raw, sampling),
         judge=_judge(raw),
         episode=(_parse_episode(raw["episode"], is_eval_source(prompt_source))
                  if "episode" in raw else None),
@@ -876,14 +1073,20 @@ def parse_job(raw: Mapping[str, Any]) -> JobSpec:
 
 
 def _check_draw_job(job: JobSpec) -> None:
-    """A forced draw, on any job (eval or generation): keyed on its seed, its samples in free order, a failed slot
-    reopened with its own draw (``corpus.eval_draw``)."""
+    """A forced draw, on any job (eval or generation, single-turn or episode, suite included): keyed on its seed,
+    its samples in free order, a failed slot reopened with its own draw (``corpus.eval_draw``)."""
     if job.seed is None:
         raise JobError("sampling.draw keys the draw on the job's seed: a seed is required")
     if job.prompt_order == PROMPT_ORDER_MINER_WALK:
         raise JobError("sampling.draw takes the draw slot from the cursor: a miner_walk job walks it")
-    if job.episode is not None and getattr(job.episode, "harness", None) == "suite":
-        raise JobError("sampling.draw is not drawn by the suite episode miner yet: use free sampling")
+    if job.sampling.top_k == 1:
+        # Greedy: the audit scores a miss on its raw logit gap (``forced_sampling._greedy``), so only one
+        # temperature means it, and the runner-up must stay possible (an honest near-tie flip).
+        if job.sampling.temperature != 1.0:
+            raise JobError(f"a greedy draw (top_k 1) runs at temperature 1, got {job.sampling.temperature}")
+        if job.judge is not None and job.judge.edge_margin <= 0:
+            raise JobError("a greedy draw (top_k 1) needs judge.edge_margin above 0: an honest flip to the "
+                           "runner-up would be impossible")
 
 
 def is_signed_sandbox(job: JobSpec) -> bool:

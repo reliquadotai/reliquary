@@ -224,7 +224,7 @@ def test_a_new_active_entry_is_wired_routed_and_started():
         assert h.wired == ["corpus-b"]
         assert sorted(h.running) == ["audit:job-b", "settle:job-b"]
         async with h.client() as client:
-            assert (await client.get("/corpus/jobs")).json() == {"jobs": ["job-b"]}
+            assert (await client.get("/corpus/jobs")).json()["jobs"] == ["job-b"]
             assert (await client.get("/corpus/jobs/job-b/job")).json() == {"job_id": "job-b"}
         await h.set.refresh()
         assert h.wired == ["corpus-b"]
@@ -276,7 +276,9 @@ def test_retired_stops_admission_drains_then_unwires():
                 response = await getattr(client, method)(path)
                 assert response.status_code == 410 and response.json() == {"detail": "job_retired"}
             assert (await client.get("/corpus/jobs/job-b/job")).status_code == 200
-            assert (await client.get("/corpus/jobs")).json() == {"jobs": []}
+            listed = (await client.get("/corpus/jobs")).json()
+            assert listed["jobs"] == []
+            assert {o["job_id"]: o["state"] for o in listed["orders"]}["job-b"] == "draining"
         assert "job-b" in h.set.served and h.cancelled == []
         # Drained: its auditor and settler stop and its routes leave.
         h.drained["job-b"] = True
@@ -319,7 +321,9 @@ def test_pause_keeps_draining_and_resume_reuses_the_same_running_job():
             assert (await client.get("/corpus/next/5Hot")).status_code == 409
             assert (await client.get("/corpus/jobs/job-b/job")).status_code == 200
             assert (await client.get("/corpus/jobs/job-b/cursor/5Hot")).status_code == 200
-            assert (await client.get("/corpus/jobs")).json() == {"jobs": []}
+            assert (await client.get("/corpus/jobs")).json()["jobs"] == []
+            paused = (await client.get("/corpus/jobs")).json()["orders"]
+            assert [(o["job_id"], o["state"]) for o in paused if o["job_id"] == "job-b"] == [("job-b", "paused")]
         release.set()
         await pending
         h.drained["job-b"] = True
@@ -329,7 +333,7 @@ def test_pause_keeps_draining_and_resume_reuses_the_same_running_job():
         await h.set.refresh()
         async with h.client() as client:
             assert (await client.get("/corpus/jobs/job-b/next/5Hot")).status_code == 200
-            assert (await client.get("/corpus/jobs")).json() == {"jobs": ["job-b"]}
+            assert (await client.get("/corpus/jobs")).json()["jobs"] == ["job-b"]
         assert h.wired == ["corpus-b"] and h.caps == {}
         for tasks in h.set._tasks.values():
             for task in tasks:
@@ -586,8 +590,8 @@ def test_a_hot_added_job_serves_and_a_retired_job_drains_without_a_restart(
             set_weights=False, registration_gate=False, read_registry=read_entries,
             refresh_every_seconds=3600,
         ))
-    assert seen["before"] == {"jobs": ["math-v1"]}
-    assert seen["after_add"] == {"jobs": ["code-v1", "math-v1"]}
+    assert seen["before"]["jobs"] == ["math-v1"]
+    assert seen["after_add"]["jobs"] == ["code-v1", "math-v1"]
     assert seen["code_job"]["job_id"] == "code-v1"
     assert seen["code_contract"] == contracts["b"]
     assert seen["legacy"] == "math-v1"

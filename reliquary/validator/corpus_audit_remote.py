@@ -34,12 +34,14 @@ from reliquary.validator.corpus_audit_protocol import (
     AUDIT_PROTOCOL,
     AUDIT_PROTOCOL_V2,
     AUDIT_PROTOCOL_V3,
+    AUDIT_PROTOCOL_V4,
     ITEM_ERROR,
     ITEM_OK,
     MAX_LEASE_ITEMS,
     MAX_LEASE_TOKENS,
     AuditResult,
     ClaimRequest,
+    draw_protocol,
     HeartbeatRequest,
 )
 
@@ -522,11 +524,13 @@ class RemoteAuditDispatcher(ExecutorLeases):
         spanned = [k for k, item in enumerate(items)
                    if item.get("spans") is not None and item.get("draw") is None]
         plain = [k for k, item in enumerate(items) if item.get("spans") is None and item.get("draw") is None]
-        drawn_spanned = [k for k in drawn if items[k].get("spans") is not None]
-        drawn_plain = [k for k in drawn if items[k].get("spans") is None]
-        for protocol, group, alone in ((AUDIT_PROTOCOL, plain, False), (AUDIT_PROTOCOL_V2, spanned, True),
-                                       (AUDIT_PROTOCOL_V3, drawn_plain, False),
-                                       (AUDIT_PROTOCOL_V3, drawn_spanned, True)):
+        # Greedy draws (top_k 1) go v4: an executor that predates v4 never scores them.
+        lanes = [(AUDIT_PROTOCOL, plain, False), (AUDIT_PROTOCOL_V2, spanned, True)]
+        for draw_lane in (AUDIT_PROTOCOL_V3, AUDIT_PROTOCOL_V4):
+            mine = [k for k in drawn if draw_protocol(items[k]["draw"]) == draw_lane]
+            lanes += [(draw_lane, [k for k in mine if items[k].get("spans") is None], False),
+                      (draw_lane, [k for k in mine if items[k].get("spans") is not None], True)]
+        for protocol, group, alone in lanes:
             # One trajectory per lease: a 60k prefill takes ~16 s (M3), and
             # several would outrun the lease and strike an honest executor.
             grouped = ([[k] for k in range(len(group))] if alone

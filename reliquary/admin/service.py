@@ -25,12 +25,14 @@ from typing import Any, Literal
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from reliquary.admin.training import CreateTraining  # a route body model: FastAPI resolves it from globals
 from reliquary.admin.auth import (
     NONCE_HEADER,
     SIGNATURE_HEADER,
     TIMESTAMP_HEADER,
     HmacVerifier,
 )
+from reliquary.corpus.job import JOB_ID_RE, MAX_DRAWN_SEQUENCE_TOKENS, MAX_JOB_PROMPT_TOKENS
 
 from reliquary.sandbox.evaluation_engagements import EvaluationSessionRequest
 
@@ -45,6 +47,8 @@ ORDER_PRICING_ENV = "RELIQUARY_ORDER_PRICING"
 # No admin request is larger; the bound is checked before the body is read.
 MAX_BODY_BYTES = 1024 * 1024
 DEFAULT_EVAL_CAP = 0.02
+# How long a job's counts are awaited before its last ones answer (``job_counts``).
+COUNTS_WAIT_SECONDS = 20.0
 # A generation order on any model: the cap share it defaults to, and its audit:
 # every submission unless the order asks for a sampled share (`audit_q`), then
 # a hotkey's first 20 audited passes (counted across orders) before sampling starts.
@@ -168,7 +172,7 @@ class CreateJob(BaseModel):
     draw: Literal["gumbel_max"] | None = None
     judge: dict[str, float | int] | None = Field(default=None, max_length=8)
     # A long-context order: its longest prompt in tokens (miners size their engine to it).
-    max_prompt_tokens: int | None = Field(default=None, gt=0, le=131072)
+    max_prompt_tokens: int | None = Field(default=None, gt=0, le=MAX_DRAWN_SEQUENCE_TOKENS)
     # A forced-draw order without a qualification pins its model here (``orders.models``): the full revision.
     revision: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
     # A reviewed contract can be pinned before the first durable write.
@@ -299,7 +303,9 @@ class RegisterExecutor(BaseModel):
     # "eval" executors serve the eval control only (provider_id and host required);
     # "grade" executors (provider_id required) grade and replay for the corpus control, bound to an env
     # pin (model_id = env package, model_revision = env commit).
-    scope: Literal["corpus", "eval", "grade"] = "corpus"
+    # "trainer" executors are a training order's pod, bound to its task (task_id required).
+    scope: Literal["corpus", "eval", "grade", "trainer"] = "corpus"
+    task_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class CreateDelivery(BaseModel):
@@ -354,6 +360,13 @@ class CombineEvaluation(BaseModel):
     model_config = ConfigDict(extra="forbid")
     # The gradings of an evaluation order's sets (one job each), in report order.
     parts: list[str] = Field(min_length=1, max_length=64)
+    # A chain order (``orders.chains``): the parts are its positions from the first, and the report adds its rates.
+    chain: str | None = Field(default=None, min_length=1, max_length=64)
+
+
+class ChainNext(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    chain: str = Field(min_length=1, max_length=64)
 
 
 class GradeEvaluation(BaseModel):
@@ -441,6 +454,16 @@ def _current_round() -> int:
     return make_round_at(chain["genesis_time"], chain["period"])(time.time()) - 1
 
 
+def _round_time(round_number: int) -> float:
+    """When drand round ``round_number`` was published (``_current_round``'s inverse)."""
+    from reliquary.infrastructure import drand
+
+    chain = drand.get_current_chain()
+    if chain.get("genesis_time") is None or chain.get("period") is None:
+        raise RuntimeError("drand chain parameters unknown")
+    return float(chain["genesis_time"]) + (int(round_number) - 1) * float(chain["period"])
+
+
 def create_admin_app(*, secret: bytes, pool_max: float,
                      models: Mapping[str, QualifiedModel | Mapping], deliveries=None,
                      records=None, clock: Callable[[], float] = time.time,
@@ -451,14 +474,22 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                      require_sandbox=None, qualifications=None, eval_jobs=None,
                      model_facts=None, evaluation_sessions=None, pin_model=None,
                      upload_tokenizer=None, subnet_pool=None, tao_usd=None,
-                     sandbox_machine_prefix: str | None = None, sandbox_machines=None) -> FastAPI:
+                     sandbox_machine_prefix: str | None = None, sandbox_machines=None,
+                     order_sessions=None, training_runtime_store=None, rl_spend_reader=None,
+                     pod_checkpoint_store=None) -> FastAPI:
     """The admin app. ``deliveries`` is the platform bucket's sink (None turns
     the export and grade routes off); ``records`` the subnet's record store;
-    ``eval_store`` the subnet bucket holding the eval sets' grading files.
+    ``eval_store`` the subnet bucket holding the eval sets' grading files; ``order_sessions``
+    the order control's sandbox session store (``list_recent``), read for an agentic order's
+    redone slots (default: the bucket's order-session prefix).
     ``subnet_pool`` (async, ``chain.subnet_pool``'s answer) and ``tao_usd``
     (async, USD per TAO) convert an order's USD token ceiling. ``sandbox_machine_prefix``
     turns on the sandbox machine routes for the machines named with it (the platform's rented
-    gateways) and only those; ``sandbox_machines`` is the machine directory (``sandbox_store``)."""
+    gateways) and only those; ``sandbox_machines`` is the machine directory (``sandbox_store``).
+    ``training_runtime_store`` or the private ``RELIQUARY_TRAINING_RUNTIME_ROOT`` supplies verified local
+    runtime observations and immutable final usage/checkpoint reads. Paid admission stays closed.
+    ``rl_spend_reader(run)`` returns a training task's spend summary or None (default: ``rl_spend.read_spend``).
+    ``pod_checkpoint_store`` holds the final models of orders run on rented pods (default: the private bucket)."""
     from reliquary.infrastructure import corpus_executor_store as executors
     from reliquary.infrastructure import corpus_job_store as job_store
     from reliquary.infrastructure import task_registry_store as registry_store
@@ -552,19 +583,63 @@ def create_admin_app(*, secret: bytes, pool_max: float,
     # verdicts are not read again by the delivery and grading that follow.
     verdict_outcomes: dict[str, dict[str, bool]] = {}
     final_jobs: set[str] = set()
+    # Listing a large job takes longer than a caller waits (the platform: 30 s). One count runs at a time per
+    # job, outlives the request that started it, and a caller gets the last counts after COUNTS_WAIT_SECONDS;
+    # a drained job's counts never change.
+    last_counts: dict[str, dict] = {}
+    counting: dict[str, asyncio.Future] = {}
 
-    async def job_counts(job_id: str) -> dict:
-        """The stored counts; ``final`` gates grading and delivery, ``drained`` only pay."""
+    async def read_counts(job_id: str) -> dict:
         from reliquary.validator.corpus_job_status import stored_job_counts
 
         known = job_id in final_jobs
+        # Read before the listing: a job retired by then admits nothing the listing could miss.
+        entries = await entries_naming(job_id)
+        retired = bool(entries) and all(e.status == "retired" for e in entries)
         counts = await stored_job_counts(records, job_id, with_final=not known,
                                          verdict_passed=verdict_outcomes.setdefault(job_id, {}))
-        if known or counts["final"]:
+        counts["retired"] = retired
+        # Kept for good only once its tasks are retired: a job still admitting is only quiet for now (2026-11-12:
+        # a 12 h network cut left an open order with every record settled; its 544-record counts were kept as
+        # drained and final while it went on to 7,543, and its delivery waited on them).
+        if known or (counts["final"] and retired):
             counts["final"] = True
             final_jobs.add(job_id)
             verdict_outcomes.pop(job_id, None)
+        last_counts[job_id] = counts
         return counts
+
+    async def job_miner_pay(job_id: str, entries) -> dict | None:
+        """What the job's miners were paid per settled period (``corpus_job_status.miner_pay``); None when the
+        settlement is unreadable."""
+        from reliquary.validator import corpus_periods as cp
+        from reliquary.validator.corpus_job_status import miner_pay
+
+        try:
+            state, _ = await records.read_settlement(job_id)
+        except Exception:
+            logger.warning("admin: the settlement of %s is unreadable", job_id, exc_info=True)
+            return None
+        emission = next((e.params.get(cp.MAX_PRICE_EMISSION_PARAM) for e in entries
+                         if e.params.get(cp.MAX_PRICE_EMISSION_PARAM) is not None), None)
+        return miner_pay(state, emission)
+
+    async def job_counts(job_id: str) -> dict:
+        """The stored counts; ``final`` gates grading and delivery, ``drained`` only pay."""
+        last = last_counts.get(job_id)
+        if last is not None and last["drained"] and last.get("retired"):
+            return dict(last)
+        running = counting.get(job_id)
+        if running is None:
+            running = counting[job_id] = asyncio.ensure_future(read_counts(job_id))
+            running.add_done_callback(lambda done, j=job_id: (
+                counting.pop(j, None), done.cancelled() or done.exception()))
+        try:
+            return dict(await asyncio.wait_for(asyncio.shield(running), COUNTS_WAIT_SECONDS))
+        except asyncio.TimeoutError:
+            if last is not None:
+                return dict(last)
+            return dict(await asyncio.shield(running))
 
     async def draining_limits(new_cap: float):
         """The cap guard, counting retired corpus tasks whose job has not drained."""
@@ -647,6 +722,20 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 f"rows [{start}, {start + count}) run past {env!r}, which has "
                 f"{source_rows[env]} rows"))
 
+    async def require_prompt_budget(body: CreateJob, card: dict, revision: str) -> None:
+        from reliquary.eval.episode_jobs import prompt_budget_refusal
+
+        refusal = prompt_budget_refusal(card, model=body.model, revision=revision,
+                                       renderer_id=THINKING_RENDERERS[body.thinking], count=body.prompt_count,
+                                       max_prompt_tokens=body.max_prompt_tokens)
+        if refusal:
+            if not JOB_ID_RE.fullmatch(body.job_id):
+                raise HTTPException(status_code=422, detail=f"unusable job id {body.job_id!r}")
+            existing, _ = await job_store.read_job(body.job_id)
+            task_id = body.task_id or body.job_id
+            if existing is None or not any(task.task_id == task_id for task in await entries_naming(body.job_id)):
+                raise HTTPException(status_code=422, detail=refusal)
+
     def refuse_unsupported(result: dict) -> None:
         from reliquary.constants import SUPPORTED_ARCHITECTURES
 
@@ -693,10 +782,12 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         if card_body is None or prompts_body is None:
             raise HTTPException(status_code=404, detail="set_unknown")
         card = json.loads(card_body)
+        await require_set_grader(card, body=body)
         if body.env not in (card["env"], card["source"]):
             raise HTTPException(status_code=422, detail=f"set {set_id} is a {card['env']} set")
         if body.prompt_count > int(card["count"]):
             raise HTTPException(status_code=422, detail=f"set {set_id} holds {card['count']} problems")
+        await require_prompt_budget(body, card, record["revision"])
         # Thresholds hold only for the conditions they were measured under.
         wanted = {"set_id": set_id, "problems": body.prompt_count,
                   "sampling": body.sampling.conditions(), "max_new_tokens": body.max_new_tokens,
@@ -820,6 +911,47 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=404, detail="set_unknown")
         return json.loads(card_body), prompts_body
 
+    def validate_local_grader(card: dict) -> None:
+        from importlib.metadata import PackageNotFoundError, version
+        from reliquary.eval.protocol import validate_set
+        from reliquary.eval.verifiers_source import installed_artifacts, taskset_id
+
+        sealed = validate_set(card, current_grader=True)
+        if (deliveries is None or not getattr(deliveries, "evaluation_supported", True)
+                or not sealed or card.get("source_kind") != "verifiers"
+                or card.get("interaction", "single_turn") != "single_turn"):
+            return
+        # These single-turn rewards run on the admin. Read installed metadata and files without loading a task.
+        taskset = card["taskset"]
+        package = taskset["package"]
+        if taskset_id(card["source"]) != taskset["id"]:
+            raise ValueError("set protocol taskset source drift")
+        expected = (taskset["package_version"], taskset["verifiers_version"], taskset["artifact_sha256"])
+        try:
+            installed = (version(package), version("verifiers"), installed_artifacts(package))
+        except (PackageNotFoundError, OSError, ValueError, TypeError, AttributeError) as exc:
+            raise HTTPException(status_code=503, detail="taskset grader unavailable") from exc
+        if installed != expected:
+            raise ValueError("set protocol taskset grader drift")
+
+    async def require_set_grader(card: dict, *, body: CreateJob | None = None) -> None:
+        if body is not None:
+            from reliquary.corpus.job import JOB_ID_RE
+
+            if not JOB_ID_RE.fullmatch(body.job_id):
+                raise HTTPException(status_code=422, detail=f"unusable job id {body.job_id!r}")
+            existing, _ = await job_store.read_job(body.job_id)
+            task_id = body.task_id or body.job_id
+            if existing is not None and any(entry.task_id == task_id for entry in await entries_naming(body.job_id)):
+                # A manifest left by a failed registry write can still open new work on retry.
+                return
+        try:
+            await asyncio.to_thread(validate_local_grader, card)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except (KeyError, TypeError, AttributeError) as exc:
+            raise HTTPException(status_code=422, detail="set protocol malformed") from exc
+
     def upload_sampling_differs(sampling: Mapping, body: CreateJob) -> list[str]:
         """An order on an upload's group runs the sampling its lines asked for (``orders.uploads``)."""
         given = {**body.sampling.model_dump(), "max_tokens": body.max_new_tokens, "seed": body.seed,
@@ -856,10 +988,15 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             if body.prompt_start != 0:
                 raise HTTPException(status_code=422, detail="an order on a set starts at its first problem")
             card, prompts_body = await read_set(body.eval_set_id)
+            if evaluation:
+                await require_set_grader(card, body=body)
             if not evaluation and card.get("source_kind") != "upload":
                 # Our sets are held out: their completions are never deliverable training data.
                 raise HTTPException(status_code=422, detail="a generation order draws from an upload, not an eval set")
             if card.get("source_kind") == "upload":
+                if (body.max_prompt_tokens or 0) > MAX_JOB_PROMPT_TOKENS:
+                    raise HTTPException(status_code=422, detail=(
+                        f"max_prompt_tokens must be at most {MAX_JOB_PROMPT_TOKENS} for a token-ID upload"))
                 if (card.get("model"), card.get("revision")) != (body.model, body.revision):
                     raise HTTPException(status_code=422, detail="the upload was rendered for another model")
                 if evaluation and not card.get("graded"):
@@ -878,6 +1015,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 raise HTTPException(status_code=422, detail=f"set {body.eval_set_id} is a {card.get('env')} set")
             if body.prompt_count > int(card["count"]):
                 raise HTTPException(status_code=422, detail=f"set {body.eval_set_id} holds {card['count']} problems")
+            if evaluation:
+                await require_prompt_budget(body, card, pin.revision)
             episode = order_episode(body, card, pin, evaluation=evaluation)
             source = eval_source_for(body.eval_set_id, prompts_body, body.prompt_count)
             register_eval_prompts(source, prompts_body)
@@ -885,16 +1024,16 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             declared_source = {"set_id": source.set_id, "problems": body.prompt_count}
         else:
             if body.episode is not None:
-                raise HTTPException(status_code=422, detail="an episode order plays a SWE or TMax eval set")
+                raise HTTPException(status_code=422, detail="an episode order plays a SWE, TMax or suite eval set")
             episode = None
             refusal = qual.order_environment_refusal(body.env)
             if refusal is not None:
                 raise HTTPException(status_code=422, detail=refusal)
             await refuse_past_the_source(body.env, body.prompt_start, body.prompt_count)
             try:
-                from reliquary.eval.sets import refuse_held_out_overlap
+                from reliquary.eval.sets import refuse_order_overlap
 
-                refuse_held_out_overlap(body.env, body.prompt_start, body.prompt_count)
+                refuse_order_overlap(body.env, body.prompt_start, body.prompt_count)
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
             prompt_source, contract_environment = body.env, None
@@ -904,6 +1043,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         from reliquary.miner.corpus_miner import PROMPT_ALLOWANCE_TOKENS
 
         longest = max(PROMPT_ALLOWANCE_TOKENS, body.max_prompt_tokens or 0) + body.max_new_tokens
+        if (body.max_prompt_tokens or 0) > MAX_JOB_PROMPT_TOKENS and pin.max_position_embeddings is None:
+            raise HTTPException(status_code=422, detail="context_unknown: long prompt needs the model's context limit")
         if episode is not None:
             longest = max(longest, int(episode["max_total_tokens"]))
         if pin.max_position_embeddings is not None and longest > pin.max_position_embeddings:
@@ -948,8 +1089,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
 
     def order_episode(body: CreateJob, card: Mapping, pin, *, evaluation: bool) -> dict | None:
         """The order's episode as its manifest carries it, None on a single-turn set: on a SWE or bridged (TMax)
-        set a signed-sandbox episode that agrees with the set (``eval.episode_jobs``), on a model that has its
-        renderer."""
+        set a signed-sandbox episode, on a suite set (``episode``: a replayed tool world) a suite one, that agrees
+        with the set (``eval.episode_jobs``), on a model that has its renderer."""
         from reliquary.corpus.job import episode_contract
         from reliquary.eval.episode_jobs import episode_renderer_refusal, refuse_episode_disagreeing_with_set
 
@@ -959,10 +1100,10 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 raise HTTPException(status_code=422, detail=f"set {body.eval_set_id} holds single-turn problems: "
                                     "an order on it has no episode")
             return None
-        if not evaluation or interaction not in ("swe", "signed_bridged"):
+        if not evaluation or interaction not in ("swe", "signed_bridged", "episode"):
             raise HTTPException(status_code=422, detail=(
-                f"set {body.eval_set_id} holds {interaction} tasks: an order plays only SWE or TMax sets, "
-                "in the signed sandbox, as an evaluation"))
+                f"set {body.eval_set_id} holds {interaction} tasks: an order plays only SWE or TMax sets "
+                "(in the signed sandbox) or suite episode sets (replayed), as an evaluation"))
         if body.thinking:
             raise HTTPException(status_code=422, detail="an episode renders through its own renderer: thinking is false")
         try:
@@ -971,7 +1112,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             episode = episode_contract(body.episode, eval_job=True)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)[:500]) from exc
-        refusal = episode_renderer_refusal(pin.architecture, episode["renderer"])
+        refusal = episode_renderer_refusal(pin.architecture, episode["renderer"],
+                                           suite=episode.get("harness") == "suite")
         if refusal is not None:
             raise HTTPException(status_code=422, detail=refusal)
         return episode
@@ -1014,6 +1156,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 f"a generation order's ids both start with {gen_prefix!r}"))
         # A forced-draw order needs no qualification: one path for eval and generation, on a set or an env.
         pinned = (evaluation or generation) and body.draw is not None and body.qualification_id is None
+        if (body.max_prompt_tokens or 0) > MAX_JOB_PROMPT_TOKENS and not pinned:
+            raise HTTPException(status_code=422, detail="max_prompt_tokens above 131072 requires a pinned draw order")
         if body.eval_set_id is not None and not (evaluation or (generation and pinned)):
             raise HTTPException(status_code=422, detail=(
                 f"an eval job's ids start with {eval_prefix!r}, and only an eval job's"))
@@ -1103,6 +1247,75 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             logger.warning("admin: the token ceiling could not be converted: %r", exc)
             raise HTTPException(status_code=503, detail="token_price_unavailable") from exc
 
+    async def sized_entry(entry, job, audit_executors: int | None):
+        """With ``RELIQUARY_ORDER_CAP_SIZING`` on, the entry's cap sized to what its audit lets it pay
+        (``admin.cap_sizing``), the asked cap kept as ``cap_max``; else the entry as it is."""
+        from dataclasses import replace
+
+        from reliquary.admin import cap_sizing as sizing
+        from reliquary.validator.eval_control import read_control_status
+
+        if not sizing.sizing_enabled():
+            return entry
+        try:
+            status = await read_control_status()
+        except Exception:
+            logger.warning("admin: the control status is unreadable; sizing on default rates", exc_info=True)
+            status = None
+        completion, prompt = sizing.model_rates(status, f"{job.checkpoint_repo}@{job.checkpoint_revision}")
+        estimate = sizing.spend_estimate(entry.params, completion_tps=completion, prompt_tps=prompt,
+                                         cards=audit_executors or 1)
+        if estimate is None:
+            return entry
+        asked = float(entry.params["cap"])
+        # A start no larger than what the whole order can pay (an episode's tokens, when it plays one).
+        episode = getattr(job, "episode", None)
+        per_sample = max(job.sampling.max_new_tokens, int(getattr(episode, "max_total_tokens", 0) or 0))
+        value = sizing.order_value(entry.params, job.prompt_count * job.sampling.n * per_sample)
+        start = sizing.START_CAP if value is None else min(sizing.START_CAP, value * sizing.HEADROOM)
+        cap = sizing.sized_cap(asked, estimate=estimate, start=start)
+        return replace(entry, params={**entry.params, "cap": cap, "floor": cap, sizing.CAP_MAX_PARAM: asked})
+
+    async def resize_order_caps() -> int:
+        """Resize every active order task with a ``cap_max`` from the control's status; the count changed."""
+        from reliquary.admin import cap_sizing as sizing
+        from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION, RegistryError
+        from reliquary.validator.eval_control import read_control_status
+
+        status = await read_control_status()
+        if not status or clock() - float(status.get("at") or 0.0) > sizing.STATUS_MAX_AGE_SECONDS:
+            return 0
+        jobs = status.get("jobs") or {}
+        entries, _ = await registry_store.read_registry(strict=False)
+        changed = 0
+        for entry in list(entries.values()):
+            if (entry.status != "active" or entry.mechanism != MECHANISM_CORPUS_GENERATION
+                    or sizing.CAP_MAX_PARAM not in entry.params):
+                continue
+            facts = (jobs.get(entry.job_id) or {}).get("sizing")
+            cap = None if not facts else sizing.resized(entry.params, facts, status, clock())
+            if cap is None:
+                continue
+            try:
+                await registry_store.set_task_cap(entry.task_id, cap, guard=await draining_limits(cap))
+            except (RegistryError, registry_store.RegistryConflict) as exc:
+                logger.warning("admin: cap of %s stays %s (sized %s): %s", entry.task_id,
+                               entry.params["cap"], cap, exc)
+                continue
+            logger.info("admin: cap of %s %s -> %s", entry.task_id, entry.params["cap"], cap)
+            changed += 1
+        return changed
+
+    async def resize_forever() -> None:
+        from reliquary.admin.cap_sizing import RESIZE_SECONDS
+
+        while True:
+            try:
+                await resize_order_caps()
+            except Exception:
+                logger.exception("admin: order cap resize failed; retrying")
+            await asyncio.sleep(RESIZE_SECONDS)
+
     def order_pricing() -> dict:
         """An order job with a ceiling is priced by auction (``corpus.token_auction``) when
         ``RELIQUARY_ORDER_PRICING`` says ``auction``; else first come at the ceiling."""
@@ -1129,8 +1342,12 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 "profile_sha256": entry.profile_sha256, "task": task_document(entry)}
 
     def refuse_changed_task(existing, expected) -> None:
+        from reliquary.admin.cap_sizing import CAP_MAX_PARAM
+
+        # A sized cap (``admin.cap_sizing``) moves; the cap the order asked for is kept beside it.
+        asked = existing.params.get(CAP_MAX_PARAM, existing.params["cap"])
         if (existing.profile_sha256 != expected.profile_sha256
-                or float(existing.params["cap"]) != float(expected.params["cap"])):
+                or float(asked) != float(expected.params["cap"])):
             raise HTTPException(status_code=409, detail="task_exists_with_another_contract")
 
     @router.get("/task-catalog")
@@ -1265,6 +1482,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             entry = replace(entry, params={**entry.params,
                                            **await token_price(body.max_price_usd_per_mtoken),
                                            **order_pricing()})
+            entry = await sized_entry(entry, parse_job(manifest), body.audit_executors)
         try:
             await registry_store.create_task(entry, guard=await draining_limits(cap))
         except (RegistryError, registry_store.RegistryConflict) as exc:
@@ -1338,6 +1556,204 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         return {"task_id": task_id, "status": "retired", "retired_at": stamp}
 
+    from reliquary.admin.training import training_enabled
+
+    if training_enabled():
+        from reliquary.admin.training import (
+            order_digest, training_capabilities, training_entry, training_refusal, training_spend,
+            training_task_id, training_view,
+        )
+        from reliquary.rl_orders.finalize import TrainingRuntimeStore
+
+        runtime_root = os.environ.get("RELIQUARY_TRAINING_RUNTIME_ROOT", "").strip()
+        if training_runtime_store is None and runtime_root:
+            training_runtime_store = TrainingRuntimeStore(runtime_root)
+
+        async def training_answer(entry):
+            answer = {**training_view(entry), "final_usage": None}
+            if training_runtime_store is not None:
+                try:
+                    answer.update(await asyncio.to_thread(training_runtime_store.view, entry))
+                except (OSError, ValueError, RuntimeError) as exc:
+                    raise HTTPException(status_code=503, detail="training_runtime_unavailable") from exc
+            return answer
+
+        async def training_task(task_id: str):
+            in_scope(task_id)
+            entries, _ = await registry_store.read_registry(strict=False)
+            entry = entries.get(task_id)
+            if entry is None or "training_order" not in entry.params:
+                raise HTTPException(status_code=404, detail="training_unknown")
+            return entry
+
+        @router.post("/training")
+        async def create_training(body: CreateTraining, response: Response) -> dict:
+            """An async RL task from a training order (``reliquary.admin.training``), priced by the RL auction.
+            A replay of the same order answers its task (200); another order under a used id is refused (409)."""
+            task_id = training_task_id(body, task_prefix)
+            in_scope(task_id)
+            digest = order_digest(body)
+
+            async def replayed() -> dict | None:
+                entries, _ = await registry_store.read_registry(strict=False)
+                existing = entries.get(task_id)
+                if existing is None:
+                    return None
+                if (existing.params.get("training_order") or {}).get("order_sha256") != digest:
+                    raise HTTPException(status_code=409, detail="training_id_reused")
+                response.status_code = 200
+                return {**(await training_answer(existing)), "created": False}
+
+            if (answer := await replayed()) is not None:
+                return answer
+            refusal = training_refusal(body)
+            if refusal is not None:
+                raise HTTPException(status_code=422, detail=refusal)
+            try:
+                entry = training_entry(body, task_prefix=task_prefix,
+                                       price_params=await token_price(
+                                           TokenCeiling(input=0.0, output=body.max_price_usd_per_mtoken)),
+                                       created_at=clock())
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            try:
+                await registry_store.create_task(entry, guard=await draining_limits(float(entry.params["cap"])))
+            except (RegistryError, registry_store.RegistryConflict) as exc:
+                if (answer := await replayed()) is not None:      # a concurrent replay created it first
+                    return answer
+                status = 409 if isinstance(exc, RegistryError) else 503
+                raise HTTPException(status_code=status, detail=str(exc)) from exc
+            logger.info("admin: declared training %s as task %s", body.training_id, task_id)
+            response.status_code = 201
+            return {**(await training_answer(entry)), "created": True}
+
+        @router.get("/training/capabilities")
+        async def training_service_capabilities() -> dict:
+            return training_capabilities()
+
+        @router.get("/training/{task_id}")
+        async def training_status(task_id: str) -> dict:
+            return await training_answer(await training_task(task_id))
+
+        async def final_training(entry):
+            if training_runtime_store is None:
+                raise HTTPException(status_code=503, detail="training_checkpoint_unavailable")
+            try:
+                final = await asyncio.to_thread(training_runtime_store.final, entry)
+            except (OSError, ValueError, RuntimeError) as exc:
+                raise HTTPException(status_code=503, detail="training_checkpoint_unavailable") from exc
+            if final is None:
+                raise HTTPException(status_code=404, detail="training_checkpoint_unknown")
+            return final
+
+        def pod_store():
+            nonlocal pod_checkpoint_store
+            if pod_checkpoint_store is None:
+                from reliquary.rl_orders.pod_delivery import PodCheckpointStore
+
+                pod_checkpoint_store = PodCheckpointStore.from_env()
+            return pod_checkpoint_store
+
+        def on_pods(entry) -> bool:
+            from reliquary.rl_orders.runtime import requires_owned_training_runtime
+
+            return not requires_owned_training_runtime(entry.params["training_order"])
+
+        @router.get("/training/{task_id}/checkpoint")
+        async def training_checkpoint(task_id: str):
+            entry = await training_task(task_id)
+            if on_pods(entry):
+                try:
+                    manifest = await asyncio.to_thread(pod_store().load_manifest, task_id)
+                except (OSError, ValueError, RuntimeError) as exc:
+                    raise HTTPException(status_code=503, detail="training_checkpoint_unavailable") from exc
+                if manifest is None:
+                    raise HTTPException(status_code=404, detail="training_checkpoint_unknown")
+                return manifest
+            final = await final_training(entry)
+            return final["checkpoint"]
+
+        @router.get("/training/{task_id}/checkpoint/files/{artifact_id}")
+        async def training_checkpoint_file(task_id: str, artifact_id: str, request: Request):
+            from reliquary.rl_orders.checkpoint_delivery import CheckpointRangeError
+
+            entry = await training_task(task_id)
+            pods = on_pods(entry)
+            if not pods:
+                await final_training(entry)
+            if re.fullmatch(r"[0-9a-f]{64}", artifact_id) is None:
+                raise HTTPException(status_code=404, detail="training_checkpoint_file_unknown")
+            try:
+                store = pod_store() if pods else training_runtime_store.checkpoints
+                item = await asyncio.to_thread(store.open_range, task_id, artifact_id, request.headers.get("range"))
+            except CheckpointRangeError as exc:
+                raise HTTPException(status_code=416, detail="training_checkpoint_range_invalid") from exc
+            except FileNotFoundError as exc:
+                raise HTTPException(status_code=404, detail="training_checkpoint_file_unknown") from exc
+            except (OSError, ValueError, RuntimeError) as exc:
+                raise HTTPException(status_code=503, detail="training_checkpoint_file_unavailable") from exc
+            headers = {"Cache-Control": "private, no-store", "Accept-Ranges": "bytes",
+                       "Content-Length": str(len(item.data)), "X-Content-SHA256": item.sha256,
+                       "Content-Disposition": f'attachment; filename="{artifact_id}.bin"'}
+            if item.partial:
+                headers["Content-Range"] = f"bytes {item.start}-{item.end}/{item.total}"
+            return Response(content=item.data, status_code=206 if item.partial else 200,
+                            media_type=item.artifact["content_type"], headers=headers)
+
+        @router.get("/training/{task_id}/spend")
+        async def training_spend_route(task_id: str) -> dict:
+            """What the task paid its miners (``rl_spend``, written by its controller), the order's frozen
+            alpha/USD rate and whether the bill is final."""
+            entry = await training_task(task_id)
+            from reliquary.validator import rl_spend
+
+            read = rl_spend_reader or rl_spend.read_spend
+            try:
+                summary = await asyncio.to_thread(read, task_id)      # a training task's run is its task id
+            except Exception as exc:
+                logger.warning("admin: the spend of %s is unreadable: %r", task_id, exc)
+                raise HTTPException(status_code=503, detail="spend_unreadable") from exc
+            if summary is None:
+                raise HTTPException(status_code=404, detail="spend_not_published")
+            if summary.get("task_id") != task_id:
+                raise HTTPException(status_code=503, detail="spend_of_another_task")
+            retired_time = None
+            if entry.retired_at is not None:
+                try:
+                    retired_time = await asyncio.to_thread(_round_time, int(entry.retired_at))
+                except Exception as exc:
+                    raise HTTPException(status_code=503, detail="drand_unavailable") from exc
+            return training_spend(entry, summary, retired_time=retired_time)
+
+        @router.post("/training/{task_id}/retire")
+        async def retire_training(task_id: str, body: Retire) -> dict:
+            entry = await training_task(task_id)
+            if entry.status != "retired":
+                try:
+                    stamp = body.retired_at if body.retired_at is not None else current_round()
+                    await registry_store.retire_task_entry(task_id, stamp)
+                except (RegistryError, registry_store.RegistryConflict) as exc:
+                    entry = await training_task(task_id)
+                    if entry.status != "retired":
+                        raise HTTPException(status_code=409 if isinstance(exc, RegistryError) else 503,
+                                            detail=str(exc)) from exc
+                except RuntimeError as exc:
+                    raise HTTPException(status_code=503, detail=str(exc)) from exc
+            try:
+                await revoke_trainer_pods(task_id)
+            except Exception as exc:
+                logger.warning("admin: the trainer pods of %s were not all revoked: %r", task_id, exc)
+                raise HTTPException(status_code=503, detail="trainer_pods_not_revoked") from exc
+            return await training_answer(await training_task(task_id))
+
+        async def revoke_trainer_pods(task_id: str) -> None:
+            """A retired order's pods lose the trainer link (each retire call retries what is left)."""
+            for document in await executors.list_executors():
+                if (executors.scope_of(document) == "trainer" and document.get("task_id") == task_id
+                        and document.get("status") == "active"):
+                    await executors.set_executor_status(document["executor_id"], "revoked",
+                                                        reason="training order retired", scope="trainer")
+
     @router.get("/jobs/{job_id}/status")
     async def job_status(job_id: str) -> dict:
         from reliquary.protocol.release_contract import canonical_sha256
@@ -1351,11 +1767,12 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=404, detail="job_unknown")
         counts = await job_counts(job_id)
         entries = await entries_naming(job_id)
+        pay = await job_miner_pay(job_id, entries)
         tasks = [{"task_id": e.task_id, "status": e.status, "cap": float(e.params["cap"]),
                   **({"max_price": price_of(e)} if price_of(e) is not None else {})}
                  for e in entries]
         manifest = job.to_contract()
-        return {"job_id": job_id, **counts, "manifest": manifest, "tasks": tasks,
+        return {"job_id": job_id, **counts, "miner_pay": pay, "manifest": manifest, "tasks": tasks,
                 "manifest_sha256": canonical_sha256(manifest),
                 "profile_sha256": entries[0].profile_sha256 if len(entries) == 1 else None,
                 "task_contracts": [task_document(e) for e in entries]}
@@ -1408,12 +1825,25 @@ def create_admin_app(*, secret: bytes, pool_max: float,
 
     @router.post("/executors")
     async def register_executor(body: RegisterExecutor, response: Response) -> dict:
+        if body.scope == "trainer":
+            from reliquary.rl_orders.runtime import requires_owned_training_runtime
+
+            if body.task_id is None:
+                raise HTTPException(status_code=422, detail="a trainer executor needs its task_id")
+            entries, _ = await registry_store.read_registry(strict=False)
+            entry = entries.get(body.task_id)
+            if entry is None or "training_order" not in entry.params:
+                raise HTTPException(status_code=422, detail="training_unknown")
+            if requires_owned_training_runtime(entry.params["training_order"]):
+                raise HTTPException(status_code=409, detail="training_requires_owned_runtime")
+            if entry.status != "active":           # a late registration would hold the order's model delivery
+                raise HTTPException(status_code=409, detail="training_not_active")
         try:
             document, created = await executors.register_executor(
                 executor_id=body.executor_id, token_sha256=body.token_sha256,
                 model_id=body.model_id, model_revision=body.model_revision,
                 expires_at=body.expires_at, now=clock(), provider_id=body.provider_id,
-                host=body.host, scope=body.scope)
+                host=body.host, scope=body.scope, task_id=body.task_id)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except executors.ExecutorConflict as exc:
@@ -1690,6 +2120,11 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             await refuse_past_the_source(body.env, wanted["prompt_start"], body.problems)
         existing, _ = await qualifications.read(body.qualification_id)
         if existing is None:
+            if body.set_id is not None:
+                card_body = await eval_store.get_bytes(subnet_key(body.set_id, "set.json"))
+                if card_body is None:
+                    raise HTTPException(status_code=404, detail="set_unknown")
+                await require_set_grader(json.loads(card_body))
             # Before any executor is rented: a model that can never be served.
             await refuse_unservable_model(body.model, body.revision)
 
@@ -1721,6 +2156,23 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         if record is None:
             raise HTTPException(status_code=404, detail="qualification_unknown")
         return record
+
+    async def order_redone_slots(job, source) -> dict | None:
+        """``grading.redone_slots`` from the order control's session store (its last days);
+        None when the store cannot be read (the report says nothing rather than zero)."""
+        from reliquary.eval.grading import redone_slots
+
+        store = order_sessions
+        if store is None:
+            from reliquary.infrastructure.sandbox_store import ORDER_SESSION_PREFIX, R2SessionStore
+
+            store = R2SessionStore(prefix=ORDER_SESSION_PREFIX)
+        try:
+            documents = await store.list_recent(int(clock()))
+        except Exception:
+            logger.warning("order %s: sandbox sessions unreadable, no redo count", job.job_id, exc_info=True)
+            return None
+        return redone_slots(documents, job.job_id, lambda index: _problem_id(source, index))
 
     def _problem_id(source, index: int) -> str:
         from reliquary.eval.prompt_source import load_eval_rows
@@ -1827,7 +2279,14 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                                      "gpu": m.get("gpu")}
                                for eid, m in (result.get("measurements") or {}).items()},
                 "status": record.get("status")}
+        from reliquary.eval.job_grading import episode_protocol
+
+        redone = await order_redone_slots(job, source) if job.episode is not None else None
         provenance = {**facts, "checkpoint_sha256": job.checkpoint_sha256, "seed": job.seed,
+                      # Slots played again after an infra end (no row): count and reason, per problem.
+                      **({"redone_slots": redone} if job.episode is not None else {}),
+                      # The harness, profile and bounds an agentic score depends on.
+                      **({"episode": episode_protocol(job.episode)} if job.episode is not None else {}),
                       "eos_token_id": job.eos_token_id, "verification": verification,
                       "job_complete": complete,
                       # Every attempt used: their missing samples are failures.
@@ -1886,15 +2345,56 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         running = gradings.get(eval_id)
         if running is not None:
             raise HTTPException(status_code=409, detail="a grading runs under this id")
+        from reliquary.orders import chains
+
+        def chain_report():
+            return chains.chain_report(chain_id=body.chain, part_ids=body.parts, platform=deliveries,
+                                       subnet=eval_store)
+
         try:
             # One writer per evaluation id: a grading and a combination never share files.
             async with grade_locks.setdefault(eval_id, asyncio.Lock()):
-                manifest = await reports.combine(deliveries, eval_id, body.parts, clock=clock)
-        except reports.PartNotGraded as exc:
+                manifest = await reports.combine(deliveries, eval_id, body.parts, clock=clock,
+                                                 chain_id=body.chain, chain_report=chain_report)
+        except (reports.PartNotGraded, chains.PartNotGraded) as exc:
             raise HTTPException(status_code=409, detail=f"part_not_graded: {exc}") from exc
         except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise HTTPException(status_code=409, detail=str(exc)[:500]) from exc
         return {"state": "done", "eval_id": eval_id, "keys": manifest["keys"], "complete": manifest["complete"]}
+
+    @router.post("/evaluations/{eval_id}/chain-next")
+    async def chain_next(eval_id: str, body: ChainNext) -> dict:
+        """The set of the chain position after ``eval_id``'s (graded), built from its answers and published to the
+        subnet bucket (``orders.chains``); asked again, the same set."""
+        from reliquary.corpus.delivery import validated_delivery_id
+        from reliquary.eval.storage import SetConflict
+        from reliquary.orders import chains
+
+        in_scope(eval_id)
+        try:
+            validated_delivery_id(eval_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if deliveries is None or not getattr(deliveries, "evaluation_supported", True):
+            raise HTTPException(status_code=503, detail="deliveries_not_configured")
+        if body.chain not in chains.CHAINS:
+            raise HTTPException(status_code=422, detail=f"chain_unknown: {body.chain!r}")
+        if upload_tokenizer is None:
+            from reliquary.validator.eval_control import load_cpu_tokenizer as load_tokenizer
+        else:
+            load_tokenizer = upload_tokenizer
+        try:
+            async with grade_locks.setdefault(eval_id, asyncio.Lock()):
+                return await chains.next_set(chain_id=body.chain, eval_id=eval_id, platform=deliveries,
+                                             subnet=eval_store, load_tokenizer=load_tokenizer, clock=clock,
+                                             work_dir=work_dir)
+        except chains.PartNotGraded as exc:
+            raise HTTPException(status_code=409, detail=f"part_not_graded: {exc}") from exc
+        except (chains.ChainRefused, SetConflict) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)[:500]) from exc
+        except Exception as exc:
+            logger.warning("chain step after %s could not be built", eval_id, exc_info=True)
+            raise HTTPException(status_code=503, detail="chain_step_unavailable") from exc
 
     @router.post("/evaluations/{eval_id}/grade")
     async def grade_evaluation(eval_id: str, body: GradeEvaluation, response: Response) -> dict:
@@ -2019,11 +2519,16 @@ def create_admin_app(*, secret: bytes, pool_max: float,
 
     @asynccontextmanager
     async def lifespan(app):
+        from reliquary.admin.cap_sizing import sizing_enabled
+
         if evaluation_sessions is not None:
             await evaluation_sessions.start()
+        resizing = asyncio.create_task(resize_forever()) if sizing_enabled() else None
         try:
             yield
         finally:
+            if resizing is not None:
+                resizing.cancel()
             if evaluation_sessions is not None:
                 await evaluation_sessions.stop()
 
@@ -2032,6 +2537,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
     app.state.exports = exports
     app.state.gradings = gradings
     app.state.task_prefix = task_prefix
+    app.state.resize_order_caps = resize_order_caps
     app.add_middleware(BodyLimit, limit=MAX_BODY_BYTES)
     return app
 

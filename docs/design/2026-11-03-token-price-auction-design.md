@@ -264,8 +264,9 @@ Limits of v1:
 - **State is in memory:** asks, debts and the target price. A restart drops debts and restarts the price at the
   ceiling for one round. Miners repost asks within 10 min.
 - **Debt leaves with the job:** it is taken back from later submissions of the same job only.
-- **Agentic miners are not covered:** `corpus mine-agentic` does not post asks yet, so episode jobs should not be
-  priced by auction.
+- **Agentic miners:** `corpus mine-agentic --ask-alpha-per-mtoken` posts its ask before its first lease and
+  reposts it as `corpus mine` does (2026-11-14); an older agentic miner posts none and leases nothing on an
+  auctioned episode job.
 - **Split corpus validators are not covered:** a front that serves routes apart from the judge does not wire the
   auction.
 - **Audit rate:** start auction jobs at `audit_q = 1` (§4).

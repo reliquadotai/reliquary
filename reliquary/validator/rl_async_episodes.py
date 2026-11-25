@@ -110,11 +110,31 @@ def validate_episode_block(name: str, block: Any) -> dict:
     if version is not None and (not isinstance(version, str) or len(version) != 64
                                 or any(c not in "0123456789abcdef" for c in version)):
         raise ValueError(f"{name}.version must be a sha256 hex digest")
+    rows = None
     if "rows" in copy:
         from reliquary.protocol.rl_prompt_ranges import parse_prompt_rows
 
-        parse_prompt_rows(copy["rows"], f"{name}.rows")
+        rows = parse_prompt_rows(copy["rows"], f"{name}.rows")
+    _refuse_outside_rl_rows(name, copy["episode"], rows)
     return copy
+
+
+def _refuse_outside_rl_rows(name: str, episode: Mapping[str, Any], rows) -> None:
+    """The environment catalog decides what RL may draw: the block's package must be a catalog env, its split an
+    RL split, and its rows (all of the split without ``rows``) RL rows of it. Never an eval or batch split."""
+    from reliquary.env_catalog import package_name, refuse_rl_rows
+
+    intervals: list[tuple[int, int]] = []
+    if rows is not None:
+        start = rows.start
+        for a, b in (*rows.exclude, (rows.end, rows.end)):
+            if start < a:
+                intervals.append((start, a))
+            start = b
+    try:
+        refuse_rl_rows(package_name(episode["env_package"]), episode["split"], intervals, whole_split=rows is None)
+    except ValueError as exc:
+        raise ValueError(f"{name}: {exc}") from None
 
 
 def episode_prompt_rows(name: str, block: Mapping[str, Any], taskset_rows: int):
@@ -342,7 +362,7 @@ def build_rl_lease_sandbox(
     config, *, validator_hotkey: str, lease_book, environments: Mapping[str, Any], policies: Mapping[str, Any],
     renderer_for: Callable[[Any], Any], registration=None, signer=None, store_kwargs=None, session_store=None,
     read_documents=None, fetch_report=None, clock: Callable[[], float] = time.time,
-    require_resources: bool = False,
+    require_resources: bool = False, task_id: str | None = None,
 ) -> RlLeaseSandbox:
     """``config``: ``sandbox_wiring.SandboxValidatorConfig``; ``lease_book``: the async ``LeaseBook``;
     ``environments[env].source``: each episode env's task source; ``policies[env]``: its ``EpisodeEnvPolicy``
@@ -406,7 +426,7 @@ def build_rl_lease_sandbox(
         issuer, policy=policy, validator_hotkey=validator_hotkey, prefix=RL_PREFIX, registration=registration,
         clock=clock, max_concurrent_closes=config.close_concurrency,
         close_body_timeout_s=config.close_body_timeout_s, max_preauth_closes=config.close_preauth_concurrency,
-        open_body_timeout_s=BODY_TIMEOUT_S, max_preauth_opens=MAX_PREAUTH)
+        open_body_timeout_s=BODY_TIMEOUT_S, max_preauth_opens=MAX_PREAUTH, task_id=task_id)
     checkers = {name: LeaseEpisodeChecker(policy=p, renderer=renderer_for(p), source=environments[name].source,
                                           directory=fleet.directory_if_ready, token_verifier=token_verifier,
                                           renderer_of=lambda variant, p=p, **kw: renderer_for(p, variant=variant,

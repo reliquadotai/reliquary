@@ -107,7 +107,12 @@ def test_one_process_serves_eval_jobs_of_two_models(world, monkeypatch):
     async def idle(self):
         await asyncio.sleep(3600)
 
-    monkeypatch.setattr(corpus_auditor.CorpusAuditor, "run", idle)
+    async def seeded_idle(self):
+        # Read back at once, then idle: the job may open to miners once its executor claims.
+        self.seeded.set()
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(corpus_auditor.CorpusAuditor, "run", seeded_idle)
     monkeypatch.setattr(corpus_period_settlement.CorpusPeriodSettler, "settle_once", lambda self: idle(self))
     from reliquary.validator import corpus_validator
 
@@ -167,6 +172,8 @@ def test_one_process_serves_eval_jobs_of_two_models(world, monkeypatch):
         assert {job: (status["jobs"][job]["audits_pending"], status["jobs"][job]["audits_idle_since"])
                 for job in ("order-eval-a", "order-eval-b")} == {"order-eval-a": (None, None),
                                                                  "order-eval-b": (None, None)}
+        # Held for their audit only: a gateway is never awaited for a single-turn order.
+        assert {status["jobs"][job].get("held") for job in ("order-eval-a", "order-eval-b")} == {"awaiting_audit"}
         # Nothing seeded yet: the backlog is unknown, so nothing is wanted yet (the fleet keeps what it has).
         assert {m: (v["expected_audits"], v["executors_wanted"], v["idle_executors"], v["executors_allowed"])
                 for m, v in status["models"].items()} == {
@@ -202,7 +209,15 @@ def test_one_process_serves_eval_jobs_of_two_models(world, monkeypatch):
             app.state.corpus_pay = Board()  # the chain read is the pay board's own test
             assert (await client.get("/corpus/pay")).json() == {"jobs": []}
             # No executor has loaded either model yet: miners are kept off both orders.
-            assert (await client.get("/corpus/jobs")).json() == {"jobs": []}
+            listed = (await client.get("/corpus/jobs")).json()
+            assert listed["jobs"] == []
+            # Listed as starting meanwhile, with what a miner fetches ahead.
+            orders = {o["job_id"]: o for o in listed["orders"]}
+            assert orders["order-eval-a"]["state"] == "starting"
+            assert orders["order-eval-a"]["model"] == "customer/A"
+            assert orders["order-eval-a"]["revision"] == "a" * 40
+            assert orders["order-eval-a"]["pricing"] == "first_come"
+            assert orders["order-eval-a"]["max_new_tokens"] > 0
             held = await client.get(f"/corpus/jobs/order-eval-a/next/{hotkey}")
             assert held.status_code == 409 and held.json()["detail"] == "job_paused"
             headers = {"Authorization": "Bearer token-one"}
@@ -212,7 +227,10 @@ def test_one_process_serves_eval_jobs_of_two_models(world, monkeypatch):
                                       headers=headers)
             assert first.status_code == 204, first.text
             # Model A's executor now claims: its order opens, model B's stays held.
-            assert (await client.get("/corpus/jobs")).json() == {"jobs": ["order-eval-a"]}
+            listed = (await client.get("/corpus/jobs")).json()
+            assert listed["jobs"] == ["order-eval-a"]
+            assert {o["job_id"]: o["state"] for o in listed["orders"]} == {
+                "order-eval-a": "open", "order-eval-b": "starting"}
             assert (await client.post("/corpus/internal/eval-audit/claim", json=claim,
                                       headers={"Authorization": "Bearer nope"})).status_code == 401
             beat = await client.post("/corpus/internal/eval-audit/heartbeat",
@@ -278,7 +296,12 @@ def test_a_drained_eval_job_is_unwired_and_releases_what_it_held(world, monkeypa
     async def nothing(self):
         return []
 
-    monkeypatch.setattr(corpus_auditor.CorpusAuditor, "run", idle)
+    async def seeded_idle(self):
+        # Read back at once, then idle: the job may open to miners once its executor claims.
+        self.seeded.set()
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(corpus_auditor.CorpusAuditor, "run", seeded_idle)
     monkeypatch.setattr(corpus_auditor.CorpusAuditor, "pending_ids", nothing)
     monkeypatch.setattr(corpus_period_settlement.CorpusPeriodSettler, "settle_once", lambda self: idle(self))
 

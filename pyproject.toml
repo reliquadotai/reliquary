@@ -41,10 +41,14 @@ dependencies = [
     # The agentic harness miners and validators share (render, parse, loop): one commit
     # of reliquary-sandbox's harness/ distribution. `agentic_swe.HARNESS_DIGEST` pins
     # the spec it must install; another digest refuses SWE and signed jobs.
-    "reliquary-harness[qwen] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@7d559fd16564ac16af52486fe6552084c685bca6#subdirectory=harness",
+    "reliquary-harness[qwen] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@d680d5e6f694c650f74b9dea4bc62930aad45da0#subdirectory=harness",
 ]
 
 [project.optional-dependencies]
+# the async trainer's Miles backend (RELIQUARY_TRAINER_BACKEND=miles): the Tinker client of the gateway
+miles = [
+    "tinker==0.36.0",
+]
 vision = [
     "torch==2.7.0",
     "peft==0.21.2",
@@ -65,13 +69,26 @@ wandb = [
 ]
 # Signed-episode sandboxes (plan 3): reliquary-sandbox, public, pinned by one commit.
 sandbox = [
-    "reliquary-sandbox[verifiers] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@f8c208bd35848a13cf5b9e44b64309d835d1d81e",
+    "reliquary-sandbox[verifiers] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@d680d5e6f694c650f74b9dea4bc62930aad45da0",
 ]
 sandbox-miner = [
-    "reliquary-sandbox[verifiers] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@f8c208bd35848a13cf5b9e44b64309d835d1d81e",
+    "reliquary-sandbox[verifiers] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@d680d5e6f694c650f74b9dea4bc62930aad45da0",
+    "reliquary[miner-envs]",
+]
+# The env packages agentic orders pin (reliquary/miner/env_packages.py: the same list), from git so
+# pip records the commit the validator checks. Built for Python 3.12 only, like the gateways.
+# pip keeps a git install whose commit moved under the same version: `reliquary miner-envs --sync`
+# (run by the miner at start) reinstalls those.
+miner-envs = [
+    "reliquary-swe @ git+https://github.com/reliquadotai/reliquary-environments.git@15ad131b473f59f46b62d363bfacf430f4931f39#subdirectory=environments/code/reliquary_swe ; python_version == '3.12'",
+    "reliquary-terminal @ git+https://github.com/reliquadotai/reliquary-environments.git@15ad131b473f59f46b62d363bfacf430f4931f39#subdirectory=environments/code/reliquary_terminal ; python_version == '3.12'",
+    "reliquary-swebench-pro @ git+https://github.com/reliquadotai/reliquary-environments.git@d2cf12b1c144515397fae634f5e848f7df55c180#subdirectory=environments/code/reliquary_swebench_pro ; python_version == '3.12'",
+    "reliquary-deepswe @ git+https://github.com/reliquadotai/reliquary-environments.git@faaefd675e6f6583e6e1ce3f3a3eca109fe8e766#subdirectory=environments/code/reliquary_deepswe ; python_version == '3.12'",
+    "reliquary-terminal-bench @ git+https://github.com/reliquadotai/reliquary-environments.git@a7718445c156a36eec2835c43d5fb6c86c045a5e#subdirectory=environments/code/reliquary_terminal_bench ; python_version == '3.12'",
+    "reliquary-automationbench @ git+https://github.com/reliquadotai/reliquary-environments.git@b404a0bb93b289a44ae242c001148f21982812a7#subdirectory=environments/tool_use/reliquary_automationbench ; python_version == '3.12'",
 ]
 sandbox-test = [
-    "reliquary-sandbox[service] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@f8c208bd35848a13cf5b9e44b64309d835d1d81e",
+    "reliquary-sandbox[service] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@d680d5e6f694c650f74b9dea4bc62930aad45da0",
 ]
 
 [project.scripts]
@@ -95,6 +112,7 @@ asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 markers = [
     "classic_window: asserts the pre-v6 timed-window behaviour. These pass under the default profile and are deselected by the v6 job, where the product answers differently by design.",
+    "slow: an end-to-end flow over several components (seconds, not milliseconds); deselect with -m 'not slow'.",
 ]
 filterwarnings = [
     "error::DeprecationWarning",

@@ -226,8 +226,11 @@ class GraderServer:
         worker_acquire_timeout_s: float = 30.0,
         listen_unix_socket: bool = True,
         runtime_id: str | None = None,
+        stdio_max_seconds: float = MAX_EXECUTOR_TIMEOUT_SECONDS,
     ) -> None:
         self.socket_path = socket_path
+        # The longest CPU budget a stdio request may ask (SciCode's sidecar: longer).
+        self.stdio_max_seconds = float(stdio_max_seconds)
         self.pool_size = pool_size
         self.worker_argv = worker_argv or [
             sys.executable, "-m", "reliquary.environment.grader.worker"
@@ -792,7 +795,7 @@ class GraderServer:
             or not 0 < output_cap <= STDIO_MAX_OUTPUT_CAP
             or not isinstance(time_limit_s, (int, float)) or isinstance(time_limit_s, bool)
             or not math.isfinite(time_limit_s)
-            or not 0 < time_limit_s <= MAX_EXECUTOR_TIMEOUT_SECONDS
+            or not 0 < time_limit_s <= self.stdio_max_seconds
         ):
             return error("bad_request")
         if self.sandbox_executor is not None:
@@ -1378,6 +1381,10 @@ def main() -> None:
         ),
         help="Atomic JSON worker lifecycle snapshot consumed by /health.",
     )
+    parser.add_argument(
+        "--stdio-max-seconds", type=float, default=MAX_EXECUTOR_TIMEOUT_SECONDS,
+        help="Largest CPU budget of a stdio request (the SciCode sidecar raises it).",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
@@ -1418,6 +1425,7 @@ def main() -> None:
         sandbox_executor=(remote_executor if remote_mode == "remote" else None),
         shadow_executor=(remote_executor if remote_mode == "shadow" else None),
         runtime_id=(remote_executor.runtime_id if remote_executor else None),
+        stdio_max_seconds=args.stdio_max_seconds,
     )
     shutdown = threading.Event()
 

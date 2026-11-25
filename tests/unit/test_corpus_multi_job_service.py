@@ -66,7 +66,7 @@ def _ledger(job_id):
 
 
 def test_the_jobs_list_names_every_served_job(two_jobs):
-    assert two_jobs.get("/corpus/jobs").json() == {"jobs": ["swe-v1", "swe-v2"]}
+    assert two_jobs.get("/corpus/jobs").json()["jobs"] == ["swe-v1", "swe-v2"]
 
 
 def test_a_job_scoped_read_answers_for_that_job(two_jobs):
@@ -90,7 +90,7 @@ def test_the_legacy_reads_serve_the_first_listed_job(seeded_job, fake_r2):
 
     assert client.get("/corpus/job").json()["job_id"] == "swe-v2"
     assert client.get("/corpus/cursor/5Hot").json() == {"hotkey": "5Hot", "cursor": 0}
-    assert client.get("/corpus/jobs").json() == {"jobs": ["swe-v1", "swe-v2"]}
+    assert client.get("/corpus/jobs").json()["jobs"] == ["swe-v1", "swe-v2"]
     # A legacy miner's submission names its job, and still reaches only that one.
     assert client.post("/corpus/submit", json=_body("swe-v2")).json()["accepted"] is True
     assert _ledger("swe-v2") and not _ledger("swe-v1")
@@ -117,7 +117,7 @@ def test_a_submission_for_an_unserved_job_lists_every_served_one(two_jobs):
 def test_one_job_keeps_the_legacy_routes_and_gains_the_scoped_ones(one_job):
     assert one_job.get("/corpus/job").json()["job_id"] == "swe-v1"
     assert one_job.get("/corpus/cursor/5Hot").json() == {"hotkey": "5Hot", "cursor": 0}
-    assert one_job.get("/corpus/jobs").json() == {"jobs": ["swe-v1"]}
+    assert one_job.get("/corpus/jobs").json()["jobs"] == ["swe-v1"]
     assert one_job.get("/corpus/jobs/swe-v1/job").json()["job_id"] == "swe-v1"
 
     refused = one_job.post("/corpus/submit", json=_body("other-job")).json()
@@ -168,3 +168,15 @@ def test_two_jobs_on_one_source_split_it_by_range(seeded_job, fake_r2):
     crossed = post("sft-v1", 500 + 1, 3)
     assert crossed["reason"] == "prompt_mismatch"
     assert post("rl-v1", 499, 3)["reason"] == "prompt_mismatch"
+
+
+def test_the_jobs_list_names_the_sandbox_hotkey_when_sessions_are_served(seeded_job, fake_r2):
+    from reliquary.validator.corpus_service import CorpusJobRoutes, build_corpus_jobs_router
+
+    routes = CorpusJobRoutes({"swe-v1": _router(seeded_job, "swe-v1")})
+    app = FastAPI()
+    app.include_router(build_corpus_jobs_router(routes))
+    client = TestClient(app)
+    assert "sandbox_hotkey" not in client.get("/corpus/jobs").json()
+    routes.sandbox_hotkey = "5Validator"
+    assert client.get("/corpus/jobs").json()["sandbox_hotkey"] == "5Validator"

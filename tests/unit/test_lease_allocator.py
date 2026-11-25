@@ -1,0 +1,570 @@
+"""Leases at the consumer's pace, cheapest miners full (docs/design/2026-11-17-lease-allocation.md): speeds with
+two counters, trusted slots declared then measured, the merit order and its clearing price, the market's pace and
+its split between orders; then a job's auction allocating by merit order."""
+from __future__ import annotations
+
+import pytest
+
+from reliquary.corpus import lease_allocator as la
+from reliquary.corpus.token_auction import (
+    ALLOWANCE_FULL,
+    ASK_ABOVE_PRICE,
+    AuctionParams,
+    Terms,
+    TokenAuction,
+)
+
+EMISSION = 100.0
+
+
+class Clock:
+    def __init__(self, now=10_000.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
+def test_merit_enabled_names_markets():
+    assert not la.merit_enabled("Qwen/Qwen3.5-9B|turn", {})
+    assert la.merit_enabled("Qwen/Qwen3.5-9B|turn", {la.MERIT_ENV: "all"})
+    assert la.merit_enabled("Qwen/Qwen3.5-9B|turn", {la.MERIT_ENV: "Qwen3.5-9B, other"})
+    assert not la.merit_enabled("Qwen/Qwen3.6-27B|turn", {la.MERIT_ENV: "Qwen3.5-9B"})
+    assert not la.merit_enabled(None, {la.MERIT_ENV: "Qwen3.5-9B"})
+
+
+# -- speeds -------------------------------------------------------------------------------------------------------
+
+
+def _run(book, clock, hotkey, held, per_delivery, every, seconds):
+    """``hotkey`` holds ``held`` leases and delivers ``per_delivery`` tokens every ``every`` seconds."""
+    end = clock.now + seconds
+    while clock.now < end:
+        clock.now += every
+        book.tick(clock.now, {hotkey: held})
+        book.delivered(hotkey, clock.now, per_delivery)
+
+
+def test_speed_counts_every_lease_held_not_only_the_delivered():
+    clock = Clock()
+    honest, hoarder = la.SpeedBook(), la.SpeedBook()
+    # Both deliver 2 000 tokens every 10 s; the hoarder holds 40 leases to do it, the honest miner 10.
+    _run(honest, clock, "h", 10, 2000, 10.0, 600)
+    clock.now -= 600
+    _run(hoarder, clock, "h", 40, 2000, 10.0, 600)
+    assert honest.speed("h", clock.now) == pytest.approx(20.0, rel=0.05)
+    assert hoarder.speed("h", clock.now) == pytest.approx(5.0, rel=0.05)
+
+
+def test_no_speed_before_enough_deliveries():
+    clock = Clock()
+    book = la.SpeedBook()
+    _run(book, clock, "h", 10, 2000, 60.0, 60.0 * (la.MIN_DELIVERIES - 1))
+    assert book.speed("h", clock.now) is None
+    _run(book, clock, "h", 10, 2000, 60.0, 60.0)
+    assert book.speed("h", clock.now) is not None
+
+
+def test_speed_forgets_past_its_window():
+    clock = Clock()
+    book = la.SpeedBook()
+    _run(book, clock, "h", 10, 2000, 10.0, 600)      # 20 tok/lease-s
+    _run(book, clock, "h", 10, 500, 10.0, 900)       # then 5
+    assert book.speed("h", clock.now) == pytest.approx(5.0, rel=0.1)
+
+
+# -- the merit order ----------------------------------------------------------------------------------------------
+
+
+def test_merit_order_fills_cheapest_first_and_cuts_only_the_last():
+    # The design's example: R* = 25k tok/s; M4 is the marginal, partly served; M5 gets nothing.
+    candidates = [la.Candidate("M1", 0.01, 100, 60.0), la.Candidate("M2", 0.02, 200, 40.0),
+                  la.Candidate("M3", 0.03, 50, 30.0), la.Candidate("M4", 0.04, 300, 40.0),
+                  la.Candidate("M5", 0.05, 80, 50.0)]
+    allocation = la.merit_order(candidates, 25_000.0, median=40.0)
+    assert allocation.slots == {"M1": 100, "M2": 200, "M3": 50, "M4": 238}
+    assert allocation.clearing == 0.04
+    assert allocation.reached
+
+
+def test_a_slow_card_counts_for_what_it_delivers():
+    cheap_slow = la.Candidate("slow", 0.0, 100, 2.0)        # 200 tok/s whatever its 100 slots
+    dear_fast = la.Candidate("fast", 0.5, 100, 40.0)
+    allocation = la.merit_order([cheap_slow, dear_fast], 1_000.0, median=20.0)
+    assert allocation.slots == {"slow": 100, "fast": 20}
+    assert allocation.clearing == 0.5
+
+
+def test_an_added_offer_never_raises_the_clearing_price():
+    """2026-11-18: nineteen hotkeys at 0 and a twentieth dear one. The dear one is either not needed, or the
+    marginal: without it the marginal would be the next offer up."""
+    book = [la.Candidate(f"zero{i}", 1e-6, 10, 20.0) for i in range(19)]
+    book += [la.Candidate("rival-a", 0.10, 50, 20.0), la.Candidate("rival-b", 0.35, 50, 20.0)]
+    for target in (3_000.0, 4_500.0, 5_500.0):
+        without = la.merit_order(book, target, 20.0).clearing
+        with_dear = la.merit_order(book + [la.Candidate("dear-sybil", 0.30, 20, 20.0)], target, 20.0).clearing
+        assert with_dear <= without
+
+
+def test_volume_delivered_does_not_set_the_price():
+    """Three hotkeys at 1e-6 delivering three quarters of the volume do not choose the price: the last needed
+    miner does."""
+    book = [la.Candidate("zero-a", 1e-6, 200, 20.0), la.Candidate("zero-b", 1e-6, 64, 20.0),
+            la.Candidate("zero-c", 1e-6, 64, 20.0), la.Candidate("mid", 0.10, 190, 20.0),
+            la.Candidate("dear", 0.35, 288, 20.0)]
+    assert la.merit_order(book, 20.0 * 400, 20.0).clearing == 0.10
+    assert la.merit_order(book, 20.0 * 300, 20.0).clearing == 1e-6       # the cheap offers alone cover it
+
+
+# -- trusted slots ------------------------------------------------------------------------------------------------
+
+
+def test_an_honest_newcomer_keeps_its_whole_capacity():
+    clock = Clock()
+    book, trust = la.SpeedBook(), la.Allowances()
+    trust.needed("new", clock.now, book)
+    _run(book, clock, "new", 200, 2000, 0.5, 300)    # 200 slots at 20 tok/lease-s
+    trust.step("new", clock.now, declared=200, held=200, speeds=book, median=20.0, median_seconds=100.0,
+               tail=False)
+    assert trust.of("new", 200) == 200
+
+
+def test_an_over_declared_capacity_drops_to_what_is_delivered_at_the_first_verdict():
+    clock = Clock()
+    book, trust = la.SpeedBook(), la.Allowances()
+    trust.needed("liar", clock.now, book)
+    _run(book, clock, "liar", 500, 2000, 1.0, 300)   # 2 000 tok/s for 500 slots declared
+    changed = trust.step("liar", clock.now, declared=500, held=500, speeds=book, median=20.0,
+                         median_seconds=100.0, tail=False)
+    assert changed.startswith("verdict")
+    assert trust.of("liar", 500) == 100              # 2 000 tok/s / 20 per slot
+
+
+def test_a_slow_full_hotkey_is_cut_then_grows_back_when_fast():
+    clock = Clock()
+    book, trust = la.SpeedBook(), la.Allowances()
+    trust.needed("h", clock.now, book)
+    _run(book, clock, "h", 100, 2000, 1.0, 300)
+    trust.step("h", clock.now, declared=100, held=100, speeds=book, median=20.0, median_seconds=100.0, tail=False)
+    assert trust.of("h", 100) == 100                 # judged honest
+    _run(book, clock, "h", 100, 200, 1.0, 600)       # then 2 tok/lease-s, under 1/4 of 20
+    trust.step("h", clock.now, declared=100, held=100, speeds=book, median=20.0, median_seconds=100.0, tail=False)
+    assert trust.of("h", 100) == 80
+    _run(book, clock, "h", 80, 2000, 1.0, 600)       # fast again, full
+    trust.step("h", clock.now, declared=100, held=80, speeds=book, median=20.0, median_seconds=100.0, tail=False)
+    assert trust.of("h", 100) == 100
+
+
+def test_the_tail_cuts_at_half_the_median():
+    assert la.vmin(20.0, tail=False) == 5.0
+    assert la.vmin(20.0, tail=True) == 10.0
+
+
+# -- the market's pace --------------------------------------------------------------------------------------------
+
+
+def test_one_order_takes_the_audit_rate_over_its_audit_share():
+    clock = Clock()
+    pace = la.MarketPace(clock)
+    pace.bind_audit(lambda: (5_000.0, 0.9))
+    pace.report("job", q=0.2, remaining_tokens=1e9, deadline=None, supply=None, backlog_tokens=0, unmet_at=None)
+    assert pace.target("job") == pytest.approx(25_000.0)
+
+
+def test_the_queue_lowers_k_when_the_wait_grows():
+    clock = Clock()
+    pace = la.MarketPace(clock)
+    pace.bind_audit(lambda: (1_000.0, 0.99))
+    pace.report("job", q=1.0, remaining_tokens=1e9, deadline=None, supply=None, backlog_tokens=240_000,
+                unmet_at=None)
+    pace.target("job")
+    assert pace.k == pytest.approx(0.5)              # a 240 s wait, the card full: target / wait, at most halved
+
+
+def test_a_queue_growing_past_half_the_hold_cuts_k_even_on_an_idle_card():
+    """Prod 2026-11-21: intake starved the judge, the card idled, and k stayed high while payments fell behind."""
+    clock = Clock()
+    pace = la.MarketPace(clock)
+    pace.bind_audit(lambda: (1_000.0, 0.3))
+
+    def step(wait_seconds):
+        pace.report("job", q=1.0, remaining_tokens=1e9, deadline=None, supply=None,
+                    backlog_tokens=wait_seconds * 1_000.0, unmet_at=None, lag_seconds=60.0)
+        pace.target("job")
+        clock.now += la.STEP_SECONDS
+
+    step(800)
+    step(899)
+    assert pace.k == 1.0                               # under the line, an idle card still means wait elsewhere
+    step(1_000)
+    assert pace.k == pytest.approx(0.5)
+    clock.now += pace.loop_seconds()
+    step(900)
+    assert pace.k == pytest.approx(0.5)                # already shrinking: no further cut
+    clock.now += pace.loop_seconds()
+    step(1_200)
+    assert pace.k == pytest.approx(0.25)
+
+
+def test_an_idle_card_with_miners_refused_raises_k():
+    clock = Clock()
+    pace = la.MarketPace(clock)
+    pace.bind_audit(lambda: (1_000.0, 0.5))
+    pace.report("job", q=1.0, remaining_tokens=1e9, deadline=None, supply=None, backlog_tokens=0,
+                unmet_at=clock.now)
+    pace.target("job")
+    assert pace.k == pytest.approx(la.K_GROW)
+
+
+def test_orders_get_their_floor_then_the_surplus_goes_to_the_closest_to_done():
+    jobs = {
+        "big": la._JobReport(q=1.0, remaining_tokens=86_400 * 100.0, deadline=86_400.0, supply=1e9),
+        "small": la._JobReport(q=1.0, remaining_tokens=60_000.0, deadline=86_400.0, supply=2_000.0),
+    }
+    rates = la.split(jobs, 3_000.0, now=0.0, first_seen={})
+    assert rates["big"] == pytest.approx(100.0 + (3_000.0 - 100.0 - 2_000.0))
+    assert rates["small"] == pytest.approx(2_000.0)  # its whole supply: it finishes in 30 s
+
+
+def test_floors_over_the_card_are_scaled_down():
+    jobs = {"a": la._JobReport(q=1.0, remaining_tokens=2e6, deadline=1_000.0),
+            "b": la._JobReport(q=1.0, remaining_tokens=2e6, deadline=1_000.0)}
+    rates = la.split(jobs, 2_000.0, now=0.0, first_seen={})
+    assert rates == {"a": pytest.approx(1_000.0), "b": pytest.approx(1_000.0)}
+
+
+# -- a job's auction by merit order -------------------------------------------------------------------------------
+
+
+class Book:
+    def __init__(self):
+        self.held = {}
+
+    def __call__(self):
+        return dict(self.held)
+
+    def take(self, terms):
+        self.held[terms.hotkey] = self.held.get(terms.hotkey, 0) + 1
+
+
+def _merit_auction(monkeypatch, clock, audit=(400.0, 0.9), q=1.0, market="m-model|turn"):
+    monkeypatch.setenv(la.MERIT_ENV, "all")
+    monkeypatch.setattr(la, "_PACES", {})
+    params = AuctionParams(ceiling=0.706 / 1e6 / EMISSION, miner_alpha_per_period=EMISSION, initial_leases=1000)
+    book = Book()
+    auction = TokenAuction(params, clock=clock, holdings=book, market_name=market, job_id="job",
+                           backlog=lambda: 0)
+    auction.bind_merit(audit=lambda: audit, q=lambda: q)
+    return auction, book
+
+
+def _warm(auction, book, clock, hotkeys, seconds=700):
+    """Each hotkey holds its leases and delivers 200 tokens per lease every 10 s (20 tok/lease-s)."""
+    end = clock.now + seconds
+    while clock.now < end:
+        clock.now += 10.0
+        for hotkey in hotkeys:
+            for _ in range(book.held.get(hotkey, 0)):
+                auction.observe_delivery(hotkey, 10.0, tokens=200)
+        auction.view()
+
+
+def test_the_cheapest_are_full_the_dear_wait_and_the_price_is_the_marginal_offer(monkeypatch):
+    clock = Clock()
+    auction, book = _merit_auction(monkeypatch, clock, audit=(400.0, 0.9))   # 400 tok/s = 20 leases at 20
+    auction.post_ask("zero", 1e-6, 10)
+    auction.post_ask("mid", 0.10, 15)
+    auction.post_ask("dear", 0.70, 20)
+    # Speeds start unmeasured: the thermostat stands in until a first measure (each takes its whole capacity).
+    for hotkey in ("zero", "mid", "dear"):
+        for _ in range(20):
+            terms = auction.admit(hotkey)
+            if isinstance(terms, Terms):
+                book.take(terms)
+                auction.unreserve(terms)
+    _warm(auction, book, clock, ["zero", "mid", "dear"])
+    book.held = {}
+    granted = {}
+    for hotkey in ("dear", "mid", "zero"):           # the dear one asks first: timing no longer matters
+        while True:
+            terms = auction.admit(hotkey)
+            if not isinstance(terms, Terms):
+                break
+            book.take(terms)
+            auction.unreserve(terms)
+            granted[hotkey] = granted.get(hotkey, 0) + 1
+            last = terms
+    assert granted.get("zero") == 10
+    assert granted.get("mid") == 10                  # partly served: the marginal
+    assert "dear" not in granted
+    assert auction.admit("dear") == ASK_ABOVE_PRICE
+    assert auction.admit("zero") == ALLOWANCE_FULL
+    assert last.price == pytest.approx(auction.params.share_of(0.10))
+    view = auction.view("zero")
+    assert view["allocator"] == "merit"
+    assert view["price_alpha_per_mtoken"] == pytest.approx(0.10)
+
+
+def test_without_the_flag_nothing_changes(monkeypatch):
+    monkeypatch.delenv(la.MERIT_ENV, raising=False)
+    params = AuctionParams(ceiling=0.706 / 1e6 / EMISSION, miner_alpha_per_period=EMISSION, initial_leases=8)
+    auction = TokenAuction(params, clock=Clock(), holdings=Book(), market_name="m|turn", job_id="job")
+    assert not auction.merit
+    auction.post_ask("a", 0.1, 4)
+    assert isinstance(auction.admit("a"), Terms)
+    assert "allocator" not in auction.view()
+
+
+def test_an_rl_env_fills_its_trainer_budget_cheapest_first(monkeypatch):
+    """RL: the budget is what the trainer's next steps take (in leases); once speeds are measured it goes to the
+    cheapest offers, not to whoever asks when a lease frees."""
+    monkeypatch.setenv(la.MERIT_ENV, "all")
+    monkeypatch.setattr(la, "_PACES", {})
+    clock = Clock()
+    params = AuctionParams(ceiling=0.706 / 1e6 / EMISSION, miner_alpha_per_period=EMISSION, initial_leases=4)
+    book = Book()
+    auction = TokenAuction(params, clock=clock, holdings=book, market_name="rl|task|math", job_id="rl-task-math",
+                           budget=lambda: 6)
+    auction.post_ask("cheap", 0.05, 6)
+    auction.post_ask("dear", 0.50, 6)
+    for hotkey in ("cheap", "dear"):
+        for _ in range(3):
+            terms = auction.admit(hotkey)
+            if isinstance(terms, Terms):
+                book.take(terms)
+                auction.unreserve(terms)
+    _warm(auction, book, clock, ["cheap", "dear"])
+    book.held = {}
+    granted = {}
+    for hotkey in ("dear", "cheap"):
+        while isinstance(terms := auction.admit(hotkey), Terms):
+            book.take(terms)
+            auction.unreserve(terms)
+            granted[hotkey] = granted.get(hotkey, 0) + 1
+    assert granted == {"cheap": 6}
+
+
+def test_with_every_offer_needed_one_small_dear_hotkey_does_not_price_every_lease():
+    """The target out of reach (the audit could take more than every miner together): the dearest offer is
+    needed, but one slot at the ceiling must not set every lease's price."""
+    book = [la.Candidate("zero", 1e-6, 300, 20.0), la.Candidate("mid", 0.10, 100, 20.0),
+            la.Candidate("sybil", 0.706, 1, 20.0)]
+    allocation = la.merit_order(book, 100_000.0, 20.0)
+    assert not allocation.reached and allocation.slots["sybil"] == 1
+    assert allocation.clearing == 0.10
+    # Real dear capacity, a tenth of the supply and more, does price the leases: it is needed and delivers.
+    book[2] = la.Candidate("dear", 0.706, 60, 20.0)
+    assert la.merit_order(book, 100_000.0, 20.0).clearing == 0.706
+
+
+def test_the_shadow_computes_and_shows_the_merit_order_but_leases_as_before(monkeypatch):
+    monkeypatch.delenv(la.MERIT_ENV, raising=False)
+    monkeypatch.setenv(la.SHADOW_ENV, "all")
+    monkeypatch.setattr(la, "_PACES", {})
+    clock = Clock()
+    params = AuctionParams(ceiling=0.706 / 1e6 / EMISSION, miner_alpha_per_period=EMISSION, initial_leases=1000)
+    book = Book()
+    auction = TokenAuction(params, clock=clock, holdings=book, market_name="m|turn", job_id="job", backlog=lambda: 0)
+    auction.bind_merit(audit=lambda: (300.0, 0.9), q=lambda: 1.0)
+    assert auction.measures and not auction.merit
+    for hotkey, alpha in (("zero", 1e-6), ("mid", 0.10), ("dear", 0.70)):
+        auction.post_ask(hotkey, alpha, 10)
+        for _ in range(10):
+            terms = auction.admit(hotkey)
+            book.take(terms)
+            auction.unreserve(terms)
+    _warm(auction, book, clock, ["zero", "mid", "dear"])
+    import reliquary.corpus.token_auction as ta
+    lines = []
+    monkeypatch.setattr(ta.logger, "info", lambda msg, *args: lines.append(msg % args))
+    clock.now += 61
+    terms = auction.admit("dear")                      # the thermostat still leases to the dear offer
+    assert isinstance(terms, Terms) or terms == ALLOWANCE_FULL
+    shadow = auction.view()["merit_shadow"]
+    assert 14 <= shadow["leases_wanted"] <= 20 and shadow["hotkeys"] == 2
+    assert shadow["price_alpha_per_mtoken"] == pytest.approx(0.10)
+    assert "allocator" not in auction.view()
+    assert any(line.startswith("merit order shadow") and "merit_price=0.1000" in line for line in lines)
+
+
+def test_a_long_queue_on_an_idle_card_does_not_lower_k():
+    clock = Clock()
+    pace = la.MarketPace(clock)
+    pace.bind_audit(lambda: (1_000.0, 0.2))
+    pace.report("job", q=1.0, remaining_tokens=1e9, deadline=None, supply=None, backlog_tokens=600_000,
+                unmet_at=None)
+    pace.target("job")
+    clock.now += la.STEP_SECONDS
+    pace.report("job", q=1.0, remaining_tokens=1e9, deadline=None, supply=None, backlog_tokens=700_000,
+                unmet_at=None)
+    pace.target("job")
+    assert pace.k == 1.0
+
+
+def test_k_moves_once_a_loop_and_a_cut_at_most_halves_it():
+    """A change of k shows in the queue a lease time later: k is cut at most by half and once a loop, while the
+    records of leases already out keep the queue growing, and raised once a loop, never wound up to K_MAX by the
+    30-s steps of one loop (2026-11-18/19: k 3.06 against 5-min leases, then 60/170 = 0.35 in one step)."""
+    clock = Clock()
+    pace = la.MarketPace(clock)
+    busy = [0.99]
+    pace.bind_audit(lambda: (1_000.0, busy[0]))
+
+    def step(backlog, unmet=None):
+        pace.report("job", q=1.0, remaining_tokens=1e9, deadline=None, supply=None, backlog_tokens=backlog,
+                    unmet_at=unmet, lag_seconds=240.0)
+        pace.target("job")
+        clock.now += la.STEP_SECONDS
+
+    assert pace.loop_seconds() == la.DEFAULT_LOOP_SECONDS + la.TARGET_WAIT_SECONDS
+    for backlog in (120_000, 150_000, 180_000, 200_000, 220_000):    # a queue still growing, the card full
+        step(backlog)
+    assert pace.loop_seconds() == 300.0
+    assert pace.k == pytest.approx(0.5)               # one cut, by half at most, in the first loop
+    for _ in range(10):                                # past the loop, still growing: the second cut
+        step(240_000)
+    assert pace.k == pytest.approx(0.25)
+    busy[0] = 0.5
+    ks = []
+    for _ in range(60):                                # the queue gone, the card idle, offers refused: 30 min
+        step(0, unmet=clock.now)
+        ks.append(pace.k)
+    assert ks[0] == pytest.approx(0.375) and ks[4] == pytest.approx(0.375)   # under 1: once half a loop
+    assert 1.0 in ks and max(ks) <= la.K_MAX
+    first_above = ks.index(next(k for k in ks if k > 1.0))
+    assert first_above - ks.index(1.0) >= 300 / la.STEP_SECONDS               # above 1: once a loop
+    assert sorted(set(ks)) == sorted(set(ks), key=ks.index)                    # never down while idle
+
+
+def test_k_never_winds_up_past_k_max():
+    clock = Clock()
+    pace = la.MarketPace(clock)
+    pace.bind_audit(lambda: (1_000.0, 0.5))
+    for _ in range(400):
+        pace.report("job", q=1.0, remaining_tokens=1e9, deadline=None, supply=None, backlog_tokens=0,
+                    unmet_at=clock.now, lag_seconds=60.0)
+        pace.target("job")
+        clock.now += la.STEP_SECONDS
+    assert pace.k == la.K_MAX == 2.0
+
+
+def test_a_hotkey_that_does_not_take_its_slots_is_trimmed_to_what_it_holds_but_not_in_the_shadow():
+    clock = Clock()
+    book, trust = la.SpeedBook(), la.Allowances()
+    trust.needed("h", clock.now, book)
+    _run(book, clock, "h", 20, 400, 1.0, 300)        # declared 100, holds 20, each at 20 tok/lease-s
+    assert trust.step("h", clock.now, declared=100, held=20, speeds=book, median=20.0, median_seconds=100.0,
+                      tail=False, trim_unused=False) is None
+    assert trust.of("h", 100) == 100                 # the shadow: refused slots are not its fault
+    changed = trust.step("h", clock.now, declared=100, held=20, speeds=book, median=20.0, median_seconds=100.0,
+                         tail=False)
+    assert changed.startswith("verdict") and trust.of("h", 100) == 25
+
+
+def test_draining_orders_without_measured_supply_take_no_surplus():
+    jobs = {"open": la._JobReport(q=0.2, remaining_tokens=1e8, deadline=None, supply=5_000.0),
+            "draining": la._JobReport(q=1.0, remaining_tokens=0.0, deadline=None, supply=None)}
+    rates = la.split(jobs, 3_000.0, now=0.0, first_seen={"open": 0.0, "draining": 0.0})
+    assert rates["draining"] == 0.0
+    assert rates["open"] == pytest.approx(15_000.0)   # 3k audit tok/s at q 0.2, up to and beyond its supply
+
+
+def test_after_a_restart_the_merit_order_resumes_at_once(monkeypatch, tmp_path):
+    """The median speed and the audit rate are kept in the state: a restarted control allocates by merit order
+    from its first lease instead of leaving the job to the thermostat while it measures again."""
+    clock = Clock()
+    auction, book = _merit_auction(monkeypatch, clock, audit=(300.0, 0.9))
+    auction._state_path = tmp_path / "job.json"
+    auction.post_ask("zero", 1e-6, 10)
+    auction.post_ask("mid", 0.10, 15)
+    for hotkey in ("zero", "mid"):
+        for _ in range(20):
+            terms = auction.admit(hotkey)
+            if isinstance(terms, Terms):
+                book.take(terms)
+                auction.unreserve(terms)
+    _warm(auction, book, clock, ["zero", "mid"])
+    assert auction.view()["allocator"] == "merit"
+    auction.save(force=True)
+
+    monkeypatch.setattr(la, "_PACES", {})
+    params = auction.params
+    restarted = TokenAuction(params, clock=clock, holdings=book, market_name="m-model|turn", job_id="job",
+                             backlog=lambda: 0, state_path=tmp_path / "job.json")
+    restarted.bind_merit(audit=lambda: None, q=lambda: 1.0)       # the card not measured again yet
+    restarted.admit("zero")
+    clock.now += la.STEP_SECONDS
+    restarted.admit("zero")
+    assert restarted.view()["allocator"] == "merit"
+
+
+def test_after_a_restart_the_audited_share_from_before_stands_until_enough_verdicts(monkeypatch, tmp_path):
+    """A fresh auditor reads its share near q (its prior): the share kept from before the restart stands until
+    Q_TRUSTED_DECISIONS verdicts land, so R* is not twice too high."""
+    import reliquary.corpus.token_auction as ta
+
+    clock = Clock()
+    monkeypatch.setenv(la.MERIT_ENV, "all")
+    monkeypatch.setattr(la, "_PACES", {})
+    params = AuctionParams(ceiling=0.706 / 1e6 / EMISSION, miner_alpha_per_period=EMISSION, initial_leases=8)
+    share, weight = [0.43], [1000]
+    auction = TokenAuction(params, clock=clock, holdings=Book(), market_name="m|turn", job_id="job",
+                           backlog=lambda: 0, state_path=tmp_path / "job.json")
+    auction.bind_merit(audit=lambda: (1_000.0, 0.9), q=lambda: share[0], q_weight=lambda: weight[0])
+    auction._report(clock.now, {})
+    auction._dirty = True
+    auction.save(force=True)
+    monkeypatch.setattr(la, "_PACES", {})
+    restarted = TokenAuction(params, clock=clock, holdings=Book(), market_name="m|turn", job_id="job",
+                             backlog=lambda: 0, state_path=tmp_path / "job.json")
+    share[0], weight[0] = 0.21, 40                    # the fresh auditor: few verdicts, near its prior
+    reports = []
+    monkeypatch.setattr(restarted._pace, "report", lambda job, **kw: reports.append(kw["q"]))
+    restarted.bind_merit(audit=lambda: (1_000.0, 0.9), q=lambda: share[0], q_weight=lambda: weight[0])
+    restarted._report(clock.now, {})
+    weight[0] = ta.Q_TRUSTED_DECISIONS
+    restarted._report(clock.now, {})
+    assert reports == [pytest.approx(0.43), pytest.approx(0.21)]
+
+
+def test_the_marginal_hotkey_taking_every_slot_it_is_given_is_not_trimmed():
+    """2026-11-24: the merit order gave the last needed hotkey 2 of its 22 slots; it held both and its first verdict
+    trimmed it to 3, judged against its capacity instead of the slots it was given."""
+    clock = Clock()
+    book, trust = la.SpeedBook(), la.Allowances()
+    trust.needed("marginal", clock.now, book, given=2)
+    trust.step("marginal", clock.now, declared=22, held=2, speeds=book, median=20.0, median_seconds=100.0,
+               tail=False, given=2)
+    _run(book, clock, "marginal", 2, 400, 10.0, 300)  # 2 leases at 20 tok/lease-s
+    assert trust.step("marginal", clock.now, declared=22, held=2, speeds=book, median=20.0, median_seconds=100.0,
+                      tail=False, given=2) is None
+    assert trust.of("marginal", 22) == 22
+
+
+def test_a_hotkey_priced_out_after_it_was_needed_is_not_trimmed():
+    """Needed once at 22 slots, priced out at the next allocation: it holds nothing because it is given nothing."""
+    clock = Clock()
+    book, trust = la.SpeedBook(), la.Allowances()
+    trust.needed("out", clock.now, book, given=22)
+    trust.step("out", clock.now, declared=22, held=0, speeds=book, median=20.0, median_seconds=100.0, tail=False,
+               given=22)
+    clock.now += 5.0
+    book.tick(clock.now, {"out": 0})
+    for _ in range(120):                              # past twice the verdict wait
+        trust.step("out", clock.now, declared=22, held=0, speeds=book, median=20.0, median_seconds=100.0,
+                   tail=False, given=0)
+        clock.now += 5.0
+        book.tick(clock.now, {"out": 0})
+    assert trust.of("out", 22) == 22
+
+
+def test_a_hotkey_not_taking_the_slots_it_is_given_is_still_trimmed():
+    clock = Clock()
+    book, trust = la.SpeedBook(), la.Allowances()
+    trust.needed("h", clock.now, book, given=10)
+    trust.step("h", clock.now, declared=22, held=2, speeds=book, median=20.0, median_seconds=100.0, tail=False,
+               given=10)
+    _run(book, clock, "h", 2, 400, 10.0, 300)         # given 10, holds 2
+    changed = trust.step("h", clock.now, declared=22, held=2, speeds=book, median=20.0, median_seconds=100.0,
+                         tail=False, given=10)
+    assert changed.startswith("verdict") and trust.of("h", 22) == 3

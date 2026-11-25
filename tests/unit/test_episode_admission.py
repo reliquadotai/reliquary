@@ -287,7 +287,7 @@ def test_a_forged_transcript_never_reads_as_a_stale_checkpoint(tmp_path):
 
 def test_a_renderer_error_on_miner_tokens_is_a_refusal(tmp_path):
     class Raising(FakeRenderer):
-        def tool_calls(self, completion_ids):
+        def tool_calls(self, completion_ids, prompt_ids=None):
             raise ValueError("undecodable")
 
     w = world(tmp_path)
@@ -400,7 +400,7 @@ class _SpyRenderer(FakeRenderer):
         self.parses += 1
         return super().span_is_canonical(prompt_ids, completion_ids)
 
-    def tool_calls(self, completion_ids):
+    def tool_calls(self, completion_ids, prompt_ids=None):
         self.parses += 1
         return super().tool_calls(completion_ids)
 

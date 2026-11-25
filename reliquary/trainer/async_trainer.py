@@ -367,6 +367,58 @@ def _peak_memory() -> dict[str, float]:
             "async/gpu_peak_reserved_gb": torch.cuda.max_memory_reserved() / 2**30}
 
 
+BATCH_DUMP_FORMAT = 1
+BATCH_DUMP_KEEP = 4                     # dumps kept (``RELIQUARY_RL_TRAINER_DUMP_KEEP``): each can be GBs
+
+
+def _dump_key(path: Path) -> tuple[int, int] | None:
+    """``(version, try)`` of a ``step-<version>-try<k>.pkl`` name, else None."""
+    import re
+
+    found = re.fullmatch(r"step-(\d+)-try(\d+)\.pkl", path.name)
+    return None if found is None else (int(found[1]), int(found[2]))
+
+
+def dump_batch(folder: Path, *, version: int, attempt: int, from_checkpoint: int, groups: list[SubmittedGroup],
+               uniforms: list[list[list[float]]], eos_ids: tuple[int, ...], keep: int = BATCH_DUMP_KEEP) -> Path:
+    """One step's batch as ``<folder>/step-<version>-try<attempt>.pkl`` (``version``: the checkpoint the step
+    produces; ``attempt``: the try at it, so a skipped or failed step's batch is not overwritten by the next one):
+    the groups in batch order and the uniforms the step used, enough to train the same batch again under another
+    layout (a lab tool, ``RELIQUARY_RL_TRAINER_DUMP_DIR``). Written to a temporary name, then renamed; a failed
+    write leaves no file. Only the ``keep`` latest dumps stay. Put the folder on its own volume: a dump is large,
+    and a disk it fills could be the one the checkpoints are exported to."""
+    import pickle
+
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"step-{int(version)}-try{int(attempt)}.pkl"
+    partial = path.with_name(path.name + ".partial")
+    try:
+        with open(partial, "wb") as handle:
+            pickle.dump({"format": BATCH_DUMP_FORMAT, "version": int(version), "attempt": int(attempt),
+                         "from_checkpoint": int(from_checkpoint), "groups": list(groups), "uniforms": uniforms,
+                         "eos_ids": tuple(eos_ids)}, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        partial.replace(path)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+    dumps = sorted((key, p) for p in folder.iterdir() if (key := _dump_key(p)) is not None)
+    for _, old in dumps[:max(0, len(dumps) - max(1, int(keep)))]:
+        old.unlink(missing_ok=True)
+    return path
+
+
+def load_batch_dump(path: Path) -> dict:
+    """A ``dump_batch`` file (trusted input only: it is a pickle)."""
+    import pickle
+
+    with open(path, "rb") as handle:
+        dump = pickle.load(handle)
+    if dump.get("format") != BATCH_DUMP_FORMAT:
+        raise ValueError(f"{path}: unknown batch dump format {dump.get('format')!r}")
+    return dump
+
+
 def save_snapshot(snapshot: Mapping[str, Any], folder: Path, *, lr_schedule_step: int | None) -> None:
     from reliquary.shared.ckpt_delta import write_anchor_shards
 
@@ -389,17 +441,23 @@ class AsyncTrainerConfig:
     max_attempts: int = 3                    # hand-outs of a group without a report before it is dropped untrained
     poll_s: float = 0.5                      # while the batch is not full
     audits_per_step: int = 8                 # out-of-zone audits judged before each step (``trainer.audits``)
-    audit_budget_s: float = 120.0            # their time budget per round; waiting for a batch runs more rounds
+    # The time budget of an audit round (``AsyncTrainer.audit_budget``): ``audit_budget_s`` when set, else
+    # max(``audit_min_s``, ``audit_share`` x the last step's train seconds). Waiting for a batch runs more rounds.
+    audit_budget_s: float | None = None
+    audit_min_s: float = 60.0
+    audit_share: float = 0.25
     prefetch: bool = False                   # take the next batch while this one trains (when enough is queued)
     report_workers: int = 1                  # report_training calls in flight at once
+    dump_dir: Path | None = None             # each batch written here before it trains (replay; None: off)
+    dump_keep: int = BATCH_DUMP_KEEP         # the latest dumps kept in ``dump_dir``
 
     def __post_init__(self) -> None:
         if self.batch_groups < 1 or (self.hf_backup_every or 1) < 1 or self.max_attempts < 1:
             raise ValueError("batch_groups, hf_backup_every and max_attempts must be positive")
-        if self.report_workers < 1:
-            raise ValueError("report_workers must be positive")
-        if self.audits_per_step < 0 or self.audit_budget_s < 0:
-            raise ValueError("audits_per_step and audit_budget_s must be non-negative")
+        if self.report_workers < 1 or self.dump_keep < 1:
+            raise ValueError("report_workers and dump_keep must be positive")
+        if self.audits_per_step < 0 or (self.audit_budget_s or 0) < 0 or self.audit_min_s < 0 or self.audit_share < 0:
+            raise ValueError("audits_per_step, audit_budget_s, audit_min_s and audit_share must be non-negative")
         if self.steps_per_checkpoint != 1:
             # pi_old is the policy under the gate: a second step before publishing trains with ratio 1 (no clip,
             # no dual clip, no drift breaker) and verifies miners against weights they never saw.
@@ -419,7 +477,8 @@ class AsyncTrainer:
                  backup_save: Callable[..., None] = save_snapshot,
                  train_step_fn: Callable = _default_train_step, ref_model: Any = None,
                  global_step_hint: int | None = None, audits=None, clock: Callable[[], float] = time.monotonic,
-                 sleep: Callable[[float], None] = time.sleep) -> None:
+                 sleep: Callable[[float], None] = time.sleep,
+                 drain_requested: Callable[[], bool] | None = None) -> None:
         self.model, self.config = model, config
         self.buffer, self.submissions, self.book = buffer, submissions, book
         self.publisher, self.backup, self._backup_save = publisher, backup, backup_save
@@ -427,6 +486,10 @@ class AsyncTrainer:
         self._train_step, self.ref_model, self.global_step_hint = train_step_fn, ref_model, global_step_hint
         self._clock, self._sleep = clock, sleep
         self.audits = audits                    # trainer.audits.TrainerAudits: out-of-zone audits on this model
+        self._drain_requested = drain_requested
+        self._draining = False
+        self._publication_error: BaseException | None = None
+        self._prefetch_error: BaseException | None = None
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ckpt-publish")
         self._pending: Future | None = None
         self._fetcher = ThreadPoolExecutor(max_workers=1, thread_name_prefix="batch-prefetch")
@@ -438,6 +501,8 @@ class AsyncTrainer:
         self.published: list[int] = []
         self.last_step: dict = {}
         self.skipped = 0
+        self.last_train_s: float | None = None  # the last step's forward/backward seconds (the audit budget's base)
+        self._tries: tuple[int, int] = (-1, 0)  # (version, tries at it): the batch dump's name
         self.last_publication: dict = {}
         self.version = book.latest_checkpoint
         if self.version is None:
@@ -473,9 +538,15 @@ class AsyncTrainer:
             self.last_publication = {**self.last_publication, **measure()}
 
     def wait_published(self) -> None:
+        if self._publication_error is not None:
+            raise self._publication_error
         if self._pending is not None:
             pending, self._pending = self._pending, None
-            pending.result()
+            try:
+                pending.result()
+            except BaseException as exc:
+                self._publication_error = exc
+                raise
 
     def close(self) -> None:
         try:
@@ -485,6 +556,23 @@ class AsyncTrainer:
             self._fetcher.shutdown(wait=True)        # what it took stays taken: the next start requeues it
             if self._reporter is not None:
                 self._reporter.shutdown(wait=True)
+
+    def drain_requested(self) -> bool:
+        if not self._draining and self._drain_requested is not None and self._drain_requested():
+            self._draining = True
+        return self._draining
+
+    def quiesce(self) -> None:
+        """Join local work and report held, untrained groups before the controller seals its trainer routes."""
+        self._draining = True
+        self._fetcher.shutdown(wait=True)
+        if self._prefetch_error is not None:
+            raise self._prefetch_error
+        held = self._collect_prefetch(strict=True)
+        if held:
+            self._report_untrained(held)
+        self._uniforms.clear()
+        self.close()
 
     # --- batch ---------------------------------------------------------------------------------------------
     def _report_untrained(self, groups, failure_class=None) -> None:
@@ -522,6 +610,9 @@ class AsyncTrainer:
         judging queued audits meanwhile."""
         taken: list[SubmittedGroup] = list(held or [])
         while True:
+            if self.drain_requested():
+                self._report_untrained(taken)
+                return []
             if len(taken) >= self.config.batch_groups:
                 return taken
             taken += self.buffer.take(self.config.batch_groups - len(taken))
@@ -530,17 +621,47 @@ class AsyncTrainer:
             if not self.run_audits():
                 self._sleep(self.config.poll_s)
 
+    def audit_budget(self) -> float:
+        """Seconds one audit round may take on the trainer's GPUs (the only GPUs of an RL-orders task: the
+        controller's audit source is the trainer). Bounded by the training it delays: ``max(audit_min_s,
+        audit_share x the last step's train seconds)``, ``audit_min_s`` before the first step;
+        ``audit_budget_s``, when set, overrides the rule. One round runs before each step, so audits add at most
+        about ``audit_share`` to a step; while the trainer waits for a full batch, rounds repeat until it is full
+        (idle GPUs: no bound on the total)."""
+        if self.config.audit_budget_s is not None:
+            return float(self.config.audit_budget_s)
+        if self.last_train_s is None:
+            return float(self.config.audit_min_s)
+        return max(float(self.config.audit_min_s), self.config.audit_share * self.last_train_s)
+
+    def _dump(self, submitted: list[SubmittedGroup], uniforms) -> float:
+        """The batch into ``dump_dir`` (off: 0 s); returns the seconds it took. A failed dump (disk full, an
+        unpicklable value) is a warning, never the reason a step fails."""
+        if self.config.dump_dir is None:
+            return 0.0
+        version = self.version + 1
+        tries = self._tries[1] + 1 if self._tries[0] == version else 1
+        self._tries = (version, tries)
+        at = self._clock()
+        try:
+            dump_batch(self.config.dump_dir, version=version, attempt=tries, from_checkpoint=self.version,
+                       groups=submitted, uniforms=uniforms, eos_ids=self.config.eos_ids, keep=self.config.dump_keep)
+        except Exception as exc:  # noqa: BLE001 - a lab aid: never the reason a step fails
+            logger.warning("batch dump into %s failed (%s: %s); training goes on", self.config.dump_dir,
+                           type(exc).__name__, exc)
+        return self._clock() - at
+
     def run_audits(self) -> int:
         """One round of out-of-zone audits on the current weights (none without ``audits``)."""
         if self.audits is None:
             return 0
-        return self.audits.run(self.model, limit=self.config.audits_per_step, budget_s=self.config.audit_budget_s)
+        return self.audits.run(self.model, limit=self.config.audits_per_step, budget_s=self.audit_budget())
 
     # --- prefetch ------------------------------------------------------------------------------------------
     def _start_prefetch(self) -> None:
         """Take the next batch in the background while this one trains, only when a full batch is already queued:
         a short take would start the controller's starvation clock while the trainer is busy."""
-        if not self.config.prefetch or self._prefetched is not None:
+        if not self.config.prefetch or self._prefetched is not None or self.drain_requested():
             return
         depth = getattr(self.buffer, "depth", None)
         if depth is None:
@@ -549,7 +670,7 @@ class AsyncTrainer:
 
     def _prefetch_job(self, depth) -> list[SubmittedGroup]:
         started = time.monotonic()
-        if sum(depth().values()) < self.config.batch_groups:
+        if self.drain_requested() or sum(depth().values()) < self.config.batch_groups:
             return []
         taken = self.buffer.take(self.config.batch_groups)
         fetched = time.monotonic()
@@ -559,14 +680,17 @@ class AsyncTrainer:
                     time.monotonic() - fetched)
         return taken
 
-    def _collect_prefetch(self) -> list[SubmittedGroup] | None:
+    def _collect_prefetch(self, *, strict: bool = False) -> list[SubmittedGroup] | None:
         """The groups the prefetch took (None: nothing held, or the take failed and may have half-happened)."""
         if self._prefetched is None:
             return None
         pending, self._prefetched = self._prefetched, None
         try:
             return pending.result()
-        except Exception:  # noqa: BLE001 - the step takes its batch itself after a requeue
+        except Exception as exc:  # noqa: BLE001 - legacy steps recover a lost take through requeue
+            if strict:
+                self._prefetch_error = exc
+                raise
             logger.exception("batch prefetch failed")
             return None
 
@@ -574,7 +698,12 @@ class AsyncTrainer:
     def run_once(self) -> str:
         began = self._clock()
         telemetry.hold()                # train_step's row and this step's timings go to wandb as one row
-        held = self._collect_prefetch()
+        held = self._collect_prefetch(strict=self._drain_requested is not None)
+        if self.drain_requested():
+            if held:
+                self._report_untrained(held)
+            self.last_step = {"result": "draining", "checkpoint": self.version}
+            return "draining"
         if held is None:
             self.buffer.requeue()       # between steps the trainer holds nothing: a take whose answer was lost
             held = []
@@ -586,8 +715,12 @@ class AsyncTrainer:
             dropped += len(stale)
             held = [g for g in held if g.checkpoint >= below]
         exhausted = self.drop_exhausted()
+        audit_budget = self.audit_budget()
         self.run_audits()                       # bounded: audits progress even when batches are always full
         submitted = self.assemble(held)
+        if not submitted:
+            self.last_step = {"result": "draining", "checkpoint": self.version}
+            return "draining"
         started = self._clock()
         _reset_peak_memory()
         batch, slot = [], 0
@@ -596,6 +729,8 @@ class AsyncTrainer:
         uniforms = [self._uniforms.pop(g.lease_id) for g in submitted]
         self._uniforms.clear()          # dropped groups' (stale, released): never trained under these leases
         self._start_prefetch()
+        dump_s = self._dump(submitted, uniforms)
+        started += dump_s               # the dump is not training: kept out of train_s and the audit budget
         for i, group in enumerate(submitted):
             batch.append(training_group(group, slot0=slot, index=i, uniforms=uniforms[i]))
             slot += len(group.completions)
@@ -617,6 +752,7 @@ class AsyncTrainer:
                                           window_index=self.steps + 1, global_step_hint=self.global_step_hint,
                                           gate=gate)
         except TrainingStepSkipped as exc:
+            self.last_train_s = self._clock() - started
             logger.warning("async train step skipped (%s): %d groups unpaid", exc.reason, len(submitted))
             self._report_untrained(submitted)
             self.skipped += 1           # its rows stay held and go out with the next trained step
@@ -653,13 +789,23 @@ class AsyncTrainer:
             self.backup.submit(self.steps, lambda folder, s=frozen, lr=lr_step:
                                self._backup_save(s, folder, lr_schedule_step=lr))
         completion = sum(len(c) for g in submitted for c in g.completions)
+        rollouts = sum(len(g.completions) for g in submitted)
+        prompt = sum(len(g.prompt_tokens) * len(g.completions) for g in submitted)
         worked = self._clock() - started
+        self.last_train_s = trained - started
         self.last_step = {"result": "trained", "step": self.steps, "checkpoint": self.version, **gate.metrics()}
-        audit_metrics = self.audits.metrics() if self.audits is not None else {}
+        audit_metrics = ({**self.audits.metrics(), "async/audit_budget_s": audit_budget}
+                         if self.audits is not None else {})
         telemetry.flush({**gate.metrics(), **timings, **self.last_publication, **audit_metrics,
                          "async/wait_s": started - began, "async/train_s": trained - started,
                          "async/step_s": worked, "async/completion_tokens": completion,
+                         **({"async/dump_s": dump_s} if self.config.dump_dir is not None else {}),
                          "async/completion_tokens_per_s": completion / worked if worked > 0 else 0.0,
+                         # every sequence token the step trained (prompt + completion), for throughput and MFU
+                         "async/rollouts": rollouts, "async/prompt_tokens": prompt,
+                         "async/tokens": prompt + completion,
+                         "async/tokens_per_train_s": (prompt + completion) / (trained - started)
+                         if trained > started else 0.0,
                          "async/steps_skipped_total": self.skipped, **_peak_memory()},
                         self.steps)
         return "trained"
@@ -698,5 +844,5 @@ class AsyncTrainer:
 
 __all__ = [
     "ASYNC_FORGERY_FLOOR", "ASYNC_GROUP_FLOOR", "ASYNC_ROLLOUT_FLOOR", "AsyncTrainer", "AsyncTrainerConfig", "DrawGate",
-    "rollout_rate", "save_snapshot", "training_group",
+    "dump_batch", "load_batch_dump", "rollout_rate", "save_snapshot", "training_group",
 ]

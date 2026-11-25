@@ -40,7 +40,7 @@ def _auction(clock, ceiling_alpha=0.5):
                                       initial_leases=8), clock=clock, mean_tokens=100)
 
 
-def _route(fake_r2, auction, records, *, prompts=2, slots=1):
+def _route(fake_r2, auction, records, *, prompts=2, slots=1, suspect_until=None):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
@@ -58,7 +58,8 @@ def _route(fake_r2, auction, records, *, prompts=2, slots=1):
     router = build_corpus_router(
         job_id="swe-v1", store=seeded.store, tokenizer=_Tokenizer(), renderer=seeded.renderer,
         verify_signature=lambda request: True, verify_lease_signature=lambda request: request.signature != "bad",
-        prompt_job_for=seeded.prompt_job_for, records=records, durable_records=False, auction=auction)
+        prompt_job_for=seeded.prompt_job_for, records=records, durable_records=False, auction=auction,
+        suspect_until=suspect_until)
     app.include_router(router)
     return TestClient(app), router
 
@@ -155,7 +156,15 @@ def test_a_job_not_priced_by_auction_refuses_asks(fake_r2):
     assert _lease(client, "5A")["leased"] is True
 
 
-def test_the_settlement_pays_every_token_at_the_periods_price_less_the_debit():
+@pytest.fixture
+def period_rule(monkeypatch):
+    """Leases received before RELIQUARY_AUCTION_MOMENT_PRICE_FROM: paid by the period rule."""
+    from reliquary.validator import corpus_settlement
+
+    monkeypatch.setattr(corpus_settlement, "MOMENT_PRICE_FROM", float("inf"))
+
+
+def test_the_settlement_pays_every_token_at_the_periods_price_less_the_debit(period_rule):
     from reliquary.validator.corpus_settlement import rewards_for
 
     verdicts = [
@@ -164,11 +173,32 @@ def test_the_settlement_pays_every_token_at_the_periods_price_less_the_debit():
         {"passed": True, "hotkey": "b", "token_count": 50, "lease_price": 1e-6, "lease_debit": 1.0},
         {"passed": False, "hotkey": "c", "token_count": 100, "lease_price": 1e-6, "lease_debit": 0.0},
     ]
-    # Every token at the period's price, the highest lease delivered (2e-6); b's debt passes its pay.
+    # Half the tokens at 2e-6: the period's price (under which 95 % were delivered) is 2e-6; b's debt passes
+    # its pay.
     assert rewards_for(verdicts, 1.0) == {"a": pytest.approx(4e-4 - 5e-5)}
     assert rewards_for(verdicts, 1.0, uniform_price=3e-6) == {"a": pytest.approx(6e-4 - 5e-5)}
     # Over the pool: scaled down to it.
     assert sum(rewards_for(verdicts, 1e-4).values()) == pytest.approx(1e-4)
+
+
+def test_a_few_dear_leases_do_not_price_a_whole_period(period_rule):
+    """2026-11-11: offers serving 0.1-1 % of a period's tokens priced all of them at the ceiling."""
+    from reliquary.validator.corpus_settlement import PERIOD_PRICE_QUANTILE, period_price, rewards_for
+
+    cheap = [{"passed": True, "hotkey": f"c{i}", "token_count": 1000, "lease_price": 1e-7, "lease_debit": 0.0}
+             for i in range(99)]
+    dear = {"passed": True, "hotkey": "d", "token_count": 1000, "lease_price": 5e-6, "lease_debit": 0.0}
+    verdicts = [*cheap, dear]
+    assert PERIOD_PRICE_QUANTILE == 0.95
+    assert period_price(verdicts) == pytest.approx(1e-7)          # 99 % of the tokens at 1e-7
+    rewards = rewards_for(verdicts, 1.0)
+    assert rewards["c0"] == pytest.approx(1000 * 1e-7)
+    assert rewards["d"] == pytest.approx(1000 * 5e-6)              # the dear lease at its own price, never under it
+    # An earlier price of the period stands when higher.
+    assert period_price(verdicts, 3e-7) == pytest.approx(3e-7)
+    # A dear share past the 5 % does set the price.
+    heavy = [*cheap[:90], *[{**dear, "hotkey": f"d{i}"} for i in range(10)]]
+    assert period_price(heavy) == pytest.approx(5e-6)
 
 
 # ------------------------------------------------------------------ the miner
@@ -321,9 +351,11 @@ def test_a_delivery_times_the_hotkeys_next_leases(fake_r2):
         lease = _lease(client, "5A")
         assert _submit_as(client, "5A", lease["prompt_index"], lease["slot"])["accepted"] is True
     assert len(auction._deliveries["5A"]) == 3
+    # Each counts for the price at the hotkey's own offer when its lease was granted.
+    assert [alpha for _, _, alpha in auction._market.of(auction._job)] == pytest.approx([0.2] * 3)
 
 
-def test_a_period_pays_its_tokens_at_the_highest_lease_delivered_in_it():
+def test_a_period_pays_its_tokens_at_the_price_under_which_most_were_delivered(period_rule):
     from reliquary.validator.corpus_period_settlement import CorpusPeriodSettler
     from tests.unit.test_corpus_period_settlement import GENESIS, Archives, Records, at, verdict
 
@@ -339,3 +371,138 @@ def test_a_period_pays_its_tokens_at_the_highest_lease_delivered_in_it():
     (doc,) = archives.docs.values()
     assert doc["rewards_by_hotkey"] == {"a": pytest.approx(0.02), "b": pytest.approx(0.02)}
     assert records.state["period_price"][str(3)] == pytest.approx(2e-5)
+
+
+
+def test_each_lease_is_paid_the_price_of_the_moment_it_was_granted_less_the_debit():
+    """2026-11-12: an offer at 0 took a small budget's leases and was paid the period's price, set by the dear
+    offers needed at other moments. Each lease now carries its moment's price and is paid it."""
+    from reliquary.validator.corpus_settlement import rewards_for
+
+    verdicts = [
+        {"passed": True, "hotkey": "zero", "token_count": 1000, "lease_price": 0.0, "lease_debit": 0.0},
+        {"passed": True, "hotkey": "zero", "token_count": 1000, "lease_price": 4e-7, "lease_debit": 0.0},
+        {"passed": True, "hotkey": "dear", "token_count": 1000, "lease_price": 1.8e-6, "lease_debit": 1e-4},
+        {"passed": False, "hotkey": "c", "token_count": 1000, "lease_price": 1.8e-6, "lease_debit": 0.0},
+    ]
+    assert rewards_for(verdicts, 1.0) == {"zero": pytest.approx(4e-4), "dear": pytest.approx(1.8e-3 - 1e-4)}
+    # A period's price (from leases of the earlier rule) never lifts a lease of the moment.
+    assert rewards_for(verdicts, 1.0, uniform_price=1.8e-6)["zero"] == pytest.approx(4e-4)
+
+
+def test_leases_received_before_the_switch_keep_the_period_rule(monkeypatch):
+    from reliquary.validator import corpus_settlement
+    from reliquary.validator.corpus_settlement import rewards_for
+
+    monkeypatch.setattr(corpus_settlement, "MOMENT_PRICE_FROM", 1000.0)
+    verdicts = [
+        # Before: its own offer (0) under the period's price, set by the leases of before (2e-6).
+        {"passed": True, "hotkey": "old", "token_count": 100, "lease_price": 0.0, "received_at": 900.0},
+        {"passed": True, "hotkey": "old2", "token_count": 900, "lease_price": 2e-6, "received_at": 950.0},
+        # After: the price of its moment, whatever the period's.
+        {"passed": True, "hotkey": "new", "token_count": 100, "lease_price": 1e-7, "received_at": 1100.0},
+    ]
+    assert rewards_for(verdicts, 1.0) == {"old": pytest.approx(2e-4), "old2": pytest.approx(1.8e-3),
+                                          "new": pytest.approx(1e-5)}
+
+
+
+
+def test_a_suspect_hotkey_gets_no_lease_and_its_offer_steps_aside(fake_r2):
+    """2026-11-13: a caught hotkey kept its leases while suspect, and its backlog held an order's audit for 25
+    minutes. Suspect, it is refused with its suspicion's end, and its share goes to the offer behind it."""
+    clock = Clock()
+    auction = _auction(clock)
+    until = time.time() + 3600
+
+    async def suspect_until(hotkey):
+        return until if hotkey == "5BAD" else None
+
+    client, _ = _route(fake_r2, auction, _Records(), prompts=4, suspect_until=suspect_until)
+    _ask(client, "5BAD", 0.1)
+    _ask(client, "5OK", 0.3)
+    refused = _lease(client, "5BAD")
+    assert refused["leased"] is False and refused["reason"] == "miner_suspect"
+    assert refused["detail"]["suspect_until"] == int(until)
+    assert auction._aside["5BAD"] == until
+    assert _lease(client, "5OK")["leased"] is True
+
+
+def test_an_offer_that_swaps_gets_its_next_lease_in_the_submissions_answer(fake_r2):
+    clock = Clock()
+    auction = _auction(clock)
+    client, _ = _route(fake_r2, auction, _Records(), prompts=4)
+    body = {"job_id": "swe-v1", "miner_hotkey": "5A", "micro_alpha_per_mtoken": 200_000, "capacity": 1,
+            "swap": True, "issued_at": int(time.time()), "nonce": secrets.token_hex(16), "signature": "ok"}
+    assert client.post("/corpus/ask", json=body).json()["accepted"] is True
+    lease = _lease(client, "5A")
+    answer = _submit_as(client, "5A", lease["prompt_index"], lease["slot"])
+    assert answer["accepted"] is True
+    (following,) = answer["detail"]["next_leases"]     # its one slot, refilled in the same answer
+    assert (following["prompt_index"], following["slot"]) != (lease["prompt_index"], lease["slot"])
+    assert _lease(client, "5A")["reason"] == "allowance_full"
+
+
+def test_an_offer_that_does_not_swap_gets_no_lease_in_its_answers(fake_r2):
+    clock = Clock()
+    client, _ = _route(fake_r2, _auction(clock), _Records(), prompts=4)
+    _ask(client, "5A", 0.2, capacity=1)
+    lease = _lease(client, "5A")
+    answer = _submit_as(client, "5A", lease["prompt_index"], lease["slot"])
+    assert answer["accepted"] is True and "next_leases" not in answer["detail"]
+
+
+def test_a_swapping_offer_is_signed_under_its_own_domain():
+    from reliquary.protocol.signatures import build_corpus_lease_binding
+
+    ask = {"job_id": "j", "miner_hotkey": "h", "issued_at": 1, "nonce": "ab" * 16, "micro_alpha_per_mtoken": 5,
+           "capacity": 4}
+    assert build_corpus_lease_binding({**ask, "swap": None}) == build_corpus_lease_binding(ask)
+    assert build_corpus_lease_binding({**ask, "swap": False}) == build_corpus_lease_binding(ask)
+    assert build_corpus_lease_binding({**ask, "swap": True}) != build_corpus_lease_binding(ask)
+
+
+def test_the_miner_takes_its_next_lease_from_the_submissions_answer():
+    from tests.unit.test_draw_leases import _Gen, _granted, _LeasingClient, _mine
+
+    class _SwappingClient(_LeasingClient):
+        def __init__(self, leases):
+            super().__init__(leases)
+            self.asks = []
+            self.next = [[{"lease_id": "bb" * 16, "prompt_index": 11, "slot": 0, "expires_at": 1e12}], []]
+
+        def ask(self, body):
+            self.asks.append(body)
+            return {"accepted": True, "reason": "accepted"}
+
+        def submit(self, body):
+            super().submit(body)
+            return {"accepted": True, "reason": "accepted",
+                    "detail": {"next_leases": self.next.pop(0) if self.next else []}}
+
+    client = _SwappingClient([_granted(10, 0, "aa" * 16)])
+    counts = _mine(client, _Gen(), max_steps=2, sign_lease=lambda body: "sig", ask_alpha_per_mtoken=0.25)
+    assert client.asks[0]["swap"] is True
+    assert client.submitted == [(10, 0), (11, 0)]
+    assert len(client.lease_bodies) == 1 and counts["lease_swapped"] == 1
+
+
+def test_the_miner_asks_without_swap_from_a_validator_that_predates_it():
+    from reliquary.miner.corpus_miner import CorpusPermanentFailure
+    from tests.unit.test_draw_leases import _Gen, _granted, _LeasingClient, _mine
+
+    class _OldClient(_LeasingClient):
+        def __init__(self, leases):
+            super().__init__(leases)
+            self.asks = []
+
+        def ask(self, body):
+            self.asks.append(body)
+            if "swap" in body:
+                raise CorpusPermanentFailure("extra field", status=422)
+            return {"accepted": True, "reason": "accepted"}
+
+    client = _OldClient([_granted(10, 0, "aa" * 16)])
+    _mine(client, _Gen(), max_steps=1, sign_lease=lambda body: "sig", ask_alpha_per_mtoken=0.25)
+    assert ["swap" in a for a in client.asks] == [True, False]
+    assert client.submitted == [(10, 0)]

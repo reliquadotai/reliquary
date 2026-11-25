@@ -342,7 +342,7 @@ def _limit_not_reached(policy, renderer, *, tokens, spans, stop, calls, opened, 
         return None                                     # (c) a lease's turn ran to the per-turn cap
     if not last or last[-1] != renderer.terminator_id:
         return "the last turn neither reached the episode cap nor ended on the turn terminator"
-    pairs = list(renderer.tool_calls(last))
+    pairs = list(renderer.tool_calls(last, prompt_ids=tokens[:start]))
     if not pairs:
         return "a turn without calls ends the episode: agent_completed, not context_length"
     plans = [plan_call(name, arguments, opened.tools) for name, arguments in pairs]

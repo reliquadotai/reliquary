@@ -64,12 +64,44 @@ for minutes, not hours. The second-lessee rule for the job's tail stays.
 
 ### 2.5 Price paid
 
-At the end of each pay period (the existing period clock), every verified token delivered in the period is paid
-the same price: the highest offer that was given a non-zero allowance during the period. Each lease records its holder's
-offer; the settlement takes the highest one among the period's passed verdicts (and those settled earlier in the
-period) and pays `tokens x price - debit` under the job's cap; the rest of the ceiling budget burns.
+A lease is paid the price of the moment it is granted, never under the holder's own offer. The price of the moment
+is the offer under which 80 % of the recently delivered leases were won, capped by the dearest offer getting work at
+that instant:
 
-Paying everyone the marginal price, not their own offer, lets a miner offer its real cost.
+- each delivery counts at its holder's own offer when the lease was granted, not at the price it was paid;
+- its weight halves every 5 minutes (dropped after 30), so the price follows a market that moves within minutes;
+- the deliveries are those of the job's **market**, its model and whether the work is agentic, across every order
+  on it (in alpha per million tokens), so a new order starts at its market's price instead of at nothing;
+- under a weight of 20 deliveries no price of the moment is taken (the 80 % quantile of four deliveries is their
+  dearest) and a lease is paid its own offer; this only happens for a model's first order or after a long gap;
+- hotkeys in debt or set aside on the job count for nothing.
+
+The settlement pays `tokens x lease price - debit` under the job's cap, and the rest of the ceiling budget burns.
+
+When cheap offers leave, the budget goes to the dearer offers at once and each is paid at least its own offer; only
+offers under their own cost wait for the delivered volume to catch up. When cheap offers arrive, the price falls at
+once through the cap.
+
+Why delivered volume and not the dearest allowance: until 2026-11-16 the price was the dearest offer given an
+allowance, even of one lease. One operator could offer 0 on a hotkey for the budget less one (the budget is public)
+and the ceiling on a second hotkey for one lease, taken and given back every three minutes to stay active: every
+lease of the first was paid the ceiling, and the second's charge was never recovered since it never submits. Now
+raising the price takes delivering a fifth of the work at that price; in a market with enough cheaper offers that
+work goes to them, and the more an offer at 0 delivers the lower the price it is paid. What remains is real market
+power: one operator delivering over a fifth of a short market's work at a high price, bounded by the ceiling.
+
+Why the moment and not the period: the budget follows the audit queue, so within one period it swings between a
+few cheap offers and the whole ladder. Priced once per period (the lease price under which 95 % of its tokens were
+delivered, from #498), an offer at 0 took the leases of a small budget and was paid the period's price, set by the
+dear offers needed at other moments. On 2026-11-12 one coldkey offering 0 delivered 26 % of a 27B order's tokens and
+was paid the ceiling, and on another order took 97 of a 100-lease budget. With the price of the moment an offer
+under its real cost only wins work at moments that pay under that cost; an offer at its real cost gets the same
+leases at the same price every other time. Paying each its own offer instead would make miners bid the price they
+guess, not their cost.
+
+The highest lease alone set the period's price at first: on 2026-11-11, offers serving 0.1-1 % of a period's tokens
+priced all of them at the ceiling. Leases received before `RELIQUARY_AUCTION_MOMENT_PRICE_FROM` keep the period
+rule (the 95 % price, or their own offer when higher).
 
 ### 2.6 Leases not delivered
 
@@ -99,7 +131,6 @@ requests one sample at a time.
 
 - Thermostat defaults (backlog marks, step sizes): check them on the first orders priced this way.
 - Prompt tokens are not paid on a job priced by auction (as before): an offer prices output tokens only.
-- Whether the period price should ignore an offer that served only a tiny share of the period's tokens.
 - Offers per job or per pinned model across jobs.
 - Rollout: announce the offer flag to miners before the first order priced this way; jobs without the flag keep
   first-come at the ceiling.

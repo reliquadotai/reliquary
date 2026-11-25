@@ -377,7 +377,7 @@ class CorpusJobSet:
             return
         self._wire_failures.pop(task_id, None)
         self._routes.add(job_id, router, contract=entry.contract,
-                         prompt_source=job.prompt_source)
+                         prompt_source=job.prompt_source, spec=job)
         self._routes.set_admission(job_id, getattr(entry, "admission", "open"))
         if entry.status != "active":
             # Wired only to finish its audits and settlement: no admission.
@@ -563,11 +563,14 @@ class CorpusJobSet:
 
     def _observed_admission(self, job_id: str, status: dict) -> dict:
         status["admission"] = "paused" if job_id in self._routes.paused else "open"
-        is_held = getattr(self._routes, "is_held", None)  # only an order control holds jobs
-        if is_held is not None and is_held(job_id):
+        held_reason = getattr(self._routes, "held_reason", None)  # only an order control holds jobs
+        reason = held_reason(job_id) if held_reason is not None else None
+        if reason is not None:
             status["awaiting_audit"] = True
+            status["held"] = reason
         else:
             status.pop("awaiting_audit", None)
+            status.pop("held", None)
         return status
 
     async def _recompute(self, job_id: str, cached) -> dict:
@@ -607,7 +610,10 @@ class CorpusJobSet:
                 raise RuntimeError(f"the judge of {job_id} does not serve it")
             book, pending = JudgedBook(judged), int(judged["pending"])
         else:
-            book.start_backfill()
+            seeded = getattr(wiring.auditor, "seeded", None)
+            # Not before the auditor's start: after a restart its listing comes first.
+            if seeded is None or seeded.is_set():
+                book.start_backfill()
             pending = wiring.auditor.pending_count(hotkey)
         state, _ = await wiring.miner_states.state_at_most(hotkey, MINER_STATUS_CACHE_SECONDS)
         status = miner_status(job_id=job_id, hotkey=hotkey, book=book,

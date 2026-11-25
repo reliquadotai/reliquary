@@ -20,6 +20,27 @@ from reliquary.protocol.corpus_submission import MAX_TRANSCRIPT_BYTES
 
 MAX_OPEN_REFUSAL_BYTES = 4096
 
+# A miner's bound on one signed episode (``signed_episode_deadline``): its open window, the
+# agent's wall budget, grading inside the verification window, submit. The order control's
+# leases on such a job last at least this long (``corpus.draw_leases``).
+OPEN_WINDOW_S = 900
+GRADING_GRACE_S = 1800
+SUBMIT_MARGIN_S = 120
+
+
+def signed_episode_deadline(wall_s: float) -> float:
+    """Seconds a miner gives one signed episode whose sandbox wall budget is ``wall_s``."""
+    return float(OPEN_WINDOW_S + wall_s + GRADING_GRACE_S + SUBMIT_MARGIN_S)
+
+
+# A corpus open's declared want (``SandboxEngagement.want``): the live sessions this hotkey wants on the job at once
+# (its batch), at most this. The validator sizes the sandbox fleet from it (design 2026-11-13-sandbox-sizing-miner-
+# demand); it is never an entitlement: the quota's allowance still bounds what the hotkey holds. A validator that
+# reads it says so on its grants and quota refusals (``WANT_ACCEPTED``); a miner sends it only after that, since
+# an older validator refuses the unknown field.
+MAX_SESSION_WANT = 512
+WANT_ACCEPTED = "declares_want"
+
 
 # The session routes of a job served by the order control: under the job's own
 # path, which the order jobs' nginx location already sends there.
@@ -58,6 +79,8 @@ class SandboxEngagement(BaseModel):
     prompt_index: int | None = Field(default=None, ge=0, strict=True)
     precommit: dict[str, Any] | None = None
     lease: dict[str, Any] | None = None      # an async RL lease's rollout: {lease_id, rollout_index} (rl_engagements)
+    # A corpus open's declared want (MAX_SESSION_WANT): signed with the engagement, absent from an older miner's.
+    want: int | None = Field(default=None, ge=1, le=MAX_SESSION_WANT, strict=True)
 
 
 class SandboxSessionOpenRequest(BaseModel):
@@ -106,6 +129,6 @@ class SandboxSessionCloseRequest(BaseModel):
         return self
 
 
-__all__ = ["JOB_SCOPED_PREFIX", "SandboxEngagement", "SandboxSessionCloseRequest",
+__all__ = ["JOB_SCOPED_PREFIX", "MAX_SESSION_WANT", "WANT_ACCEPTED", "SandboxEngagement", "SandboxSessionCloseRequest",
            "SandboxSessionOpenRequest", "SessionRefused", "job_scoped_prefix", "sandbox_close_path",
            "sandbox_open_path"]

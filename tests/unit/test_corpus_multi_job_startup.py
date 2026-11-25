@@ -104,7 +104,7 @@ def started(tmp_path, fake_r2, wired_records, fixed_drand_chain, monkeypatch):  
 
 def test_two_jobs_from_two_templates_start_and_serve(started):
     client = TestClient(started.app)
-    assert client.get("/corpus/jobs").json() == {"jobs": ["code-v1", "math-v1"]}
+    assert client.get("/corpus/jobs").json()["jobs"] == ["code-v1", "math-v1"]
     assert client.get("/corpus/jobs/math-v1/contract").json() == started.contracts["a"]
     assert client.get("/corpus/jobs/code-v1/contract").json() == started.contracts["b"]
 

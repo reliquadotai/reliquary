@@ -28,10 +28,11 @@ class EvalClaimRequest(_Strict):
     # What the executor will take: an audit lease (R3's executors ask for
     # nothing else), a qualification, or either.
     kind: Literal["any", "audit", "qualify"] = "audit"
-    # The audit protocols the executor scores; an executor that predates v3 sends none (v1 only).
+    # The audit protocols the executor scores; an executor that predates v3 sends none (v1 only). v4: greedy
+    # forced draws (``corpus_audit_protocol.AUDIT_PROTOCOL_V4``).
     protocols: list[Literal["reliquary.corpus-audit/v1", "reliquary.corpus-audit/v2",
-                            "reliquary.corpus-audit/v3"]] = Field(
-        default_factory=lambda: ["reliquary.corpus-audit/v1"], min_length=1, max_length=3)
+                            "reliquary.corpus-audit/v3", "reliquary.corpus-audit/v4"]] = Field(
+        default_factory=lambda: ["reliquary.corpus-audit/v1"], min_length=1, max_length=4)
 
 
 class QualifyPrompt(_Strict):

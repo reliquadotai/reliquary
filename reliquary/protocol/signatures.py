@@ -828,6 +828,8 @@ CORPUS_ASK_DOMAIN = b"reliquary/corpus-ask/v1"
 # An offer with its capacity, and a lease request for several slots: the new field is bound under a new domain.
 CORPUS_ASK_CAPACITY_DOMAIN = b"reliquary/corpus-ask/v2"
 CORPUS_LEASE_COUNT_DOMAIN = b"reliquary/corpus-lease/v2"
+# An offer that takes its next leases in its submissions' answers (``swap``).
+CORPUS_ASK_SWAP_DOMAIN = b"reliquary/corpus-ask/v3"
 
 
 def build_corpus_lease_binding(request) -> bytes:
@@ -837,6 +839,9 @@ def build_corpus_lease_binding(request) -> bytes:
         parts = [str(body["job_id"]).encode(), str(body["miner_hotkey"]).encode(),
                  int(body["issued_at"]).to_bytes(8, "big", signed=False), str(body["nonce"]).encode(),
                  int(body["micro_alpha_per_mtoken"]).to_bytes(8, "big", signed=False)]
+        if body.get("swap"):
+            return _bound(CORPUS_ASK_SWAP_DOMAIN, [*parts, int(body.get("capacity") or 1).to_bytes(8, "big",
+                                                                                               signed=False)])
         if body.get("capacity") is None:
             return _bound(CORPUS_ASK_DOMAIN, parts)
         return _bound(CORPUS_ASK_CAPACITY_DOMAIN, [*parts, int(body["capacity"]).to_bytes(8, "big", signed=False)])
@@ -1092,6 +1097,34 @@ def verify_rl_lease_forfeit_signature(hotkey: str, *, at: int, lease_id: str, si
     try:
         binding = build_rl_lease_forfeit_binding(hotkey=hotkey, at=at, lease_id=lease_id,
                                                  validator_hotkey=validator_hotkey, path=path)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return verify_hotkey_signature(hotkey, binding, signature)
+
+
+# A hotkey's offer on one env of an RL task priced by auction (``rl_auction``): its price per million matched
+# tokens and the groups it can hold at once, signed for one validator and route, single-use.
+RL_ASK_DOMAIN = b"reliquary/rl-ask/v1"
+
+
+def build_rl_ask_binding(*, hotkey: str, at: int, environment: str, micro_alpha_per_mtoken: int, capacity: int,
+                         validator_hotkey: str, path: str) -> bytes:
+    for name, value in (("at", at), ("micro_alpha_per_mtoken", micro_alpha_per_mtoken), ("capacity", capacity)):
+        if type(value) is not int or value < 0:
+            raise TypeError(f"{name}: non-negative integer required")
+    return _bound(RL_ASK_DOMAIN, [str(hotkey).encode("utf-8"), at.to_bytes(8, "big", signed=False),
+                                  str(environment).encode("utf-8"),
+                                  micro_alpha_per_mtoken.to_bytes(8, "big", signed=False),
+                                  capacity.to_bytes(4, "big", signed=False), *_audience(validator_hotkey, path)])
+
+
+def verify_rl_ask_signature(hotkey: str, *, at: int, environment: str, micro_alpha_per_mtoken: int, capacity: int,
+                            signature: str, validator_hotkey: str, path: str) -> bool:
+    """False on any failure; fail-closed without bittensor."""
+    try:
+        binding = build_rl_ask_binding(hotkey=hotkey, at=at, environment=environment,
+                                       micro_alpha_per_mtoken=micro_alpha_per_mtoken, capacity=capacity,
+                                       validator_hotkey=validator_hotkey, path=path)
     except (TypeError, ValueError, OverflowError):
         return False
     return verify_hotkey_signature(hotkey, binding, signature)

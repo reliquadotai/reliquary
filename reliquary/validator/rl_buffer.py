@@ -29,6 +29,9 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS rl_buffer(lease_id TEXT PRIMARY KEY, environment TEXT NOT NULL, k INTEGER NOT NULL,
     arrived_at REAL NOT NULL, hotkey TEXT NOT NULL, state TEXT NOT NULL, body BLOB NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS rl_trainer_waits(start REAL NOT NULL, end REAL, polled REAL);   -- end NULL: still waiting
+CREATE TABLE IF NOT EXISTS rl_trainer_dead(start REAL NOT NULL, end REAL NOT NULL);   -- no take inside a wait
+CREATE TABLE IF NOT EXISTS rl_trainer_poll(id INTEGER PRIMARY KEY CHECK(id=0), at REAL NOT NULL);   -- the last take
 CREATE INDEX IF NOT EXISTS rl_buffer_fresh ON rl_buffer(state, environment, k, arrived_at);
 """
 
@@ -116,6 +119,50 @@ def mixed_take(rows, caps: dict[str, int], limit: int, urgent_below: int | None 
         chosen.append(lease_id)
     return chosen + extra[:max(0, limit - len(chosen))]
 
+STARVATION_GRACE_S = 300.0  # the first minutes of a wait are normal: a run's bill counts a wait only past them
+# A recorded wait counts a gap between two takes up to this long (the trainer's audit rounds run between its takes
+# while it waits, up to 120 s); the rest of a longer gap is the trainer away, not starved.
+STARVATION_DEAD_GAP_S = 180.0
+
+
+def starved_intervals(db, *, min_wait_s: float = STARVATION_GRACE_S,
+                      now: float | None = None) -> list[tuple[float, float]]:
+    """The spans where the trainer starved for rollouts: each wait's live time after its first ``min_wait_s``.
+    A take counts at most ``STARVATION_DEAD_GAP_S`` after the one before (``rl_trainer_dead`` holds the rest of a
+    longer gap) and an open wait ends at the last take + ``STARVATION_DEAD_GAP_S`` (at most ``now``): a trainer
+    that stopped asking is down, not starved, and a span once reported never grows over that time. A controller
+    restart ends the wait at its last take (``TrainingBuffer``). ``db``: the lease book's connection."""
+    now = time.time() if now is None else now
+    dead = [(float(s), float(e)) for s, e in db.execute("SELECT start, end FROM rl_trainer_dead ORDER BY start")]
+    out = []
+    for start, end, polled in db.execute("SELECT start, end, polled FROM rl_trainer_waits ORDER BY start"):
+        if end is None:
+            end = min(now, (start if polled is None else polled) + STARVATION_DEAD_GAP_S)
+        live = [(start, end)]
+        for ds, de in dead:
+            live = [p for a, b in live for p in ((a, min(b, ds)), (max(a, de), b)) if p[1] > p[0]]
+        grace = min_wait_s
+        for a, b in live:
+            if b - a <= grace:
+                grace -= b - a
+                continue
+            out.append((a + grace, b))
+            grace = 0.0
+    return out
+
+
+def dead_intervals(db, *, now: float | None = None) -> list[tuple[float, float]]:
+    """The spans where the trainer was down: the recorded pieces of ``rl_trainer_dead`` (a gap between two takes
+    longer than ``STARVATION_DEAD_GAP_S``, from the take + that gap to the next take) and, for a trainer that
+    stopped asking, an open piece from its last take + ``STARVATION_DEAD_GAP_S`` to ``now``. They never overlap
+    ``starved_intervals`` (that one leaves the dead pieces out and ends an open wait at the same bound)."""
+    now = time.time() if now is None else now
+    out = [(float(s), float(e)) for s, e in db.execute("SELECT start, end FROM rl_trainer_dead ORDER BY start")]
+    row = db.execute("SELECT at FROM rl_trainer_poll WHERE id=0").fetchone()
+    if row is not None and now - float(row[0]) > STARVATION_DEAD_GAP_S:
+        out.append((float(row[0]) + STARVATION_DEAD_GAP_S, now))
+    return out
+
 
 class TrainingBuffer:
     def __init__(self, book, clock=time.time, batch_caps=None) -> None:
@@ -131,6 +178,11 @@ class TrainingBuffer:
             book.db.executescript(_SCHEMA)
             if "attempts" not in {row[1] for row in book.db.execute("PRAGMA table_info(rl_buffer)")}:
                 book.db.execute("ALTER TABLE rl_buffer ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")   # an older file
+            if "polled" not in {row[1] for row in book.db.execute("PRAGMA table_info(rl_trainer_waits)")}:
+                book.db.execute("ALTER TABLE rl_trainer_waits ADD COLUMN polled REAL")   # an older file
+            # A restart: the wait it left open ends at its last take (our downtime is not starved; the last-poll mark stays, so it is dead);
+            # the trainer's next short take opens a fresh one.
+            book.db.execute("UPDATE rl_trainer_waits SET end=COALESCE(polled, start) WHERE end IS NULL")
             book.db.commit()
 
     def requeue(self) -> int:
@@ -190,9 +242,22 @@ class TrainingBuffer:
             rows = fresh + retried
             self.book.db.executemany("UPDATE rl_buffer SET state=?, attempts=attempts+1 WHERE lease_id=?",
                                      [(TAKEN, lease_id) for lease_id, _ in rows])
+            last = self.book.db.execute("SELECT at FROM rl_trainer_poll WHERE id=0").fetchone()
+            if last is not None and now - float(last[0]) > STARVATION_DEAD_GAP_S:   # the trainer was away
+                self.book.db.execute("INSERT INTO rl_trainer_dead(start, end) VALUES(?, ?)",
+                                     (float(last[0]) + STARVATION_DEAD_GAP_S, now))
             if self._waiting_since is not None:
                 self._starved_s += min(now - self._waiting_since, MAX_POLL_GAP_S)
-            self._waiting_since = now if len(rows) < limit else None
+            short = len(rows) < limit
+            if short and self._waiting_since is None and not self.book.db.execute(
+                    "SELECT 1 FROM rl_trainer_waits WHERE end IS NULL").fetchone():   # one open wait
+                self.book.db.execute("INSERT INTO rl_trainer_waits(start, end, polled) VALUES(?, NULL, ?)", (now, now))
+            else:
+                self.book.db.execute(f"UPDATE rl_trainer_waits SET {'polled' if short else 'end'}=? "
+                                     "WHERE end IS NULL", (now,))
+            self.book.db.execute("INSERT INTO rl_trainer_poll(id, at) VALUES(0, ?) ON CONFLICT(id) DO UPDATE SET at=?",
+                                 (now, now))
+            self._waiting_since = now if short else None
         groups = [SubmittedGroup.unpack(body) for _, body in rows]
         with self.book.lock:
             self._taken += sum(len(c) for g in groups for c in g.completions)

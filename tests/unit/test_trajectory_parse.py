@@ -36,7 +36,7 @@ class FakeRenderer:
     def initial_ids(self, prompt):
         return [TEXT + (ord(c) % 50) for c in prompt] + [GEN]
 
-    def tool_calls(self, completion_ids):
+    def tool_calls(self, completion_ids, prompt_ids=None):
         calls = sum(1 for t in completion_ids if t == CALL)
         return [("bash", json.dumps({"command": f"c{i}"})) for i in range(calls)]
 

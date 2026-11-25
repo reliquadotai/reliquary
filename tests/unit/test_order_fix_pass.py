@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from reliquary.admin.training import trainable_environments
 from reliquary.eval import qualification as qual
 from tests.unit.test_admin_eval_jobs import admin  # noqa: F401
 from tests.unit.test_eval_control_process import world  # noqa: F401
@@ -64,6 +65,40 @@ def test_model_facts_turns_missing_files_into_a_refusal(tmp_path, monkeypatch):
         eval_control.model_facts("adapter/only", "r" * 40)
     with pytest.raises(ValueError, match="tokenizer"):
         eval_control.load_cpu_tokenizer("adapter/only", "r" * 40)
+
+
+@pytest.mark.parametrize("config,architecture", [
+    # Gemma 4 26B-A4B: the dense 31B's class, with experts nobody measured.
+    ({"architectures": ["Gemma4ForConditionalGeneration"],
+      "text_config": {"enable_moe_block": True, "num_experts": 128}}, "Gemma4ForConditionalGeneration+experts"),
+    ({"architectures": ["Gemma4ForConditionalGeneration"], "text_config": {"enable_moe_block": False}},
+     "Gemma4ForConditionalGeneration"),
+    # Qwen3.6-35B-A3B: measured with its experts.
+    ({"architectures": ["Qwen3_5MoeForConditionalGeneration"], "text_config": {"num_experts": 256}},
+     "Qwen3_5MoeForConditionalGeneration"),
+    ({"architectures": ["Qwen3MoeForCausalLM"], "num_experts": 128}, "Qwen3MoeForCausalLM"),
+    ({"architectures": ["Qwen3ForCausalLM"]}, "Qwen3ForCausalLM"),
+    ({}, None),
+])
+def test_a_checkpoint_with_unmeasured_experts_is_not_its_dense_class(config, architecture):
+    from reliquary.constants import SUPPORTED_ARCHITECTURES, architecture_of
+
+    assert architecture_of(config) == architecture
+    if architecture is not None:
+        assert (architecture in SUPPORTED_ARCHITECTURES) == (not architecture.endswith("+experts"))
+
+
+def test_model_facts_names_unmeasured_experts(tmp_path, monkeypatch):
+    from reliquary.validator import eval_control
+
+    monkeypatch.setattr(eval_control, "_model_files", lambda repo, revision: str(tmp_path))
+    monkeypatch.setattr(eval_control, "_cpu_tokenizer", lambda *a: object())
+    monkeypatch.setattr(eval_control, "_declared_stops", lambda directory: ())
+    monkeypatch.setattr("reliquary.shared.modeling.turn_end_token_id", lambda tok, stops: 1)
+    (tmp_path / "config.json").write_text(json.dumps({"architectures": ["Gemma4ForConditionalGeneration"],
+                                                      "text_config": {"enable_moe_block": True}}))
+    assert eval_control.model_facts("google/gemma-4-26B-A4B-it", "r" * 40)["architecture"] \
+        == "Gemma4ForConditionalGeneration+experts"
 
 
 def test_a_pending_qualification_expires(monkeypatch):
@@ -507,9 +542,11 @@ def test_the_order_control_runtime_check_names_every_missing_piece(monkeypatch):
     seen = []
     monkeypatch.setattr(eval_control, "_import", lambda name: seen.append(name))
     monkeypatch.setattr(eval_control, "_verify_environment", lambda env: None)
+    monkeypatch.setattr(eval_control, "_verify_rl_environment", lambda env: None)
     report = eval_control.order_control_runtime_check()
     assert set(seen) >= {"bittensor_drand", "huggingface_hub", "transformers"}
     assert set(report["environments"]) == set(qual.ORDER_ENVIRONMENTS)
+    assert set(report["rl_environments"]) == set(trainable_environments())
     assert report["ok"] is True
 
     def missing(env):
@@ -518,6 +555,29 @@ def test_the_order_control_runtime_check_names_every_missing_piece(monkeypatch):
     monkeypatch.setattr(eval_control, "_verify_environment", missing)
     report = eval_control.order_control_runtime_check()
     assert report["ok"] is False and "not installed" in report["environments"][GEN_ENV]
+
+    monkeypatch.setattr(eval_control, "_verify_environment", lambda env: None)
+    monkeypatch.setattr(eval_control, "_verify_rl_environment", missing)
+    report = eval_control.order_control_runtime_check()
+    assert report["ok"] is False and "not installed" in report["rl_environments"]["reliquary_hard_math_v1"]
+
+
+def test_every_trainable_environment_is_registered_and_installed_by_the_order_control_image():
+    """A training order may name any of them, and its controller runs from the order-control image: each is
+    built in or an external package the image installs (a missing one crashes the controller at load)."""
+    from pathlib import Path
+
+    from reliquary.environment.registry import ENVIRONMENT_SPECS
+
+    dockerfile = Path("docker/Dockerfile.order-control").read_text()
+    names = trainable_environments()
+    assert {"reliquary_hard_math_v1", "reliquary_telecom_solo_v1", "envscaler_tools_v2"} <= set(names)
+    for name in names:
+        spec = ENVIRONMENT_SPECS[name]
+        if spec.external_distribution is None:
+            continue
+        wheel = spec.external_distribution.replace("-", "_")
+        assert spec.external_distribution in dockerfile or f"/tmp/envs/{wheel}-" in dockerfile, name
 
 
 def test_the_order_control_image_installs_and_checks_its_runtime():

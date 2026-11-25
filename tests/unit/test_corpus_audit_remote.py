@@ -805,3 +805,226 @@ def test_remote_audit_is_an_operator_opt_in(monkeypatch):
 
 from tests.unit.test_corpus_service import _r2_client, fake_r2, seeded_job  # noqa: E402,F401
 from tests.unit.test_corpus_validator import fixed_drand_chain, wired_records  # noqa: E402,F401
+
+
+# --------------------------------------------------------------------------
+# Audit ahead: drawn records are scored before their pass reaches them
+# --------------------------------------------------------------------------
+
+
+def test_a_record_audited_ahead_is_judged_from_that_outcome_without_a_second_score():
+    from reliquary.validator.corpus_auditor import CorpusAuditor
+
+    model, other = _tiny(0), _tiny(1)
+    sid_good, sid_bad = "a" * 64, "b" * 64
+    records = _Records({sid_good: _record(model), sid_bad: _record(other)})
+    remote = _AlwaysConnected(model)
+    auditor = CorpusAuditor(job_id="j", records=records, model=model, tokenizer=_Tokenizer(),
+                            proof=PROOF, remote=remote)
+
+    async def go():
+        await auditor._read_all([sid_good, sid_bad])
+        # q = 1: every pending record is sure to be audited.
+        assert sorted(auditor._ahead_candidates(8)) == [sid_good, sid_bad]
+        await auditor._audit_ahead_batch([sid_good, sid_bad])
+        assert set(auditor._ahead) == {sid_good, sid_bad} and remote.calls == 1
+        assert auditor._ahead_candidates(8) == []
+        await auditor.audit_many([sid_good, sid_bad])
+
+    asyncio.run(go())
+    assert remote.calls == 1  # the pass took the outcomes computed ahead
+    assert records.verdicts[sid_good]["passed"] is True
+    assert records.verdicts[sid_good]["scored_by"] == ["pod-1"]
+    # A failure scored ahead is still confirmed by a second audit on this GPU before it counts.
+    assert records.verdicts[sid_bad]["passed"] is False
+    assert auditor._ahead == {}
+
+
+def test_outcomes_audited_ahead_by_a_quarantined_executor_are_dropped():
+    from reliquary.validator.corpus_auditor import CorpusAuditor
+
+    model = _tiny(0)
+    sid = "a" * 64
+    records = _Records({sid: _record(model)})
+    remote = _AlwaysConnected(model, lie_pass=True, executor="pod-9")
+    auditor = CorpusAuditor(job_id="j", records=records, model=model, tokenizer=_Tokenizer(),
+                            proof=PROOF, remote=remote)
+
+    async def go():
+        await auditor._audit_ahead_batch([sid])
+        assert sid in auditor._ahead
+        await auditor.reaudit_executor("pod-9")
+        assert sid not in auditor._ahead
+
+    asyncio.run(go())
+
+
+def test_a_validator_error_ahead_is_left_for_the_pass():
+    from reliquary.validator.corpus_auditor import CorpusAuditor
+
+    model = _tiny(0)
+    sid = "a" * 64
+    records = _Records({sid: _record(model)})
+
+    class _Broken(_AlwaysConnected):
+        async def score(self, items):
+            self.calls += 1
+            raise RuntimeError("executor gone")
+
+    remote = _Broken(model)
+    auditor = CorpusAuditor(job_id="j", records=records, model=model, tokenizer=_Tokenizer(),
+                            proof=PROOF, remote=remote)
+    asyncio.run(auditor._audit_ahead_batch([sid]))
+    assert auditor._ahead == {} and auditor._ahead_flight == {}
+
+
+def test_on_a_sampled_job_only_drawn_records_with_their_round_out_are_audited_ahead():
+    from reliquary.corpus.audit_policy import AuditParams, drawn
+    from reliquary.validator.corpus_auditor import CorpusAuditor
+
+    model = _tiny(0)
+    sids = [f"{i:x}" * 64 for i in range(1, 9)]
+    records = _Records({sid: _record(model) for sid in sids})
+    auditor = CorpusAuditor(job_id="j", records=records, model=model, tokenizer=_Tokenizer(),
+                            proof=PROOF, remote=_AlwaysConnected(model), params=AuditParams(q=0.5),
+                            round_at=lambda t: 100)
+    randomness = "c" * 64
+
+    async def go():
+        await auditor._read_all(sids)
+        assert auditor._ahead_candidates(16) == []  # round 101 not out yet
+        auditor._randomness[101] = randomness
+        return auditor._ahead_candidates(16)
+
+    chosen = asyncio.run(go())
+    expected = {sid for sid in sids if drawn(randomness, sid, 0.5)}
+    assert set(chosen) == expected and 0 < len(expected) < len(sids)
+
+
+def test_the_audit_backlog_leaves_out_records_with_no_gpu_work_left():
+    from reliquary.validator.corpus_auditor import CorpusAuditor
+
+    model = _tiny(0)
+    a, b, c = "a" * 64, "b" * 64, "c" * 64
+    auditor = CorpusAuditor(job_id="j", records=_Records({}), model=model, tokenizer=_Tokenizer(),
+                            proof=PROOF, remote=_AlwaysConnected(model))
+    for sid in (a, b, c):
+        auditor._schedule(sid, 0.0)
+    assert auditor.audit_backlog() == 3
+    auditor._undrawn.add(a)
+    auditor._ahead[b] = {"passed": True}
+    assert auditor.audit_backlog() == 1
+
+
+def test_on_a_sampled_job_a_probation_hotkeys_records_are_audited_ahead():
+    """Records sure to be audited because their hotkey is in probation (or too slow to be sampled) are sent ahead
+    too, not only drawn ones: the card keeps working between passes (2026-11-18)."""
+    from reliquary.corpus.audit_policy import AuditParams, MinerState
+    from reliquary.validator.corpus_auditor import CorpusAuditor
+
+    model = _tiny(0)
+    sids = [f"{i:x}" * 64 for i in range(1, 5)]
+    records = _Records({sid: _record(model) for sid in sids})
+    auditor = CorpusAuditor(job_id="j", records=records, model=model, tokenizer=_Tokenizer(),
+                            proof=PROOF, remote=_AlwaysConnected(model), params=AuditParams(q=0.5),
+                            round_at=lambda t: 100)
+
+    async def go():
+        await auditor._read_all(sids)
+        assert auditor._ahead_candidates(16) == []          # standing unknown, round not out: nothing sure
+        hotkey = auditor._meta[sids[0]][0]
+        auditor._state_cache[hotkey] = MinerState()          # no audited pass yet: probation
+        return auditor._ahead_candidates(16)
+
+    assert set(asyncio.run(go())) == set(sids)
+
+
+def test_a_record_its_pass_is_auditing_is_not_sent_ahead_again():
+    """From the pass taking a record's outcome (ahead, or scored now) to its verdict's write, the record is in no
+    other set; the ahead loop sent it again, the oldest drawn record, and threw the score away (2026-11-19: half
+    the card's scores, the auction sized on them opening twice the leases the verdicts could take)."""
+    from reliquary.validator.corpus_auditor import CorpusAuditor
+
+    model = _tiny(0)
+    sids = [c * 64 for c in "abcd"]
+    during_write = []
+
+    class _Watched(_Records):
+        async def write_verdict(self, job_id, sid, verdict):
+            during_write.append(auditor._ahead_candidates(8))
+            return await super().write_verdict(job_id, sid, verdict)
+
+    records = _Watched({sid: _record(model) for sid in sids})
+    remote = _AlwaysConnected(model)
+    auditor = CorpusAuditor(job_id="j", records=records, model=model, tokenizer=_Tokenizer(),
+                            proof=PROOF, remote=remote)
+
+    async def go():
+        await auditor._read_all(sids)
+        await auditor._audit_ahead_batch(sids[:2])  # a and b ahead; c and d scored by the pass itself
+        await auditor.audit_many(sids)
+
+    asyncio.run(go())
+    assert during_write and all(candidates == [] for candidates in during_write)
+    assert auditor._in_pass == set() and set(records.verdicts) == set(sids)
+    assert remote.calls == 2 and auditor.ahead_wasted == 0
+
+
+def test_a_pass_takes_the_outcome_of_an_ahead_batch_in_flight_when_it_took_the_record():
+    """2026-11-19: the batch saw the record in its pass and dropped the outcome the pass was waiting for; the pass
+    then scored it again (ahead used 1-5 a pass, 395 outcomes thrown away in 20 min)."""
+    from reliquary.validator.corpus_auditor import CorpusAuditor
+
+    model = _tiny(0)
+    sid = "f" * 64
+    records = _Records({sid: _record(model)})
+    remote = _AlwaysConnected(model)
+    auditor = CorpusAuditor(job_id="j", records=records, model=model, tokenizer=_Tokenizer(),
+                            proof=PROOF, remote=remote)
+    release = asyncio.Event()
+    score = remote.score
+
+    async def held_score(items):
+        await release.wait()
+        return await score(items)
+
+    remote.score = held_score
+
+    async def go():
+        await auditor._read_all([sid])
+        flight = asyncio.ensure_future(auditor._audit_ahead_batch([sid]))
+        auditor._ahead_flight[sid] = flight
+        await asyncio.sleep(0)
+        judging = asyncio.ensure_future(auditor.audit_many([sid]))
+        await asyncio.sleep(0.05)
+        release.set()
+        await judging
+
+    asyncio.run(go())
+    assert remote.calls == 1 and auditor.ahead_wasted == 0
+    assert records.verdicts[sid]["passed"] is True
+
+
+def test_an_outcome_scored_ahead_for_a_record_judged_meanwhile_counts_as_wasted():
+    from reliquary.validator.corpus_auditor import CorpusAuditor
+
+    model = _tiny(0)
+    sid = "e" * 64
+    records = _Records({sid: _record(model)})
+    remote = _AlwaysConnected(model)
+    auditor = CorpusAuditor(job_id="j", records=records, model=model, tokenizer=_Tokenizer(),
+                            proof=PROOF, remote=remote)
+    score = remote.score
+
+    async def judged_meanwhile(items):
+        auditor._judged.add(sid)  # its verdict landed while the batch flew
+        return await score(items)
+
+    remote.score = judged_meanwhile
+
+    async def go():
+        await auditor._read_all([sid])
+        await auditor._audit_ahead_batch([sid])
+
+    asyncio.run(go())
+    assert auditor._ahead == {} and auditor.ahead_wasted == 1

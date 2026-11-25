@@ -962,6 +962,34 @@ _SPEC_VALUES = (
         external_distribution="reliquary-telecom-solo",
         external_artifact_resource="reliquary_telecom_solo/artifact.json",
     ),
+    EnvironmentSpec(
+        # AutomationBench 1.0.6 (zapier, MIT) in its api toolset, made
+        # deterministic (seeded ids, pinned clock) so the validator replays
+        # it. Held out: splits eval (600 scored, 100-row domain blocks) and
+        # qualification (200 simple), no train. In no profile: orders only.
+        name="reliquary_automationbench_v1",
+        factory_path="reliquary_automationbench:AutomationBenchEnvironment",
+        scorer_path=(
+            "reliquary.environment.agentic.suite:"
+            "episode_score_many_not_supported"
+        ),
+        validator_authoritative_reward=True,
+        admission_resource_class="cpu",
+        termination_policy="eos_or_cap",
+        final_answer_policy="json",
+        reward_lattice_policy="binary-v1",
+        attainable_rewards=(0.0, 1.0),
+        contract_version="reliquary/episode-json/v1",
+        interaction_mode="episode",
+        episode_replay_path="reliquary.environment.agentic.suite:replay_submission",
+        renderer_id="reliquary-chatml-tools-v1",
+        environment_manifest_sha256=(
+            "c86adff3c5ed8d8ab9f1c871effdd6c7"
+            "5f6eb5ec9fdd460a9faaa6f224db818b"
+        ),
+        external_distribution="reliquary-automationbench",
+        external_artifact_resource="reliquary_automationbench/artifact.json",
+    ),
 )
 
 

@@ -73,6 +73,14 @@ def test_the_grade_is_the_final_records(tmp_path, reward, success):
     assert asyncio.run(grader.ready(["sub-1"])) == {"sub-1"}
 
 
+def test_the_grade_keeps_why_the_episode_stopped(tmp_path):
+    signed = transcript(signer(tmp_path, "v", "v1"), signer(tmp_path, "m", "k1"), claims())
+    stopped = record(signed)
+    stopped["completions"][0]["stop"] = "max_turns"
+    assert grade(Records({"sub-1": stopped}))[1]["stop"] == "max_turns"
+    assert "stop" not in grade(Records({"sub-1": record(signed)}))[1]
+
+
 def test_a_failed_audit_is_graded_audit_failed(tmp_path):
     signed = transcript(signer(tmp_path, "v", "v1"), signer(tmp_path, "m", "k1"), claims())
     records = Records({"sub-1": record(signed)}, verdicts={"sub-1": {"passed": False}})

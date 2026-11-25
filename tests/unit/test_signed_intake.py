@@ -732,3 +732,42 @@ def test_a_drain_between_the_final_close_and_the_submission_does_not_void_it(wor
                     prompt_index=1)
     assert (answer["reason"], answer["detail"].get("session_state")) == \
         ("sandbox_transcript_invalid", VOIDED), answer
+
+
+# -- an eval profile's model-budget close: a scored 0, never an infra redo -----------------
+
+def _closed_request(world, *, status="budget_exhausted", reason="max_calls", stop="episode_closed"):
+    """The model's last turn sent a call the machine refused: its call budget was spent."""
+    signed = transcript(world.validator, world.machine, claims(), calls=(CALL_ZERO,), status=status,
+                        state=None, reason=reason, env_package=JOB.episode.sandbox.env_package)
+    request = request_for(world, signed=signed, final=[TEXT] * 8 + [CALL, TERM], final_diff="")
+    return request.model_copy(update={"trajectory": request.trajectory.model_copy(update={"stop": stop})})
+
+
+@pytest.fixture
+def profiled(monkeypatch):
+    from reliquary.corpus import job as job_module
+
+    monkeypatch.setattr(job_module, "scores_model_closes", lambda episode: True)
+    monkeypatch.setattr(signed_intake, "scores_model_closes", lambda episode: True)
+
+
+def test_a_profiles_model_budget_close_is_accepted_as_zero(world, profiled):
+    answer = post(world, _closed_request(world))
+    assert answer.json()["reason"] == "accepted", answer.json()
+    assert remaining(world) == JOB.slots_per_prompt - 1
+
+
+@pytest.mark.parametrize("status,reason,stop", [
+    ("expired", "deadline passed", "episode_closed"),        # wall time: the slot is redone
+    ("budget_exhausted", "max_calls", "agent_completed"),     # the stop must say it closed
+])
+def test_an_infra_end_or_a_mislabelled_close_is_refused(world, profiled, status, reason, stop):
+    answer = post(world, _closed_request(world, status=status, reason=reason, stop=stop)).json()
+    assert answer["reason"] in ("sandbox_transcript_invalid", "bad_stop"), answer
+    assert remaining(world) == JOB.slots_per_prompt
+
+
+def test_without_a_profile_a_budget_close_stays_unpayable(world):
+    answer = post(world, _closed_request(world)).json()
+    assert answer["reason"] == "sandbox_transcript_invalid" and "not_graded" in answer["detail"]["reasons"]

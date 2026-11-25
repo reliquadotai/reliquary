@@ -60,13 +60,17 @@ def test_a_draw_generation_jobs_failed_slot_reopens():
         asyncio.run(record_prompt_failure(Store(), plain, 3, "s" * 64))
 
 
-def test_a_draw_on_a_suite_episode_is_refused_until_its_miner_draws():
+def test_a_draw_on_a_suite_episode_is_accepted():
     from reliquary.corpus.job import _check_draw_job
     from types import SimpleNamespace
 
-    job = SimpleNamespace(seed=1, prompt_order=PROMPT_ORDER_FREE, episode=SimpleNamespace(harness="suite"))
-    with pytest.raises(JobError, match="suite"):
-        _check_draw_job(job)
+    sampling = SimpleNamespace(top_k=0, temperature=1.0)
+    job = SimpleNamespace(seed=1, prompt_order=PROMPT_ORDER_FREE, episode=SimpleNamespace(harness="suite"),
+                          sampling=sampling, judge=None)
+    _check_draw_job(job)
+    with pytest.raises(JobError, match="seed"):
+        _check_draw_job(SimpleNamespace(seed=None, prompt_order=PROMPT_ORDER_FREE, episode=job.episode,
+                                        sampling=sampling, judge=None))
 
 
 # ------------------------------------------------------------------ prompts as token ids
@@ -134,9 +138,24 @@ def test_a_long_context_job_declares_its_longest_prompt():
     job = parse_job(_gen_raw(max_prompt_tokens=60000))
     assert job.max_prompt_tokens == 60000 and job.to_contract()["max_prompt_tokens"] == 60000
     assert "max_prompt_tokens" not in parse_job(_gen_raw()).to_contract()
-    for bad in (0, 131073, "1"):
+    for bad in (0, 262145, "1"):
         with pytest.raises(JobError):
             parse_job(_gen_raw(max_prompt_tokens=bad))
+
+
+def test_a_single_turn_draw_can_use_the_remaining_audit_sequence_for_its_prompt():
+    from reliquary.validator.corpus_audit_protocol import MAX_DRAWN_SEQUENCE_TOKENS
+
+    raw = _gen_raw(max_prompt_tokens=131876)
+    raw["sampling"]["max_new_tokens"] = 8192
+    assert parse_job(raw).to_contract()["max_prompt_tokens"] == 131876
+    last = MAX_DRAWN_SEQUENCE_TOKENS - 8192
+    assert parse_job({**raw, "max_prompt_tokens": last}).max_prompt_tokens == last
+    with pytest.raises(JobError, match="max_prompt_tokens"):
+        parse_job({**raw, "max_prompt_tokens": last + 1})
+    del raw["sampling"]["draw"]
+    with pytest.raises(JobError, match="max_prompt_tokens"):
+        parse_job(raw)
 
 
 def test_a_drawn_audit_item_holds_a_long_context_sample_a_proven_one_does_not():

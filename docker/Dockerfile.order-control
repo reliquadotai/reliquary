@@ -13,6 +13,11 @@
 #   reliquary-dapo-math              -> reliquary_dapo_math_v1
 #   reliquary-instruction-following  -> reliquary_instruction_following_v1
 #   reliquary-code                   -> reliquary_code_v1
+#
+# The other RL training envs (a training order may name any env of a Gumbel profile with live RL
+# rows: `reliquary.admin.training.trainable_environments`) are installed from reliquary-environments
+# at a pinned commit, below; their artifact pins each file's digest and the version, so the source
+# of the bytes does not matter and a wrong commit fails `order-control-check`.
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
@@ -27,15 +32,36 @@ RUN --mount=type=bind,from=envs,target=/tmp/envs \
 # with its verifiers bridge at SANDBOX_COMMIT, and the env packages at the commit the
 # agentic eval sets pin (record 0's env_package). reliquary-harness comes with the base.
 ARG ENVS=15ad131b473f59f46b62d363bfacf430f4931f39
-ARG SBX=f8c208bd35848a13cf5b9e44b64309d835d1d81e
+ARG SBX=d680d5e6f694c650f74b9dea4bc62930aad45da0
 ARG SWE_ENV_PACKAGE=reliquary-swe==0.3.0+ge8e1f1ed62a639ae.vfb2
 ARG TERMINAL_ENV_PACKAGE=reliquary-terminal==0.3.1+gcd4df2dcc1aaf175.vfb2
+# Terminal-Bench 2.1 (reliquary-terminal-bench): its own commit of the envs repository.
+ARG TB_ENVS=a7718445c156a36eec2835c43d5fb6c86c045a5e
+ARG TB_ENV_PACKAGE=reliquary-terminal-bench==0.1.0+g683caef3ad3c8770.vfb2
 RUN E="git+https://github.com/reliquadotai/reliquary-environments.git@${ENVS}" \
  && pip install \
       "reliquary-sandbox[verifiers] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@${SBX}" \
       "reliquary-swe @ ${E}#subdirectory=environments/code/reliquary_swe" \
       "reliquary-terminal @ ${E}#subdirectory=environments/code/reliquary_terminal" \
-      "renderers==0.1.11"
+      "renderers==0.1.11" \
+ && pip install --no-deps "reliquary-terminal-bench @ git+https://github.com/reliquadotai/reliquary-environments.git@${TB_ENVS}#subdirectory=environments/code/reliquary_terminal_bench"
+
+# RL training envs beyond the four wheels (`reliquary rl supervise` runs from this image; an order
+# naming one whose distribution is missing crashes its controller at load). Their packages are
+# identical at ENVS and at the commit their artifacts were last cut. reliquary-telecom-solo is
+# 0.1.0a1 (reliquary_telecom_solo_v1, the one the Gumbel profiles name) at its own commit: v2 is
+# 0.2.0a1 of the same distribution, so one image carries one of the two.
+# Runtime data: science, competitive-code and general fetch their corpus from public Hub datasets
+# at pinned revisions (or RELIQUARY_GENERAL_DATA); envscaler_tools_v2 (built in) reads
+# RELIQUARY_ENVSCALER_DATA; hard-math and telecom ship theirs in the package.
+ARG TELECOM_ENVS=a003ffedf4f34bd62d19cdd470920ea497677fdc
+RUN E="git+https://github.com/reliquadotai/reliquary-environments.git" \
+ && pip install \
+      "reliquary-hard-math @ ${E}@${ENVS}#subdirectory=environments/reasoning/reliquary_hard_math" \
+      "reliquary-science @ ${E}@${ENVS}#subdirectory=environments/reasoning/reliquary_science" \
+      "reliquary-competitive-code @ ${E}@${ENVS}#subdirectory=environments/code/reliquary_competitive_code" \
+      "reliquary-general @ ${E}@${ENVS}#subdirectory=environments/general/reliquary_general" \
+      "reliquary-telecom-solo @ ${E}@${TELECOM_ENVS}#subdirectory=environments/tool_use/reliquary_telecom_solo"
 
 # The Verifiers tasksets single-turn eval sets are graded with (built against these),
 # in their own directory at the END of sys.path: the venv's versions always win.
@@ -46,15 +72,27 @@ RUN R="${TASKSETS_REPO}#subdirectory=environments" \
       "ifbench @ ${R}/if/ifbench" "mmlu-pro @ ${R}/knowledge/mmlu_pro" \
       "livecodebench @ ${R}/code/livecodebench" \
  && echo /opt/evalsets-site > "$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')/zzz-evalsets.pth"
+# Reliquary's own single-turn tasksets (tasksets/): HMMT Feb 2026, GraphWalks, OpenAI MRCR,
+# HLE-Diamond deterministic subset, SciCode (graded by the SciCode grading service). Non-editable
+# installs, so their artifact hashes match the sets.
+# tiktoken is MRCR's row selection (o200k_base bins); hle-diamond needs HF_TOKEN of an admitted account.
+COPY tasksets /tmp/reliquary-tasksets
+RUN pip install --target /opt/evalsets-site --no-deps \
+      /tmp/reliquary-tasksets/hmmt_feb_2026 /tmp/reliquary-tasksets/graphwalks_single_turn \
+      /tmp/reliquary-tasksets/openai_mrcr_single_turn /tmp/reliquary-tasksets/hle_diamond_text_det \
+      /tmp/reliquary-tasksets/scicode_steps \
+ && pip install "tiktoken>=0.7" && rm -rf /tmp/reliquary-tasksets
 
 # Fails the build unless bittensor_drand (the partial audit's draw), the hub
-# and tokenizer libraries import and every package verifies against the
-# catalog digest orders are qualified on.
+# and tokenizer libraries import, every package verifies against the
+# catalog digest orders are qualified on, and every env a training order may
+# name is built in or installed at the artifact the registry pins.
 RUN reliquary corpus order-control-check
 
 # Fails the build unless a signed episode job could be served: the pinned sandbox,
 # harness and renderers, each env's bridged identity, and the tasksets.
 RUN SWE_ENV_PACKAGE="${SWE_ENV_PACKAGE}" TERMINAL_ENV_PACKAGE="${TERMINAL_ENV_PACKAGE}" SBX="${SBX}" \
+    TB_ENV_PACKAGE="${TB_ENV_PACKAGE}" \
     python - <<'PY'
 import importlib, importlib.metadata as md, importlib.util, os, sys
 from reliquary.sandbox import SANDBOX_COMMIT, require_sandbox, sandbox_commit_refusal
@@ -68,7 +106,9 @@ assert md.version("renderers") == RENDERERS_VERSION, md.version("renderers")
 importlib.import_module("reliquary_sandbox_verifiers")
 assert installed_env_package("reliquary-swe") == os.environ["SWE_ENV_PACKAGE"], installed_env_package("reliquary-swe")
 assert installed_env_package("reliquary-terminal") == os.environ["TERMINAL_ENV_PACKAGE"], installed_env_package("reliquary-terminal")
-for name in ("aime25", "aime26", "gpqa", "ifbench", "mmlu_pro", "livecodebench"):
+assert installed_env_package("reliquary-terminal-bench") == os.environ["TB_ENV_PACKAGE"], installed_env_package("reliquary-terminal-bench")
+for name in ("aime25", "aime26", "gpqa", "ifbench", "mmlu_pro", "livecodebench", "hmmt_feb_2026",
+             "graphwalks_single_turn", "openai_mrcr_single_turn", "hle_diamond_text_det", "scicode_steps"):
     importlib.import_module(name)
 assert "/opt/evalsets-site" in sys.path
 assert not importlib.util.find_spec("verifiers").origin.startswith("/opt/evalsets-site/")
@@ -76,7 +116,8 @@ print("ORDER_CONTROL_EPISODES_OK")
 PY
 
 LABEL ai.reliquary.role="order-control" \
-      ai.reliquary.envs-commit="${ENVS}" ai.reliquary.sandbox-commit="${SBX}"
+      ai.reliquary.envs-commit="${ENVS}" ai.reliquary.telecom-envs-commit="${TELECOM_ENVS}" \
+      ai.reliquary.sandbox-commit="${SBX}"
 EXPOSE 8791
 # No wallet and no grader of single-turn orders. Signed episode orders need the order
 # control's own sandbox token key (never the corpus validator's), mounted at run time:

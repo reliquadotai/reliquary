@@ -16,7 +16,7 @@ from reliquary.validator.corpus_periods import PERIOD_EPOCH, PERIOD_SECONDS
 from tests.unit.test_corpus_auditor import _Tokenizer
 from tests.unit.test_corpus_forfeit import _Store
 from tests.unit.test_corpus_judge import (
-    HK, HOLD, PROOF, Q, SAMPLED, T0, _Beacon, _Clock, _ids, _model, _rec, _round_at, _States,
+    HK, HOLD, PROOF, Q, RAND, SAMPLED, T0, _Beacon, _Clock, _ids, _model, _rec, _round_at, _States,
 )
 
 
@@ -159,7 +159,7 @@ def test_the_stake_is_counted_once():
     _judge_at(auditor, clock, T0 + 40, [sid])
     first = auditor._stake[sid]
     # Much later, with everything before it gone from memory, the record keeps its first count.
-    auditor._forfeitable_at[HK].clear()
+    auditor._forfeitable_at[auditor._operator(HK)].clear()
     assert auditor._stake_of(sid, T0 + 30 + HOLD + 1) == first == 2.0
 
 
@@ -300,3 +300,36 @@ def test_only_a_forced_draw_record_with_a_short_completion_is_short():
     auditor._remember("d" * 64, {"hotkey": HK, "received_at": T0, "token_count": 500})
     # Read even without the stake rule; a record never read in full is left to the usual rules.
     assert [auditor._short_draw(sid * 64) for sid in "bcd"] == [True, False, False]
+
+
+def test_the_audit_backlog_leaves_out_records_still_waiting_for_their_draw():
+    from reliquary.validator.corpus_auditor import DRAW_WAIT_SECONDS
+
+    clock = _Clock(T0)
+    sampled = _auditor(_Store({}), clock)
+    full = CorpusAuditor(job_id="order-eval-x", records=_Store({}), model=_model(0), tokenizer=_Tokenizer(),
+                         proof=PROOF, params=AuditParams(q=1.0, hold_seconds=HOLD), miner_states=_States({}),
+                         beacon=_Beacon(), round_at=_round_at, clock=clock, accept_slack_seconds=0.0)
+    for auditor in (sampled, full):
+        for sid in _ids(False, 3):
+            auditor.enqueue(sid)
+    # Just received: a sampled job's records wait for their draw round, not for the audit.
+    assert sampled.audit_backlog() == 0
+    assert full.audit_backlog() == 3
+    clock.now = T0 + DRAW_WAIT_SECONDS + 1
+    assert sampled.audit_backlog() == 3
+
+
+def test_after_a_restart_the_backlog_leaves_out_records_whose_cached_draw_is_undrawn():
+    # A restart seeds every due record with none known undrawn yet: once their draw round is cached, the undrawn
+    # ones leave no GPU work and must not cut the auction's budget (2026-11-14).
+    from reliquary.validator.corpus_auditor import DRAW_WAIT_SECONDS
+
+    clock = _Clock(T0)
+    auditor = _auditor(_Store({}), clock)
+    for sid in (*_ids(False, 3), *_ids(True, 2)):
+        auditor.enqueue(sid)
+    clock.now = T0 + DRAW_WAIT_SECONDS + 1
+    assert auditor.audit_backlog() == 5          # no randomness yet: every record may still be drawn
+    auditor._randomness[_round_at(T0) + 1] = RAND
+    assert auditor.audit_backlog() == 2

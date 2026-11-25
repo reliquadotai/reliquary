@@ -95,7 +95,7 @@ jobs:
           assert "qwen3_5_text" in CONFIG_MAPPING
           for name, commit in {
               "reliquary-sandbox": SANDBOX_COMMIT,
-              "reliquary-harness": "7d559fd16564ac16af52486fe6552084c685bca6",
+              "reliquary-harness": "d680d5e6f694c650f74b9dea4bc62930aad45da0",
               "verifiers": "b2e4e8157783b2c0dffc7821044c87f29f1c3ccf",
           }.items():
               direct = json.loads(distribution(name).read_text("direct_url.json"))

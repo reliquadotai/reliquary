@@ -15,7 +15,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from reliquary.corpus.eval_draw import REASON_DRAW_SLOT_TAKEN, has_draw
-from reliquary.corpus.job import PROMPT_ORDER_FREE
+from reliquary.corpus.job import PROMPT_ORDER_FREE, scores_model_closes
 from reliquary.corpus.slots import OpenMap, parse_open_map
 from reliquary.corpus.trajectory import BuiltTrajectory, TrajectoryUnbuildable, build_trajectory
 from reliquary.corpus.walk import job_walk_index
@@ -64,6 +64,10 @@ class Identity:
     sign_binding: Callable[[bytes], str] | None = None
     # Draw jobs: signs a light lease request or release (``corpus.draw_leases``); None, slots from the open map.
     sign_lease: Callable[[dict], str] | None = None
+    # A job priced by auction (``corpus.token_auction``): the alpha per million verified tokens this hotkey works
+    # for, posted before its first lease and again as `corpus_miner.mine_steps` does; None posts no ask.
+    ask_alpha_per_mtoken: float | None = None
+    ask_capacity: int | None = None
 
 
 def harness_key(harness_env: dict | None) -> tuple:
@@ -285,12 +289,35 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
     rng = random.Random(secrets.randbits(64))
     # A draw job's light leases (``corpus.draw_leases``): on while the validator grants them.
     leasing = [drawn and identity.sign_lease is not None and callable(getattr(client, "lease", None))]
+    asking = (leasing[0] and identity.ask_alpha_per_mtoken is not None
+              and callable(getattr(client, "ask", None)))
+    asked_at: list[float | None] = [None]
+
+    def post_ask(force: bool = False) -> None:
+        """This hotkey's ask on a job priced by auction, every ``ASK_REPOST_SECONDS`` (or now, ``force``)."""
+        from reliquary.corpus.token_auction import ASK_REPOST_SECONDS
+        from reliquary.miner.corpus_miner import ask_body
+
+        now = time.monotonic()
+        if not asking or (not force and asked_at[0] is not None and now - asked_at[0] < ASK_REPOST_SECONDS):
+            return
+        try:
+            answer = client.ask(ask_body(job.job_id, identity.hotkey, identity.ask_alpha_per_mtoken,
+                                         identity.sign_lease, identity.ask_capacity))
+        except Exception as exc:  # noqa: BLE001 - the next lease asks again
+            logger.warning("%s: posting the ask failed (%r)", tag, exc)
+            return
+        asked_at[0] = now
+        if answer is not None and not answer.get("accepted"):
+            counts[f"ask_{answer.get('reason')}"] += 1
+            logger.warning("%s: the validator refused this hotkey's ask: %s", tag, answer.get("reason"))
 
     def take_lease():
         """``((prompt, slot), lease_id)``, ``"wait"`` (none free now), ``"complete"``, or None (no leases here:
         slots from the open map)."""
         from reliquary.miner.corpus_miner import _LEASE_FALLBACK, lease_body
 
+        post_ask()
         try:
             answer = _retry(lambda: client.lease(lease_body(job.job_id, identity.hotkey, identity.sign_lease)),
                             sleep=time.sleep, counts=counts, max_consecutive_failures=5)
@@ -311,6 +338,11 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
             leasing[0] = False
             return None
         counts[f"lease_{reason}"] += 1
+        if reason == "no_ask":
+            if asking:
+                post_ask(force=True)
+            elif counts["lease_no_ask"] == 1:
+                logger.warning("%s: this job is priced by auction: set --ask-alpha-per-mtoken to get leases", tag)
         return "wait"
 
     def release_lease(lease_id: str) -> None:
@@ -402,9 +434,12 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
             await unsubmitted()
             return
         try:
+            # A suite runner's stop is its replay's (a cut included): relabelling is for verifiers' harnesses.
+            relabel = drawn and not getattr(runner, "replays_stop", False)
             built = build_trajectory(session.turns, final_diff=result.final_diff,
                                      stop=drawn_stop(result.stop, session.turns, job, stop_ids)
-                                     if drawn else result.stop)
+                                     if relabel else result.stop, drawn=drawn,
+                                     closed=scores_model_closes(job.episode))
             if result.transcript is not None:
                 built = dataclasses.replace(built, transcript=result.transcript)
         except TrajectoryUnbuildable as exc:
@@ -507,97 +542,106 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
     # `cursor` is this hotkey's walk position, and the validator of a free job
     # (every episode job) does not check it: positions whose prompt is full
     # are passed over, in the walk's own order. `started` counts episodes.
-    cursor = started = 0
-    while not stop.is_set() and (identity.episodes is None or started < identity.episodes):
-        await slots.acquire()
-        if stop.is_set():
-            slots.release()
-            break
-        if not getattr(engine, "healthy", True):
-            # Every turn would fail fast: starting episodes would only burn boxes.
-            counts["engine_unhealthy"] += 1
-            logger.error("the generate engine is unhealthy: %s stops", tag)
-            stop.set()
-            slots.release()
-            break
-        # After the wait for a slot, which can last a whole episode: the map
-        # this start is decided on is at most OPEN_MAX_AGE_SECONDS old.
-        try:
-            await open_prompts.refresh(counts)
-        except CorpusJobRetired as exc:
-            counts["halted"] += 1
-            logger.error("%s stops: %s", tag, exc)
-            halt()
-            slots.release()
-            break
-        if open_prompts.exhausted:
-            # Running episodes finish and submit; each learns `job_complete` itself.
-            counts["no_open_prompt"] += 1
-            logger.info("no prompt of %s has a slot left: %s starts no more episodes",
-                        job.job_id, tag)
-            stop.set()
-            slots.release()
-            break
-        if drawn:
-            lease_id = None
-            choice = None
-            if leasing[0]:
-                try:
-                    outcome = await asyncio.to_thread(take_lease)
-                except (CorpusJobRetired, CorpusMinerHalted) as exc:
-                    counts["halted"] += 1
-                    logger.error("%s stops: %s", tag, exc)
-                    halt()
-                    slots.release()
-                    break
-                if outcome == "complete":
-                    counts["job_complete"] += 1
-                    stop.set()
-                    slots.release()
-                    break
-                if outcome == "wait":
-                    slots.release()
-                    await asyncio.sleep(DRAW_SLOT_WAIT_SECONDS)
-                    continue
-                if outcome is not None:
-                    (prompt, slot), lease_id = outcome
-                    open_prompts.run_leased(prompt, slot)
-                    choice = (prompt, slot)
-            if choice is None:
-                choice = open_prompts.take_draw_slot(job, rng)
-            if choice is None:
-                # Every open prompt's free slots are running here: wait for one to end.
-                counts["no_free_draw_slot"] += 1
+    try:
+        cursor = started = 0
+        while not stop.is_set() and (identity.episodes is None or started < identity.episodes):
+            await slots.acquire()
+            if stop.is_set():
                 slots.release()
-                if not tasks or all(t.done() for t in tasks):
-                    await asyncio.sleep(DRAW_SLOT_WAIT_SECONDS)
-                else:
-                    await asyncio.wait([t for t in tasks if not t.done()],
-                                       return_when=asyncio.FIRST_COMPLETED)
+                break
+            if not getattr(engine, "healthy", True):
+                # Every turn would fail fast: starting episodes would only burn boxes.
+                counts["engine_unhealthy"] += 1
+                logger.error("the generate engine is unhealthy: %s stops", tag)
+                stop.set()
+                slots.release()
+                break
+            # After the wait for a slot, which can last a whole episode: the map
+            # this start is decided on is at most OPEN_MAX_AGE_SECONDS old.
+            try:
+                await open_prompts.refresh(counts)
+            except CorpusJobRetired as exc:
+                counts["halted"] += 1
+                logger.error("%s stops: %s", tag, exc)
+                halt()
+                slots.release()
+                break
+            if open_prompts.exhausted:
+                # Running episodes finish and submit; each learns `job_complete` itself.
+                counts["no_open_prompt"] += 1
+                logger.info("no prompt of %s has a slot left: %s starts no more episodes",
+                            job.job_id, tag)
+                stop.set()
+                slots.release()
+                break
+            if drawn:
+                lease_id = None
+                choice = None
+                if leasing[0]:
+                    try:
+                        outcome = await asyncio.to_thread(take_lease)
+                    except (CorpusJobRetired, CorpusMinerHalted) as exc:
+                        counts["halted"] += 1
+                        logger.error("%s stops: %s", tag, exc)
+                        halt()
+                        slots.release()
+                        break
+                    if outcome == "complete":
+                        counts["job_complete"] += 1
+                        stop.set()
+                        slots.release()
+                        break
+                    if outcome == "wait":
+                        slots.release()
+                        await asyncio.sleep(DRAW_SLOT_WAIT_SECONDS)
+                        continue
+                    if outcome is not None:
+                        (prompt, slot), lease_id = outcome
+                        open_prompts.run_leased(prompt, slot)
+                        choice = (prompt, slot)
+                if choice is None:
+                    choice = open_prompts.take_draw_slot(job, rng)
+                if choice is None:
+                    # Every open prompt's free slots are running here: wait for one to end.
+                    counts["no_free_draw_slot"] += 1
+                    slots.release()
+                    if not tasks or all(t.done() for t in tasks):
+                        await asyncio.sleep(DRAW_SLOT_WAIT_SECONDS)
+                    else:
+                        await asyncio.wait([t for t in tasks if not t.done()],
+                                           return_when=asyncio.FIRST_COMPLETED)
+                    continue
+                prompt, slot = choice
+                task = asyncio.create_task(one(slot, prompt, lease_id))
+                task.add_done_callback(lambda _t: slots.release())
+                tasks.add(task)
+                started += 1
                 continue
-            prompt, slot = choice
-            task = asyncio.create_task(one(slot, prompt, lease_id))
+            for _ in range(_OPEN_SCAN):
+                if open_prompts.is_open(job_walk_index(job, identity.hotkey, cursor)):
+                    break
+                cursor += 1
+                counts["skipped_full"] += 1
+            else:
+                # A long run of full prompts: let the loop breathe, then go on.
+                slots.release()
+                await asyncio.sleep(0)
+                continue
+            task = asyncio.create_task(one(cursor))
             task.add_done_callback(lambda _t: slots.release())
             tasks.add(task)
-            started += 1
-            continue
-        for _ in range(_OPEN_SCAN):
-            if open_prompts.is_open(job_walk_index(job, identity.hotkey, cursor)):
-                break
             cursor += 1
-            counts["skipped_full"] += 1
-        else:
-            # A long run of full prompts: let the loop breathe, then go on.
-            slots.release()
-            await asyncio.sleep(0)
-            continue
-        task = asyncio.create_task(one(cursor))
-        task.add_done_callback(lambda _t: slots.release())
-        tasks.add(task)
-        cursor += 1
-        started += 1
-    # return_exceptions: a cancelled or crashed episode never cancels its siblings.
-    await asyncio.gather(*tasks, return_exceptions=True)
+            started += 1
+        # return_exceptions: a cancelled or crashed episode never cancels its siblings.
+        await asyncio.gather(*tasks, return_exceptions=True)
+    except asyncio.CancelledError:
+        # The miner is stopping (SIGTERM, `until_terminated`): its running episodes are cancelled here, so each
+        # releases its lease and reports its sandbox sessions (`one`) before the engine and runners go away.
+        stop.set()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
 
 async def mine_agentic(*, job, identities, client, engine, runners, decode,
@@ -629,6 +673,42 @@ async def mine_agentic(*, job, identities, client, engine, runners, decode,
     return counts
 
 
+# The exit code of an agentic miner stopped by SIGTERM (the order follower's stop): 128 + SIGTERM.
+STOPPED_EXIT_CODE = 143
+
+
+async def until_terminated(coroutine):
+    """Run ``coroutine`` (``run_agentic_miner``) until it returns, or until SIGTERM: then it is cancelled, which
+    starts nothing more, cancels the running episodes (each releases its lease and reports its sessions) and stops
+    the engine. Returns its result, or None when SIGTERM stopped it."""
+    import signal
+
+    task = asyncio.ensure_future(coroutine)
+    loop = asyncio.get_running_loop()
+    stopping: list[bool] = []
+
+    def on_terminate() -> None:
+        if not stopping:
+            stopping.append(True)
+            logger.warning("SIGTERM: stopping; running episodes are cancelled, their leases released")
+            task.cancel()
+
+    try:
+        loop.add_signal_handler(signal.SIGTERM, on_terminate)
+        installed = True
+    except (NotImplementedError, RuntimeError, ValueError):   # not the main thread, or no signals here
+        installed = False
+    try:
+        return await task
+    except asyncio.CancelledError:
+        if stopping:
+            return None
+        raise
+    finally:
+        if installed:
+            loop.remove_signal_handler(signal.SIGTERM)
+
+
 async def serve_loopback(app, port: int):
     """Start ``app`` on 127.0.0.1 only (the generate endpoint has no auth);
     returns the uvicorn server and its serving task once it accepts requests."""
@@ -652,6 +732,12 @@ async def serve_loopback(app, port: int):
             raise RuntimeError(f"the generate endpoint did not start on 127.0.0.1:{port}")
         await asyncio.sleep(0.1)
     return server, serving
+
+
+def declared_want(max_live_per_job: int, concurrency: int, identities: int) -> int:
+    """A signed job's declared want per hotkey (``SignedSweEpisodeRunner.want``): its share of the episodes this
+    process runs at once (``concurrency``, shared by its identities), within ``max_live_per_job``."""
+    return max(1, min(int(max_live_per_job), -(-int(concurrency) // max(1, int(identities)))))
 
 
 async def run_agentic_miner(*, job, checkpoint_dir: str, proof, tokenizer, identities, client,
@@ -722,6 +808,7 @@ async def run_agentic_miner(*, job, checkpoint_dir: str, proof, tokenizer, ident
                 if source is None:
                     source = job_signed_source(job)
                 per_identity = {}
+                want = declared_want(max_live_per_job, concurrency, len(identities))
                 for identity in identities:
                     per_identity[identity.hotkey] = await stack.enter_async_context(
                         SignedSweEpisodeRunner(
@@ -730,7 +817,7 @@ async def run_agentic_miner(*, job, checkpoint_dir: str, proof, tokenizer, ident
                             renderer_model_dir=checkpoint_dir,
                             generate_url=f"http://127.0.0.1:{port}", sampling=job.sampling,
                             harness_env=identity.harness_env, max_live=max_live_per_job,
-                            source=source))
+                            source=source, want=want))
                 return await mine_agentic(
                     job=job, identities=identities, client=client, engine=engine, runners={},
                     runner_for=lambda identity: per_identity[identity.hotkey],
@@ -767,7 +854,10 @@ async def run_suite_miner(*, job, checkpoint_dir: str, proof, tokenizer, identit
                           max_num_seqs: int = 16, source=None) -> dict[str, Counter]:
     """A suite episode job: the engine thread and episodes in one process. No
     endpoint: the runner's policy calls the engine directly, and nothing but
-    the pinned environment wheel runs between turns."""
+    the pinned environment wheel runs between turns. A forced-draw job (an
+    order) draws every turn as ``run_agentic_miner`` does: a forced core over
+    an fp32 LM head, no proof, each episode's session bound to its draw slot
+    (``mine_agentic``)."""
     from reliquary.corpus.suite_episode import TokenizerCodec
     from reliquary.miner.corpus_generate_server import GenerateEngine, VllmTurnCore
     from reliquary.miner.suite_episode import SuiteEpisodeRunner, suite_stop_ids
@@ -775,12 +865,16 @@ async def run_suite_miner(*, job, checkpoint_dir: str, proof, tokenizer, identit
     # Coded as the validator's intake, replay and export code.
     codec = TokenizerCodec(tokenizer)
     encode, decode = codec.encode, codec.decode
-    core = VllmTurnCore(checkpoint_dir, sampling=job.sampling, proof=proof,
-                        stop_token_ids=suite_stop_ids(encode),
+    stop_ids = suite_stop_ids(encode)
+    drawn = has_draw(job)
+    core = VllmTurnCore(checkpoint_dir, sampling=job.sampling, proof=None if drawn else proof,
+                        stop_token_ids=stop_ids,
                         max_total_tokens=job.episode.max_total_tokens, max_num_seqs=max_num_seqs,
-                        gpu_memory_utilization=gpu_memory_utilization)
+                        gpu_memory_utilization=gpu_memory_utilization,
+                        **({"forced": True, "lm_head_fp32": True} if drawn else {}))
     engine = GenerateEngine(core, max_total_tokens=job.episode.max_total_tokens,
-                            max_tokens_per_turn=job.episode.max_tokens_per_turn)
+                            max_tokens_per_turn=job.episode.max_tokens_per_turn,
+                            **({"draws": ForcedDraws()} if drawn else {}))
     engine.start()
     try:
         runner = SuiteEpisodeRunner(job=job, engine=engine, encode=encode, decode=decode,
@@ -788,10 +882,10 @@ async def run_suite_miner(*, job, checkpoint_dir: str, proof, tokenizer, identit
         return await mine_agentic(
             job=job, identities=identities, client=client, engine=engine,
             runners={harness_key(identity.harness_env): runner for identity in identities},
-            decode=decode, concurrency=concurrency)
+            decode=decode, concurrency=concurrency, stop_ids=stop_ids)
     finally:
         engine.stop()
 
 
-__all__ = ["Identity", "OpenPrompts", "build_trajectory_submission", "harness_key", "mine_agentic",
+__all__ = ["Identity", "OpenPrompts", "declared_want", "build_trajectory_submission", "harness_key", "mine_agentic",
            "run_agentic_miner", "run_suite_miner", "serve_loopback", "trajectory_precheck"]

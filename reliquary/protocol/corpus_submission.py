@@ -38,6 +38,10 @@ MAX_RENDERED_PROMPT_CHARS = MAX_COMPLETION_TEXT_CHARS
 # pins them equal.
 MAX_TRAJECTORY_TOKENS = 60000
 MAX_TRAJECTORY_TURNS = 64
+# An eval episode profile's (`corpus.job.EPISODE_PROFILES`) lifts both: the
+# corpus wire takes up to these, and each job's own bounds are checked at intake.
+MAX_PROFILE_TRAJECTORY_TOKENS = 131072
+MAX_PROFILE_TRAJECTORY_TURNS = 250
 MAX_FINAL_DIFF_CHARS = 1_048_576
 # The binding writes token ids as 4 bytes.
 MAX_TOKEN_ID = 2**32 - 1
@@ -64,6 +68,9 @@ class CorpusRejectReason(str, Enum):
     # Checked right after the signature, so a spoofed hotkey cannot probe ban
     # status and a banned one never reaches the ledgers.
     MINER_BANNED = "miner_banned"
+    # On a job priced by auction, a hotkey whose audits just failed gets no new lease until its suspicion ends
+    # (its own page, /corpus/jobs/<id>/miners/<hotkey>, says why).
+    MINER_SUSPECT = "miner_suspect"
     # An unregistered hotkey is never paid, so its work would only spend audit GPU.
     HOTKEY_NOT_REGISTERED = "hotkey_not_registered"
     MALFORMED_SUBMISSION = "malformed_submission"
@@ -164,7 +171,7 @@ class CorpusTurn(BaseModel):
 
     start: int = Field(ge=0)
     end: int = Field(ge=1)
-    proofs: list[ProofB64] = Field(default_factory=list, max_length=MAX_TRAJECTORY_TOKENS)
+    proofs: list[ProofB64] = Field(default_factory=list, max_length=MAX_PROFILE_TRAJECTORY_TOKENS)
 
     @model_validator(mode="after")
     def _a_turn_has_tokens_and_fitting_proofs(self) -> "CorpusTurn":
@@ -183,13 +190,13 @@ class CorpusTrajectory(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    tokens: list[int] = Field(min_length=1, max_length=MAX_TRAJECTORY_TOKENS)
-    turns: list[CorpusTurn] = Field(min_length=1, max_length=MAX_TRAJECTORY_TURNS)
+    tokens: list[int] = Field(min_length=1, max_length=MAX_PROFILE_TRAJECTORY_TOKENS)
+    turns: list[CorpusTurn] = Field(min_length=1, max_length=MAX_PROFILE_TRAJECTORY_TURNS)
     final_diff: str = Field(max_length=MAX_FINAL_DIFF_CHARS)
-    # No "episode_closed" (the signed bridge's mid-turn close): such an episode ends
-    # unpaid, and `corpus.signed_parse` refuses it with a graded final anyway. Kept
-    # out of the wire as defense in depth.
-    stop: Literal["agent_completed", "max_turns", "context_length"]
+    # "episode_closed" (the signed bridge's mid-turn close) only for an eval episode
+    # profile's model-budget close (`corpus.job.model_closed`): the signed intake refuses
+    # it for any other job or final, and `corpus.signed_parse` with a graded final.
+    stop: Literal["agent_completed", "max_turns", "context_length", "episode_closed"]
     # Signed-sandbox jobs only: the gateway's transcript `{"token", "records"}`.
     transcript: dict[str, Any] | None = None
 
@@ -331,6 +338,9 @@ class CorpusAskRequest(BaseModel):
     issued_at: int = Field(ge=0)
     nonce: str = Field(pattern=r"^[0-9a-f]{32}$")
     signature: str = Field(min_length=1, max_length=256)
+    # The hotkey takes its next leases in its accepted submissions' answers (``detail["next_leases"]``): each
+    # submission refills its batch without a lease request (docs/design/2026-11-17-lease-allocation.md 3.5).
+    swap: bool | None = None
 
 
 class CorpusAskResponse(BaseModel):

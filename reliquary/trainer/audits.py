@@ -176,6 +176,98 @@ def audit_group(model: Any, group):
             model.train()
 
 
+def diagnostics_from_rows(*, match, gap, stochastic, offsets, boundary_epsilon: float):
+    """``SeedConsistencyDiagnostics`` (Gumbel draw) from a gateway's per drawn position rows: ``match`` (the pick is
+    the miner's token), ``gap`` (Gumbel score gap, 0 when matched), ``stochastic`` (max p < the threshold),
+    ``offsets`` (draw index). The miss is ``forced_sampling``'s ``1 - exp(-gap)``."""
+    import math
+
+    from reliquary.environment.forced_sampling import _FAR_MISS, SeedConsistencyDiagnostics
+
+    miss = [0.0 if m else -math.expm1(-float(g)) for m, g in zip(match, gap, strict=True)]
+    exact = [bool(m) for m in match]
+    stoch = [bool(s) for s in stochastic]
+    hard = [not (e or x <= boundary_epsilon) for e, x in zip(exact, miss)]
+    first = [o for o, h in zip(offsets, hard) if h]
+    if not miss:
+        return SeedConsistencyDiagnostics()
+    return SeedConsistencyDiagnostics(
+        n_positions=len(miss), n_stochastic=sum(stoch), n_exact_match=sum(s and e for s, e in zip(stoch, exact)),
+        n_boundary_match=len(miss) - sum(hard), n_hard_mismatch=sum(hard),
+        n_deterministic_hard_mismatch=sum(h and not s for h, s in zip(hard, stoch)),
+        n_miss_gt_0_01=sum(x > 0.01 for x in miss), n_miss_gt_0_05=sum(x > 0.05 for x in miss),
+        n_miss_gt_0_10=sum(x > 0.10 for x in miss), max_cdf_miss=max(miss),
+        first_hard_mismatch_offset=min(first) if first else None, n_drawn_exact_match=sum(exact),
+        last_miss=miss[-1], n_far_miss=sum(x > _FAR_MISS for x in miss))
+
+
+def gateway_audit(client, *, eos_ids) -> Callable:
+    """``TrainerAudits``' ``audit_fn`` on a Miles gateway (``RELIQUARY_TRAINER_BACKEND=miles``): a ``forward`` with the
+    ``reliquary_gate`` loss (a forward trains nothing and is never backed out), its per-position rows turned into
+    the verifier's diagnostics, then ``rl_audit.judge`` per group.
+
+    ``audit(model, group)`` judges one group; ``audit.many(model, groups)`` judges several in one ``forward`` per
+    draw config (single-turn groups together, episodes together: they take no final-EOS test), both submitted
+    before either is awaited. Each rollout's rows are computed from its own datum by the same per-rollout logic,
+    alone or batched; the numerics follow the gateway's packing as in the training forward (bf16 tiling can move a
+    boundary gap by a few ulps, well inside ``boundary_epsilon``), so do not expect bitwise equality across batch
+    shapes. ``TrainerAudits`` decides how many groups share a call (``max_rollouts_per_call``)."""
+    from reliquary.environment.forced_sampling import DRAW_GUMBEL_MAX
+    from reliquary.trainer.async_trainer import training_group
+    from reliquary.trainer.miles_datums import _draw_positions, rollout_datum
+    from reliquary.validator.rl_audit import judge
+    from reliquary.validator.verifier import draw_settings
+
+    settings = draw_settings()
+    if settings.draw != DRAW_GUMBEL_MAX or settings.top_k not in (0, -1) or settings.top_p < 1.0:
+        raise RuntimeError("the gateway audit implements the unwarped Gumbel draw only")
+    config = {"eos_ids": ",".join(str(int(t)) for t in eos_ids)} if eos_ids else {}
+    if float(settings.t) != 1.0:
+        config["temperature"] = float(settings.t)
+
+    def values(x):
+        return x.tolist() if hasattr(x, "tolist") else list(x)
+
+    def diagnostics(rollout, output):
+        p = int(rollout.commit["rollout"]["prompt_length"])
+        drawn = _draw_positions(rollout)
+        rows = [p + q - 1 for _, q in drawn]
+        match, gap, stoch = values(output["match"]), values(output["gap"]), values(output["stochastic"])
+        return diagnostics_from_rows(
+            match=[match[j] for j in rows], gap=[gap[j] for j in rows], stochastic=[stoch[j] for j in rows],
+            offsets=[t for t, _ in drawn], boundary_epsilon=settings.boundary_epsilon)
+
+    def many(_model, groups):
+        prepared = []
+        for group in groups:
+            uniforms = [group.draw_uniforms(i) for i in range(len(group.completions))]
+            rollouts = training_group(group, slot0=0, index=0, uniforms=uniforms).rollouts
+            prepared.append((rollouts, any("episode" in r.commit["rollout"] for r in rollouts)))
+        pending = []                                # (group indices, future): one forward per draw config
+        for episode in (False, True):
+            members = [g for g, (_, e) in enumerate(prepared) if e == episode]
+            if members:
+                datums = [rollout_datum(r, 0.0, 0) for g in members for r in prepared[g][0]]
+                pending.append((members, client.forward(
+                    datums, "reliquary_gate", {**config, "terminal_check": 0} if episode else config)))
+        found: list = [None] * len(groups)
+        for members, future in pending:
+            outputs = list(future.result().loss_fn_outputs)
+            expected = sum(len(prepared[g][0]) for g in members)
+            if len(outputs) != expected:
+                raise RuntimeError(f"the gateway returned {len(outputs)} rows for {expected} rollouts")
+            rows = iter(outputs)
+            for g in members:
+                found[g] = judge([diagnostics(r, next(rows)) for r in prepared[g][0]])
+        return found
+
+    def audit(model, group):
+        return many(model, [group])[0]
+
+    audit.many = many
+    return audit
+
+
 def broadcasting_audit(channel, audit_fn: Callable = audit_group) -> Callable:
     """Rank 0's audit under FSDP2: the followers run the same forward on the same group."""
 
@@ -187,39 +279,67 @@ def broadcasting_audit(channel, audit_fn: Callable = audit_group) -> Callable:
 
 
 AUDIT_CHUNK = 8   # audits taken per call
+AUDIT_TAKE_MAX = 32                 # largest take of a batched round (group bodies are large)
+AUDIT_ROLLOUTS_PER_CALL = 64        # rollouts per batched audit forward (``RELIQUARY_RL_TRAINER_AUDIT_ROLLOUTS_PER_CALL``)
+GROUP_ROLLOUTS = 16                 # a group's usual size: sizes the take of a batched round
+
+
+def pack_by_rollouts(groups: list, max_rollouts: int) -> list[list]:
+    """Consecutive groups packed into calls of at most ``max_rollouts`` rollouts (a larger group goes alone)."""
+    calls: list[list] = []
+    size = 0
+    for group in groups:
+        n = len(group.completions)
+        if calls and size + n <= max_rollouts:
+            calls[-1].append(group)
+            size += n
+        else:
+            calls.append([group])
+            size = n
+    return calls
 
 
 class TrainerAudits:
     """Take audit jobs from ``source`` (``take_audits(limit)`` / ``report_audit(lease_id, result)``: the trainer
-    link, or ``RlSubmissions`` in process) and judge them with ``audit_fn(model, group)``."""
+    link, or ``RlSubmissions`` in process) and judge them with ``audit_fn(model, group)``, or, when the audit
+    function has ``many(model, groups)`` (the Miles gateway's), several groups per call: consecutive groups up to
+    ``max_rollouts_per_call`` rollouts, the budget checked between calls (a round can overrun ``budget_s`` by one
+    call, and always makes at least one: the budget is a soft cap that never starves the audits)."""
 
-    def __init__(self, source, *, audit_fn: Callable = audit_group, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(self, source, *, audit_fn: Callable = audit_group, clock: Callable[[], float] = time.monotonic,
+                 max_rollouts_per_call: int = AUDIT_ROLLOUTS_PER_CALL) -> None:
+        if max_rollouts_per_call < 1:
+            raise ValueError("max_rollouts_per_call must be positive")
         self.source, self.audit_fn, self.clock = source, audit_fn, clock
+        self.max_rollouts_per_call = int(max_rollouts_per_call)
         self.done = 0
         self.seconds = 0.0
+        self.calls = 0
 
     def run(self, model, *, limit: int, budget_s: float) -> int:
         """Judge up to ``limit`` queued audits within about ``budget_s`` seconds; returns how many were reported."""
         if limit <= 0:
             return 0
         began = self.clock()
+        many = getattr(self.audit_fn, "many", None)
+        # taken a few at a time: a group body is large, and what the budget leaves is downloaded again. A take
+        # returns the queue's head until it is reported, so each take is judged (or left to the budget) whole.
+        chunk = AUDIT_CHUNK if many is None else min(
+            AUDIT_TAKE_MAX, max(AUDIT_CHUNK, 2 * -(-self.max_rollouts_per_call // GROUP_ROLLOUTS)))
         done = 0
         while done < limit and not (done and self.clock() - began > budget_s):
-            # taken a few at a time: a group body is large, and what the budget leaves is downloaded again
-            jobs = self.source.take_audits(min(AUDIT_CHUNK, limit - done))
+            jobs = self.source.take_audits(min(chunk, limit - done))
             if not jobs:
                 break
-            for group in jobs:
+            calls = [[g] for g in jobs] if many is None else pack_by_rollouts(jobs, self.max_rollouts_per_call)
+            for call in calls:
                 if done and self.clock() - began > budget_s:
                     break                       # the rest stay queued for the next round
-                result = self.audit_fn(model, group)
-                try:
-                    self.source.report_audit(group.lease_id, result)
-                except Exception as exc:
-                    if not (isinstance(exc, LookupError) or getattr(exc, "status", None) == 404):
-                        raise
-                    # concluded meanwhile (dropped as stale): nothing to report
-                done += 1
+                results = [self.audit_fn(model, call[0])] if many is None else many(model, call)
+                self.calls += 1
+                for group, result in zip(call, results, strict=True):
+                    self._report(group, result)
+                done += len(call)
         spent = self.clock() - began
         self.done += done
         self.seconds += spent
@@ -227,12 +347,22 @@ class TrainerAudits:
             logger.info("trainer audits: %d judged in %.1fs", done, spent)
         return done
 
+    def _report(self, group, result) -> None:
+        try:
+            self.source.report_audit(group.lease_id, result)
+        except Exception as exc:
+            if not (isinstance(exc, LookupError) or getattr(exc, "status", None) == 404):
+                raise
+            # concluded meanwhile (dropped as stale): nothing to report
+
     def metrics(self) -> dict[str, float]:
-        """Since the last call: audits judged and the seconds they took."""
-        out = {"async/audits": float(self.done), "async/audit_s": self.seconds}
-        self.done, self.seconds = 0, 0.0
+        """Since the last call: audits judged, the seconds they took and the audit calls made (one per group
+        unless batched)."""
+        out = {"async/audits": float(self.done), "async/audit_s": self.seconds, "async/audit_calls": float(self.calls)}
+        self.done, self.seconds, self.calls = 0, 0.0, 0
         return out
 
 
-__all__ = ["TrainerAudits", "audit_group", "broadcasting_audit", "group_diagnostics", "head_projection",
+__all__ = ["TrainerAudits", "audit_group", "pack_by_rollouts", "broadcasting_audit", "diagnostics_from_rows", "gateway_audit",
+           "group_diagnostics", "head_projection",
            "rollout_diagnostics"]

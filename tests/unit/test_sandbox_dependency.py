@@ -15,7 +15,7 @@ def test_every_sandbox_extra_pins_the_same_commit_as_the_code():
     extras = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["optional-dependencies"]
     pins = set()
     for name in ("sandbox", "sandbox-miner", "sandbox-test"):
-        (spec,) = extras[name]
+        spec = extras[name][0]
         assert spec.startswith("reliquary-sandbox")
         pins.add(re.search(r"@([0-9a-f]{40})$", spec).group(1))
     assert pins == {sandbox.SANDBOX_COMMIT}
@@ -58,6 +58,21 @@ def test_historical_job_pins_are_not_served_as_the_new_build(monkeypatch, histor
     assert historical_pin in refusal and "job pins" in refusal
 
 
+PREVIOUS_RELEASE = "f8c208bd35848a13cf5b9e44b64309d835d1d81e"
+
+
+def test_a_job_pinned_at_the_previous_release_keeps_running(monkeypatch):
+    """release-2026-11-13 serves offline tasks identically (option digests, bridged
+    identities, fingerprints): jobs created before it are not refused by new builds."""
+    assert PREVIOUS_RELEASE in sandbox.COMPATIBLE_SANDBOX_COMMITS
+    assert sandbox.SANDBOX_COMMIT in sandbox.COMPATIBLE_SANDBOX_COMMITS
+    monkeypatch.setattr(sandbox, "_installed_commit", lambda: sandbox.SANDBOX_COMMIT)
+    assert sandbox.sandbox_commit_refusal(PREVIOUS_RELEASE) is None
+    monkeypatch.setattr(sandbox, "_installed_commit", lambda: PREVIOUS_RELEASE)
+    assert sandbox.sandbox_commit_refusal(sandbox.SANDBOX_COMMIT) is None
+    assert sandbox.sandbox_commit_refusal(PREVIOUS_RELEASE) is None
+
+
 def test_a_machine_advertising_a_transcript_cap_over_the_wire_cap_is_refused():
     """A machine whose signed transcripts may exceed the submission body's transcript
     cap would sign honest episodes no miner can submit: it is not placed."""
@@ -70,3 +85,9 @@ def test_a_machine_advertising_a_transcript_cap_over_the_wire_cap_is_refused():
     for caps in ({}, {"max_transcript_bytes": "8"}, {"max_transcript_bytes": True},
                  {"max_transcript_bytes": 0}, None):
         assert sandbox.transcript_cap_refusal(caps) is not None
+
+
+def test_the_egress_release_stays_compatible():
+    """d680d5e is 7743b57 (release-2026-11-13) plus the harness distribution's terminus-2@1:
+    the same sandbox code, so a job or an install at 7743b57 is served as at d680d5e."""
+    assert "7743b57410bd10c8d30217388b28c2c589f39e31" in sandbox.COMPATIBLE_SANDBOX_COMMITS

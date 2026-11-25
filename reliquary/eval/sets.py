@@ -15,11 +15,12 @@ import json
 import random
 import re
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from reliquary.env_catalog import CATALOG, CatalogEnv, Rows, refuse_batch_rows, refuse_order_rows
 from reliquary.eval.prompt_source import REFERENCE_INTERACTIONS
 
 SET_SCHEMA = "reliquary/eval-set/v1"
@@ -82,115 +83,37 @@ CORPUS_RANGES: tuple[UsedRange, ...] = (
               "competitive-code-v2-qwen38-27b-v1"),
 )
 
-# reliquary_telecom_solo_v2 0.2.0a1 (reliquary-environments c72f918) lays
-# train out SFT first then RL, as its environment.toml `[data]` declares
-# (train_sft_start/count, train_rl_start/count; the package's
-# `layout.use_range`), as (start, count). Its 134 tau2-bench benchmark tickets
-# are a split of their own, `benchmark`, never train.
-TELECOM_SOLO_V2_SFT = (0, 1220)
-TELECOM_SOLO_V2_RL = (1220, 493)
+
+def _catalog_rows(use: str) -> list[tuple[CatalogEnv, Rows]]:
+    return [(env, rows) for env in CATALOG.values() for rows in env.rows if rows.use == use]
+
 
 # Rows a source keeps for RL alone: no corpus job may take them, whatever it
-# declares. reliquary_competitive_code_v1 shares train by problem identity
-# (the package's `layout.use_of`), SFT first then RL, as its environment.toml
-# `[data]` declares: SFT [0, 4181), RL [4181, 6899). v1.1
-# (ReliquaryForge/competitive-code-curated@4ae52941, reliquary-environments
-# 63f1d02) appends 1,893 problems, all SFT, after the v1 rows: SFT also
-# [6899, 8792). The v1 rows, and so the RL share, are unchanged.
-#
-# envscaler_tools_v2 splits by world: its RL worlds' scenarios are [0, 1296),
-# restated from `envscaler_tools_v2.environment.RL_RANGE` (a test holds the
-# two equal).
-RL_ONLY_RANGES: tuple[UsedRange, ...] = (
-    UsedRange("rl", "reliquary_competitive_code_v1", "train", 4181, 2718,
-              "competitive-code RL share"),
-    UsedRange("rl", "reliquary_telecom_solo_v2", "train", *TELECOM_SOLO_V2_RL,
-              "telecom v2 RL share"),
-    UsedRange("rl", "envscaler_tools_v2", "train", 0, 1296,
-              "envscaler RL worlds"),
+# declares. The environment catalog's RL rows, where the environment has no
+# ruling that RL and batch share them (``reliquary.env_catalog``).
+RL_ONLY_RANGES: tuple[UsedRange, ...] = tuple(
+    UsedRange("rl", env.name, rows.split, rows.start, rows.count, rows.what or "RL share")
+    for env, rows in _catalog_rows("rl")
+    if env.shared is None and not rows.covers_split()
 )
 
 # Sources a corpus job may take only part of: its range must lie inside ONE of
-# these. reliquary_general_v1 lays train out as (block, thinking mode)
-# segments, each opening with its single-turn rows (one user message, no
-# tools, no system message). Stage A serves those rows of chat, safety, ifeval
-# and structured, one segment per job (one renderer); multi-turn, tool and
-# task-system rows, clarification and identity wait for stage B, which renders
-# messages and tools. Counts from the package's `segments()` at
-# ReliquaryForge/general-prompts-curated@02b3ef7a.
-#
-# An empty tuple serves no corpus job: reliquary_telecom_solo_v1's train split
-# still holds the benchmark tickets, so telecom is distilled from v2's SFT
-# share only.
+# these (the catalog's batch rows of train; an empty tuple serves no corpus
+# job). Enforced through ``env_catalog.refuse_batch_rows``, which joins
+# adjacent ranges; kept as UsedRange for the cards that list them.
 CORPUS_SERVABLE_RANGES: dict[str, tuple[UsedRange, ...]] = {
-    "reliquary_telecom_solo_v1": (),
-    "reliquary_telecom_solo_v2": (
-        UsedRange("corpus", "reliquary_telecom_solo_v2", "train", *TELECOM_SOLO_V2_SFT,
-                  "telecom v2 SFT share"),
-    ),
-    "reliquary_general_v1": tuple(
-        UsedRange("corpus", "reliquary_general_v1", "train", start, stop - start,
-                  f"{segment} single-turn (stage A)")
-        for segment, start, stop in (
-            ("chat/direct", 0, 30_141),
-            ("chat/thinking", 30_141, 51_965),
-            ("ifeval/direct", 66_291, 70_971),
-            ("ifeval/thinking", 71_720, 82_808),
-            ("structured/direct", 84_587, 86_967),
-            ("structured/thinking", 87_540, 93_067),
-            ("safety/direct", 94_476, 101_778),
-            ("safety/thinking", 101_778, 107_165),
-        )
-    ),
-    # `SFT_CORPUS_RANGE`, restated from `envscaler_tools_v2.environment`: the
-    # graded scenarios of the 12 SFT worlds kept for the corpus. The whole
-    # graded SFT range [1296, 2546) (25 worlds, 13 of which a 27B policy
-    # almost never wins) and the ungraded range [2546, 7225)
-    # (EnvScaler-SFT-Scenario, no checks) are held in reserve.
-    "envscaler_tools_v2": (
-        UsedRange("corpus", "envscaler_tools_v2", "train", 7225, 600,
-                  "SFT worlds kept for the corpus, graded"),
-    ),
+    name: tuple(UsedRange("corpus", name, rows.split, rows.start, rows.count, rows.what)
+                for rows in env.rows_of("batch", RL_SPLIT))
+    for name, env in CATALOG.items()
+    if env.kind != "episode"
 }
 
-_CODE_LENGTH = 2_481_806
-_CODE_HELD_OUT = 100_000
-
 HELD_OUT: dict[str, HeldOut] = {
-    "math": HeldOut(
-        env="math", source="reliquary_dapo_math_v1", split="eval",
-        justification=(
-            "The package's eval split: problems are assigned to train/eval/qualification by "
-            "a salted hash of the problem key, so no eval problem is a train problem. RL "
-            "and corpus jobs build the train split only. OpenMathInstruct was not used: RL "
-            "samples its whole index space, offset 10000 measured 43.6% trained, and its "
-            "rows repeat each question ~20 times, so no index range is held out."),
-    ),
-    "code": HeldOut(
-        env="code", source="reliquary_code_v1", split="train",
-        start=_CODE_LENGTH - _CODE_HELD_OUT, count=_CODE_HELD_OUT, source_length=_CODE_LENGTH,
-        justification=(
-            "The last 100,000 rows of the pinned OpenCodeInstruct curation (d3caaefc, "
-            "2,481,806 rows), the corpus export's grader. The package has no other split. "
-            "Disjoint from every corpus job (code 0..100k), and `jobs create` refuses a job "
-            "reaching it. NOT disjoint from past RL: RL samples the whole train split, so "
-            "these rows were eligible (see the rulings)."),
-    ),
-    "logic": HeldOut(
-        env="logic", source="reliquary_logic_v2", split="eval",
-        justification=(
-            "The generator's eval split: splits interleave (position = index*3 + split), so "
-            "no eval task is a train task whatever the index. RL and corpus jobs (logic "
-            "rows 100M..100.05M) build the train split only."),
-    ),
-    "instruction_following": HeldOut(
-        env="instruction_following", source="reliquary_instruction_following_v1",
-        split="eval",
-        justification=(
-            "The package's eval split (10%): rows are assigned by a salted hash of the row "
-            "key, so no eval row is a train row. RL and corpus jobs (IF 0..20k) build the "
-            "train split only."),
-    ),
+    rows.eval_set: HeldOut(
+        env=rows.eval_set, source=env.name, split=rows.split, justification=rows.what,
+        start=rows.start, count=rows.count,
+        source_length=env.lengths.get(rows.split) if rows.count is not None else None)
+    for env, rows in _catalog_rows("eval") if rows.eval_set is not None
 }
 
 # Environments whose held-out region RL could sample, each by a ruling.
@@ -267,7 +190,8 @@ def overlaps(a: UsedRange, b: UsedRange) -> bool:
 
 
 def refuse_held_out_overlap(source: str, prompt_start: int, prompt_count: int) -> None:
-    """A corpus job (train split) may not take rows an eval set holds out."""
+    """A corpus job or a generation order (train split) takes only its source's batch rows (the
+    environment catalog), never rows an eval set holds out or RL keeps."""
     job = UsedRange("corpus", source, RL_SPLIT, int(prompt_start), int(prompt_count), "job")
     for held in HELD_OUT.values():
         # Only an index range can be refused; a source of the same corpus with
@@ -277,23 +201,26 @@ def refuse_held_out_overlap(source: str, prompt_start: int, prompt_count: int) -
                 f"rows [{held.start}, {held.region.end}) of {source!r} are held out for the "
                 f"{held.env!r} evaluation set; this job's [{job.start}, {job.end}) reaches them"
             )
-    servable = CORPUS_SERVABLE_RANGES.get(source)
-    if servable is not None and not any(
-        allowed.start <= job.start and job.end <= allowed.end for allowed in servable
-    ):
-        if not servable:
-            raise ValueError(f"{source!r} serves no corpus job (CORPUS_SERVABLE_RANGES)")
-        raise ValueError(
-            f"{source!r} serves corpus jobs only inside its corpus ranges, one "
-            f"segment per job ({', '.join(f'[{r.start}, {r.end}) {r.what}' for r in servable)}); "
-            f"this job's [{job.start}, {job.end}) is not inside one"
-        )
+    refuse_batch_rows(source, RL_SPLIT, int(prompt_start), int(prompt_count))
     for reserved in RL_ONLY_RANGES:
         if lineage(source)[1] == lineage(reserved.source)[1] and overlaps(job, reserved):
             raise ValueError(
                 f"rows [{reserved.start}, {reserved.end}) of {source!r} are the RL share "
                 f"({reserved.what}); this job's [{job.start}, {job.end}) reaches them"
             )
+
+
+def refuse_order_overlap(source: str, prompt_start: int, prompt_count: int) -> None:
+    """A customer's generation order (train split) names its own rows: any but the rows an eval set holds out
+    (``env_catalog.refuse_order_rows``). Our corpus jobs go through ``refuse_held_out_overlap``."""
+    job = UsedRange("order", source, RL_SPLIT, int(prompt_start), int(prompt_count), "order")
+    for held in HELD_OUT.values():
+        if lineage(source)[1] == lineage(held.source)[1] and overlaps(job, held.region):
+            raise ValueError(
+                f"rows [{held.start}, {held.region.end}) of {source!r} are held out for the "
+                f"{held.env!r} evaluation set; this order's [{job.start}, {job.end}) reaches them"
+            )
+    refuse_order_rows(source, RL_SPLIT, int(prompt_start), int(prompt_count))
 
 
 def _disjointness(held: HeldOut) -> dict:
@@ -471,9 +398,44 @@ def _catalog_spec(source: str):
 
 
 def _source_set_id(source: str, split: str, low: int, count: int,
-                   sample: int | None, seed: int | None) -> str:
+                   sample: int | None, seed: int | None, excluded: int = 0) -> str:
     base = f"{source.replace(':', '-')}-{split}-r{low}-n{count}"
+    base = base if not excluded else f"{base}-x{excluded}"
     return base if sample is None else f"{base}-k{sample}-s{seed}"
+
+
+def _checked_exclusion(exclude: Mapping[str, str] | None, interaction: str) -> dict[str, str]:
+    """``{instance id: reason}``, sorted, every reason stated; refused on a single-turn set."""
+    if not exclude:
+        return {}
+    if interaction == INTERACTION:
+        raise ValueError("an exclusion names instance ids: episode and SWE sets only")
+    if not isinstance(exclude, Mapping):
+        raise ValueError("the exclusion must map instance ids to reasons")
+    for instance_id, reason in exclude.items():
+        if not isinstance(instance_id, str) or not instance_id:
+            raise ValueError(f"excluded instance id {instance_id!r} is not a name")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError(f"excluded instance {instance_id!r} needs a reason")
+    return dict(sorted(exclude.items()))
+
+
+def _order(sample: int | None, excluded: Mapping[str, str]) -> str:
+    rows = "the rows of index_range not in selection.exclude, in order" if excluded else "index_range"
+    if sample is None:
+        return "the range in order, minus selection.exclude" if excluded else "the range in order"
+    return f"random.Random(seed).sample({rows}, sample); an order of N problems takes the first N"
+
+
+def _select_from(candidates: list[int], *, sample: int | None, seed: int | None) -> list[int]:
+    """`select_indices` over an explicit row list (a range minus its exclusions)."""
+    if sample is None:
+        return list(candidates)
+    if seed is None:
+        raise ValueError("a sampled set needs a seed")
+    if sample > len(candidates):
+        raise ValueError(f"the range holds {len(candidates)} usable rows, fewer than {sample}")
+    return random.Random(seed).sample(candidates, sample)
 
 
 def _write_set(directory: Path, prompts: list[dict], grading: list[dict], card: dict,
@@ -508,9 +470,11 @@ def build_source_set(source: str, *, out: str | Path, split: str | None = None,
                      taskset_args: dict | None = None,
                      protocol: dict | None = None, bridge: dict | None = None,
                      open_bridged: Callable[..., Any] | None = None,
+                     exclude: Mapping[str, str] | None = None,
                      open_environment: Callable[[str, str], Any] = open_source,
                      open_taskset: Callable[..., Any] | None = None,
-                     clock: Callable[[], float] = time.time) -> dict:
+                     clock: Callable[[], float] = time.time,
+                     count_tokens: str | None = None) -> dict:
     """Freeze rows ``[start, start + count)`` of any source, whole or sampled.
 
     A catalog environment at any split, or ``verifiers:<taskset-id>``: an
@@ -519,21 +483,29 @@ def build_source_set(source: str, *, out: str | Path, split: str | None = None,
 
     A bridged eval env (``corpus.job.BRIDGED_EVAL_PACKAGES``, e.g. reliquary-terminal)
     needs ``bridge``, ``{"options", "image_lock_sha256"}`` as the gateway serves it: its
-    rows are references to the tasks that env serves at ``split``."""
+    rows are references to the tasks that env serves at ``split``.
+
+    ``exclude`` ({instance id: reason}, reference sets only): rows known unusable
+    (e.g. a task no box can pass) leave the range before it is sampled, and the
+    card lists them, so the same exclusion and seed give the same set."""
     from reliquary.eval import verifiers_source
 
     if start < 0 or (count is not None and count <= 0):
         raise ValueError("start must be >= 0 and count positive")
     if verifiers_source.is_verifiers_source(source):
+        if exclude:
+            raise ValueError("an exclusion names instance ids: episode and SWE sets only")
         if split is not None:
             raise ValueError("a Verifiers source has no split: its taskset args choose the rows")
         return verifiers_source.build_set(
             source, out=out, start=start, count=count, sample=sample, seed=seed,
             set_id=set_id, taskset_args=dict(taskset_args or {}),
             open_taskset=open_taskset or verifiers_source.open_taskset, clock=clock,
-            protocol=protocol)
+            protocol=protocol, count_tokens=count_tokens)
     if taskset_args:
         raise ValueError("taskset args belong to a Verifiers source")
+    if count_tokens:
+        raise ValueError("--count-tokens is for a Verifiers source")
     from reliquary.corpus.job import BRIDGED_EVAL_PACKAGES
     from reliquary.protocol.environment_catalog import ENVIRONMENT_CATALOG
 
@@ -572,9 +544,24 @@ def build_source_set(source: str, *, out: str | Path, split: str | None = None,
         raise ValueError(f"[{start}, {high}) runs past {source!r}:{split} ({length} rows)")
     if start >= high:
         raise ValueError(f"{source!r}:{split} holds no row from {start}")
-    indices = select_indices(start, high, sample=sample, seed=seed)
+    def instance_id_of(index: int) -> str:
+        return (bridged_swe.instance_id_of(split, index) if interaction == "swe"
+                else bridged.instance_id(index) if bridged is not None
+                else str(environment.get_task(index).id))
+
+    excluded = _checked_exclusion(exclude, interaction)
+    if excluded:
+        ids = {index: instance_id_of(index) for index in range(start, high)}
+        unknown = sorted(set(excluded) - set(ids.values()))
+        if unknown:
+            raise ValueError(f"excluded instances not in {source!r}:{split} [{start}, {high}): "
+                             f"{unknown}")
+        indices = _select_from([i for i in range(start, high) if ids[i] not in excluded],
+                               sample=sample, seed=seed)
+    else:
+        indices = select_indices(start, high, sample=sample, seed=seed)
     set_id = validated_set_id(set_id or _source_set_id(source, split, start, high - start,
-                                                       sample, seed))
+                                                       sample, seed, len(excluded)))
     prompts, grading = [], []
     for ordinal, index in enumerate(indices):
         problem_id = f"{set_id}-{ordinal:06d}"
@@ -593,9 +580,7 @@ def build_source_set(source: str, *, out: str | Path, split: str | None = None,
             continue
         # A reference: the task is rebuilt from (split, index) by whoever runs it, and
         # must carry this id. `grading.jsonl` holds the same row.
-        instance_id = (bridged_swe.instance_id_of(split, index) if interaction == "swe"
-                       else bridged.instance_id(index) if bridged is not None
-                       else str(environment.get_task(index).id))
+        instance_id = instance_id_of(index)
         if not instance_id:
             raise ValueError(f"{source!r}:{split} row {index} has no instance id")
         row = {"problem_id": problem_id, "interaction": interaction, "split": split,
@@ -611,10 +596,9 @@ def build_source_set(source: str, *, out: str | Path, split: str | None = None,
         "source_kind": "catalog", "interaction": interaction, "split": split,
         "index_range": [start, high], "source_length": length, "count": len(indices),
         "seed": seed, "selection": {"start": start, "count": count, "sample": sample,
-                                    "seed": seed},
-        "order": ("the range in order" if sample is None else
-                  "random.Random(seed).sample(index_range, sample); an order of N "
-                  "problems takes the first N"),
+                                    "seed": seed,
+                                    **({"exclude": excluded} if excluded else {})},
+        "order": _order(sample, excluded),
         "created_at": clock(),
         "prompt_template_id": getattr(getattr(profile, "prompt_template", None),
                                       "template_id", None),

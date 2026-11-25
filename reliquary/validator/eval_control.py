@@ -26,7 +26,9 @@ import json
 import itertools
 import logging
 import math
+import random
 import secrets
+import statistics
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
@@ -42,15 +44,17 @@ from reliquary.protocol.toploc import ChunkResult
 from reliquary.validator.corpus_audit_protocol import (
     AUDIT_PROTOCOL,
     AUDIT_PROTOCOL_V3,
+    AUDIT_PROTOCOL_V4,
+    DRAW_PROTOCOLS,
     ITEM_ERROR,
     ITEM_OK,
     AuditResult,
     HeartbeatRequest,
+    draw_protocol,
 )
 from reliquary.validator.corpus_audit_remote import (
     AUDIT_LEASE_SECONDS,
     EXECUTOR_LIVE_SECONDS,
-    LEASE_EXPIRY_STRIKES,
     MAX_LEASES_PER_EXECUTOR,
     REGISTRY_REFRESH_SECONDS,
     LeaseRefused,
@@ -71,6 +75,16 @@ SCORERS_ENV = "RELIQUARY_ORDER_AUDIT_SCORERS"
 DEFAULT_SCORERS = 1
 
 
+def job_audit_protocol(job) -> str | None:
+    """The lease protocol a job's samples are audited in: v4 for a greedy draw (top_k 1), v3 for another draw,
+    None (any) without one."""
+    if not has_draw(job):
+        return None
+    from reliquary.corpus.eval_draw import job_warp
+
+    return AUDIT_PROTOCOL_V4 if job_warp(job).top_k == 1 else AUDIT_PROTOCOL_V3
+
+
 def order_audit_scorers(env=None) -> int:
     """How many executors score each audit batch (1, 2 or 3)."""
     import os
@@ -80,7 +94,19 @@ def order_audit_scorers(env=None) -> int:
     if not 1 <= value <= MAX_SCORERS:
         raise ValueError(f"{SCORERS_ENV} must be 1 to {MAX_SCORERS}, got {value}")
     return value
+# Store connections shared by the miners' intake and every order's auditors (each pass reads READ_CONCURRENCY
+# records and writes WRITE_CONCURRENCY verdicts at once). At 64 on 2026-11-19 a record write took ~1.7 s and a
+# pass's read ~1.7 s against 0.2 s alone.
+ORDER_POOL_CONNECTIONS = 256
 STATUS_SECONDS = 30.0
+# A judge process's slot reopen that lost its ledger race: tried again after this, doubling.
+REOPEN_RETRY_SECONDS = 1.0
+MAX_REOPEN_RETRY_SECONDS = 30.0
+# Why a job is still kept from miners (control status ``jobs[...]["held"]``).
+HELD_NO_GATEWAY = "no_gateway"
+HELD_AWAITING_AUDIT = "awaiting_audit"
+# Bound on resolving an episode order's first task for its options digest.
+GATEWAY_DIGEST_TIMEOUT_S = 60.0
 # Audit throughput is measured over this window: items scored per second an executor held a lease.
 THROUGHPUT_WINDOW_SECONDS = 900.0
 # Enough executors that the expected audits of a model's orders drain within this (env: DRAIN_ENV).
@@ -92,11 +118,38 @@ DEFAULT_MAX_EXECUTORS = 3
 SCALE_DOWN_SECONDS = 600.0
 # Busy seconds measured before a rate is trusted.
 MIN_MEASURED_BUSY_SECONDS = 120.0
+# A card that lost this many results in a row (leases expired) is set aside; a delivered result clears the count
+# only after CLEAN_STREAK of them, so a card failing one call in two does not keep its work.
+LOST_RESULT_STRIKES = 2
+CLEAN_STREAK = 5
+# An audit lease lives twice the time the model's recent results took per item, for its items and those the
+# card already holds, plus LEASE_OVERHEAD_SECONDS, within [AUDIT_LEASE_FLOOR_SECONDS, the dispatcher's lease
+# seconds]; the dispatcher's lease seconds until LEASE_TIMES_NEEDED results were timed.
+AUDIT_LEASE_FLOOR_SECONDS = 60.0
+LEASE_OVERHEAD_SECONDS = 30.0
+LEASE_TIMES_KEPT = 20
+LEASE_TIMES_NEEDED = 3
 HEARTBEAT_WRITE_SECONDS = 30.0
 EVAL_CONTROL_STATUS_KEY = "reliquary/eval/control/status.json"
 # The miners document every order shares: a hotkey's probation progress carries
 # from one order to the next (no `order-` prefix: it is no order).
 ORDER_TRUST_ID = "miner-trust-orders"
+# How stale a hotkey's audit state may be when a lease request asks whether it is suspect (a lease request is
+# frequent; a failure is acted on in the audit itself, this only stops new work).
+SUSPECT_READ_MAX_AGE = 30.0
+
+
+def _suspect_reader(miner_states, params):
+    """``hotkey``'s suspicion end (unix seconds) while it is suspect on the job, else None."""
+    from reliquary.corpus.audit_policy import effective_state
+
+    async def suspect_until(hotkey: str) -> float | None:
+        state, _ = await miner_states.state_at_most(hotkey, SUSPECT_READ_MAX_AGE)
+        if effective_state(state, time.time(), params) == "suspect":
+            return state.suspect_until
+        return None
+
+    return suspect_until
 
 
 def order_audit_drain_seconds(env=None) -> float:
@@ -241,6 +294,13 @@ class EvalExecutorDirectory:
     def document(self, executor_id: str) -> dict | None:
         return self._by_id.get(executor_id)
 
+    def quarantined_ids(self) -> list[str]:
+        """The eval executors the registry, as last read, says were quarantined (a status is never set back)."""
+        from reliquary.infrastructure.corpus_executor_store import WAS_QUARANTINED
+
+        return sorted(eid for eid, d in self._by_id.items() if d.get("scope") == "eval"
+                      and (d.get("status") == "quarantined" or d.get(WAS_QUARANTINED) is True))
+
 
 def _placement(document: dict) -> tuple[str, str] | None:
     """Where an executor runs; None when it cannot be told apart from others."""
@@ -274,6 +334,7 @@ class _Lease:
     batch: _Batch
     executor_id: str
     expires_at: float
+    granted_at: float = 0.0
 
 
 class PairedAuditDispatcher:
@@ -288,7 +349,7 @@ class PairedAuditDispatcher:
                  lease_seconds: float = AUDIT_LEASE_SECONDS,
                  live_seconds: float = EXECUTOR_LIVE_SECONDS,
                  max_leases_per_executor: int = MAX_LEASES_PER_EXECUTOR,
-                 expiry_strikes: int = LEASE_EXPIRY_STRIKES,
+                 expiry_strikes: int = LOST_RESULT_STRIKES,
                  scorers: int = DEFAULT_SCORERS) -> None:
         if not 1 <= scorers <= MAX_SCORERS:
             raise ValueError(f"scorers must be 1 to {MAX_SCORERS}")
@@ -306,6 +367,11 @@ class PairedAuditDispatcher:
             collections.deque)
         self._leases: dict[str, _Lease] = {}
         self._strikes: collections.Counter = collections.Counter()
+        # Per executor, results delivered in time since its last lost one.
+        self._clean: collections.Counter = collections.Counter()
+        # Per model, seconds per item its recent results took from grant to result.
+        self._lease_times: dict[ModelKey, collections.deque] = collections.defaultdict(
+            lambda: collections.deque(maxlen=LEASE_TIMES_KEPT))
         self._seen: dict[str, float] = {}
         self._listeners: list[Callable[[str], Awaitable[Any]]] = []
         self._background: set[asyncio.Task] = set()
@@ -320,8 +386,8 @@ class PairedAuditDispatcher:
         self.parked: collections.Counter = collections.Counter()
         self.quarantined: set[str] = set()
         self.stats = collections.Counter()
-        # Throughput: per executor, since when it holds a lease; per model, (when, items scored) and
-        # (when it ended, busy seconds) of the last THROUGHPUT_WINDOW_SECONDS.
+        # Throughput: per executor, since when it holds a lease; per model, (when, items scored, completion
+        # tokens, prompt tokens) and (when it ended, busy seconds) of the last THROUGHPUT_WINDOW_SECONDS.
         self._busy_since: dict[str, tuple[float, ModelKey]] = {}
         self._scored_items: dict[ModelKey, collections.deque] = collections.defaultdict(collections.deque)
         self._busy_spans: dict[ModelKey, collections.deque] = collections.defaultdict(collections.deque)
@@ -354,10 +420,12 @@ class PairedAuditDispatcher:
         self.parked.pop(job_id, None)
         self.reuse_only_jobs.discard(job_id)
 
-    async def score(self, model: ModelKey, proof, items: Sequence[dict], job_id: str = "", judge=None):
+    async def score(self, model: ModelKey, proof, items: Sequence[dict], job_id: str = "", judge=None,
+                    batches: list | None = None):
         """``(status, chunks, scored_by[, diagnostics])`` per item; ``scored_by`` is the
         tuple of executors whose agreement decided it. Drawn items (``draw``) go in v3
-        batches, a trajectory alone, decided by ``judge`` (the job's ``DrawJudge``)."""
+        batches, a trajectory alone, decided by ``judge`` (the job's ``DrawJudge``).
+        ``batches`` collects this call's batches, for a caller that may have to cancel them."""
         loop = asyncio.get_running_loop()
         units = []
         drawn = [k for k, item in enumerate(items) if item.get("draw") is not None]
@@ -365,10 +433,13 @@ class PairedAuditDispatcher:
             raise RuntimeError("trajectory audit is not available on remote executors")
         plain = [k for k, item in enumerate(items) if item.get("draw") is None]
         groups = [(AUDIT_PROTOCOL, [[plain[k] for k in unit] for unit in _lease_units([items[k] for k in plain])])]
-        drawn_plain = [k for k in drawn if items[k].get("spans") is None]
-        groups.append((AUDIT_PROTOCOL_V3, [[drawn_plain[k] for k in unit]
-                                            for unit in _lease_units([items[k] for k in drawn_plain])]
-                       + [[k] for k in drawn if items[k].get("spans") is not None]))
+        # Greedy draws (top_k 1) go in v4 leases: an executor that predates v4 never scores them.
+        for protocol in (AUDIT_PROTOCOL_V3, AUDIT_PROTOCOL_V4):
+            mine = [k for k in drawn if draw_protocol(items[k]["draw"]) == protocol]
+            drawn_plain = [k for k in mine if items[k].get("spans") is None]
+            groups.append((protocol, [[drawn_plain[k] for k in unit]
+                                      for unit in _lease_units([items[k] for k in drawn_plain])]
+                           + [[k] for k in mine if items[k].get("spans") is not None]))
         for protocol, grouped in groups:
             for indexes in grouped:
                 batch = _Batch(id=next(self._ids), model=model, proof=proof,
@@ -378,6 +449,8 @@ class PairedAuditDispatcher:
                                reuse_auditors_only=job_id in self.reuse_only_jobs)
                 units.append((indexes, batch))
                 self._queues[model].append(batch)
+                if batches is not None:
+                    batches.append(batch)
         scored: list = [None] * len(items)
         for indexes, batch in units:
             scores, scored_by = await batch.future
@@ -452,8 +525,11 @@ class PairedAuditDispatcher:
             if batch.reuse_auditors_only and (held or
                     self.reusable_auditor(batch.model, batch.protocol) != executor_id):
                 continue
+            now = self._clock()
             lease = _Lease(lease_id=secrets.token_hex(16), batch=batch, executor_id=executor_id,
-                           expires_at=self._clock() + self._lease_seconds)
+                           expires_at=now + self.lease_time(batch.model, len(batch.items)
+                                                            + sum(len(h.batch.items) for h in held)),
+                           granted_at=now)
             self._leases[lease.lease_id] = lease
             self._mark_busy(executor_id, batch.model)
             batch.leased.add(executor_id)
@@ -472,6 +548,15 @@ class PairedAuditDispatcher:
             }
         return None
 
+    def lease_time(self, model: ModelKey, items: int) -> float:
+        """Seconds an audit lease of ``items`` items (its own and those its card already holds) lives."""
+        times = self._lease_times.get(model)
+        if not times or len(times) < LEASE_TIMES_NEEDED:
+            return self._lease_seconds
+        per_item = statistics.median(times)
+        return min(self._lease_seconds,
+                   max(AUDIT_LEASE_FLOOR_SECONDS, 2.0 * per_item * max(1, items) + LEASE_OVERHEAD_SECONDS))
+
     def lease_of(self, lease_id: str) -> _Lease | None:
         return self._leases.get(lease_id)
 
@@ -487,7 +572,12 @@ class PairedAuditDispatcher:
         if lease.expires_at <= self._clock():
             raise LeaseRefused(410, "lease_expired")
         if not batch.reuse_auditors_only:
-            self._strikes[executor_id] = 0
+            self._clean[executor_id] += 1
+            if self._clean[executor_id] >= CLEAN_STREAK:
+                self._strikes[executor_id] = 0
+            if batch.items:
+                self._lease_times[batch.model].append(
+                    (self._clock() - lease.granted_at) / len(batch.items))
         scores = result.scores
         if len(scores) != len(batch.items) or any(_misfit(s, item) for s, item in zip(scores, batch.items)):
             raise LeaseRefused(422, "result_does_not_fit_the_lease")
@@ -498,7 +588,9 @@ class PairedAuditDispatcher:
         batch.scores[executor_id] = converted_scores(scores)
         self.stats["scored"] += 1
         if not batch.reuse_auditors_only:
-            self._scored_items[batch.model].append((self._clock(), len(batch.items)))
+            prompts = sum(int(item.get("prompt_len") or 0) for item in batch.items)
+            completions = sum(len(item.get("tokens") or ()) for item in batch.items) - prompts
+            self._scored_items[batch.model].append((self._clock(), len(batch.items), completions, prompts))
         await self._decide(batch)
         return "accepted"
 
@@ -611,20 +703,47 @@ class PairedAuditDispatcher:
         busy = {lease.executor_id for lease in self._leases.values()}
         return live, [e for e in live if e not in busy]
 
-    def items_per_second(self, model: ModelKey) -> float | None:
-        """Items one executor of ``model`` scores per second it holds a lease, over the last
-        THROUGHPUT_WINDOW_SECONDS; None until MIN_MEASURED_BUSY_SECONDS were measured."""
+    def _scored_per_second(self, model: ModelKey) -> tuple[int, int, int, float] | None:
+        """Items, completion tokens and prompt tokens one executor of ``model`` scored, and the seconds it
+        held a lease, over the last THROUGHPUT_WINDOW_SECONDS; None until MIN_MEASURED_BUSY_SECONDS."""
         now = self._clock()
         start = now - THROUGHPUT_WINDOW_SECONDS
         for log in (self._scored_items[model], self._busy_spans[model]):
             while log and log[0][0] < start:
                 log.popleft()
-        items = sum(n for _, n in self._scored_items[model])
+        scored = self._scored_items[model]
+        items = sum(row[1] for row in scored)
         busy = sum(min(seconds, end - start) for end, seconds in self._busy_spans[model])
         busy += sum(now - max(since, start) for since, m in self._busy_since.values() if m == model)
         if busy < MIN_MEASURED_BUSY_SECONDS or items <= 0:
             return None
-        return items / busy
+        return items, sum(row[2] for row in scored), sum(row[3] for row in scored), busy
+
+    def items_per_second(self, model: ModelKey) -> float | None:
+        """Items one executor of ``model`` scores per second it holds a lease (`_scored_per_second`)."""
+        measured = self._scored_per_second(model)
+        return None if measured is None else measured[0] / measured[3]
+
+    def tokens_per_second(self, model: ModelKey) -> tuple[float, float] | None:
+        """Completion and prompt tokens one executor of ``model`` audits per second it holds a lease: what
+        caps an order's paid tokens (``admin.cap_sizing``)."""
+        measured = self._scored_per_second(model)
+        return None if measured is None else (measured[1] / measured[3], measured[2] / measured[3])
+
+    def audit_pace(self, model: ModelKey) -> tuple[float, float | None] | None:
+        """What the merit order fills to (``corpus.lease_allocator``): the completion tokens per second the live
+        executors of ``model`` audit together (one's measured speed x how many are live), and their busy share
+        over the window; None until measured."""
+        measured = self._scored_per_second(model)
+        live = self.live_executors(model)
+        if measured is None or not live:
+            return None
+        busy = measured[3]
+        # Busy over the time each live executor was seen within the window, not the whole window: after a restart
+        # (or for a card just arrived) the window is not covered yet, and its idle share would read far too high.
+        now = self._clock()
+        seen = sum(min(THROUGHPUT_WINDOW_SECONDS, now - self._first_seen.get(d["executor_id"], now)) for d in live)
+        return measured[1] / busy * len(live), min(1.0, busy / max(seen, MIN_MEASURED_BUSY_SECONDS))
 
     def status(self) -> dict:
         """Per model, what the fleet must know: ``executors_needed`` more
@@ -651,7 +770,11 @@ class PairedAuditDispatcher:
                 "live_draw_executors": sum(1 for d in live if AUDIT_PROTOCOL_V3 in self._protocols.get(
                     d["executor_id"], ())),
                 "waiting_batches": len(waiting),
-                "waiting_draw_batches": sum(1 for b in waiting if b.protocol == AUDIT_PROTOCOL_V3),
+                "waiting_draw_batches": sum(1 for b in waiting if b.protocol in DRAW_PROTOCOLS),
+                # Greedy draws (v4) are leased only to executors that claim v4.
+                "live_greedy_executors": sum(1 for d in live if AUDIT_PROTOCOL_V4 in self._protocols.get(
+                    d["executor_id"], ())),
+                "waiting_greedy_batches": sum(1 for b in waiting if b.protocol == AUDIT_PROTOCOL_V4),
                 "awaiting_third_scorer": sum(1 for b in waiting if b.needed > max(2, self._scorers))}
         jobs = {job_id: {"needs_attention": True, "parked_batches": self.parked[job_id],
                          "reasons": list(reasons)}
@@ -660,13 +783,22 @@ class PairedAuditDispatcher:
                 "models": models, "jobs": jobs,
                 "quarantined": sorted(self.quarantined), "stats": dict(self.stats)}
 
-    async def quarantine(self, executor_id: str, reason: str) -> None:
+    async def load_quarantined(self) -> list[str]:
+        """Quarantines the registry holds that this process has not heard of (it forgets its own at a restart): each
+        goes through ``quarantine`` once, with no registry write. A read that failed or lists none changes nothing."""
+        loaded = [eid for eid in self._directory.quarantined_ids() if eid not in self.quarantined]
+        for executor_id in loaded:
+            await self.quarantine(executor_id, "quarantined in the registry", recorded=True)
+        return loaded
+
+    async def quarantine(self, executor_id: str, reason: str, *, recorded: bool = False) -> None:
+        """``recorded``: read from the registry, so nothing is written back to it."""
         if executor_id in self.quarantined:
             return
         logger.error("eval audit executor %s quarantined: %s", executor_id, reason)
         self.quarantined.add(executor_id)
         self._directory.revoke_locally(executor_id)
-        self.stats["quarantined"] += 1
+        self.stats["quarantined_loaded" if recorded else "quarantined"] += 1
         for lease_id, lease in list(self._leases.items()):
             if lease.executor_id == executor_id:
                 del self._leases[lease_id]
@@ -677,8 +809,9 @@ class PairedAuditDispatcher:
                 if not batch.future.done() and executor_id in batch.scores:
                     # Its score no longer counts towards an agreement.
                     del batch.scores[executor_id]
-        self._unwritten[executor_id] = reason
-        await self._write_quarantines()
+        if not recorded:
+            self._unwritten[executor_id] = reason
+            await self._write_quarantines()
         for listener in self._listeners:
             task = asyncio.ensure_future(self._notify(listener, executor_id))
             self._background.add(task)
@@ -714,9 +847,10 @@ class PairedAuditDispatcher:
                 if lease.batch.reuse_auditors_only:
                     continue
                 self._strikes[lease.executor_id] += 1
+                self._clean[lease.executor_id] = 0
                 if self._strikes[lease.executor_id] >= self._strikes_limit:
                     await self.quarantine(lease.executor_id,
-                                          f"{self._strikes_limit} leases expired in a row")
+                                          f"{self._strikes_limit} results lost (leases expired)")
         for queue in self._queues.values():
             while queue and queue[0].future.done():
                 queue.popleft()
@@ -860,6 +994,36 @@ def eval_auditor(**kwargs):
                 parked_now = len(self.parked_ids - before)
                 self._validator_errors = max(0, self._validator_errors - parked_now)
                 self._current_ids, self._current_records = [], []
+                self._reaudit_quarantined()
+
+        def _reaudit_quarantined(self) -> None:
+            """A judge process: a pass written after its executor's quarantine event has no event left to catch it."""
+            quarantined = getattr(self._remote, "quarantined", None)
+            if quarantined is None:
+                return
+            for executor_id in set(self._remote_scored) & quarantined():
+                if self._remote_scored[executor_id] and executor_id not in self._late_reaudits:
+                    self._late_reaudits[executor_id] = asyncio.ensure_future(self._reaudit_late(executor_id))
+
+        async def _reaudit_late(self, executor_id: str) -> None:
+            delay = REOPEN_RETRY_SECONDS
+            try:
+                while self._remote_scored.get(executor_id):
+                    listed = list(self._remote_scored[executor_id])
+                    try:
+                        await self.reaudit_executor(executor_id)
+                        delay = REOPEN_RETRY_SECONDS
+                    except Exception:
+                        logger.exception("eval job %s: re-audit of quarantined executor %s failed; retrying",
+                                         self._job_id, executor_id)
+                        # It took them off the list before failing.
+                        known = self._remote_scored.setdefault(executor_id, [])
+                        present = set(known)
+                        known.extend(sid for sid in listed if sid not in present)
+                        await asyncio.sleep(delay)
+                        delay = min(MAX_REOPEN_RETRY_SECONDS, 2 * delay)
+            finally:
+                self._late_reaudits.pop(executor_id, None)
 
         async def judge_many(self, submission_ids):
             # A parked record is not tried again until an operator acts.
@@ -868,26 +1032,56 @@ def eval_auditor(**kwargs):
         # -- an eval job stays completable: a failure reopens its slot ------
         # (a generation order's never does: today's corpus semantics)
 
-        async def _record_failure(self, submission_id: str) -> None:
+        async def _reopen_once(self, submission_id: str) -> None:
             from reliquary.corpus.eval_draw import has_draw
             from reliquary.validator.corpus_service import draw_failure_slot, record_prompt_failure
 
+            record = await self._records.read_submission(self._job_id, submission_id)
+            if record is None:
+                return
+            outcome = await record_prompt_failure(
+                self.job_store, self.job, int(record["prompt_index"]), submission_id,
+                **(draw_failure_slot(record) if has_draw(self.job) else {}))
+            if outcome is False:
+                logger.warning("eval job %s: prompt %s exhausted its attempts",
+                               self._job_id, record["prompt_index"])
+
+        async def _record_failure(self, submission_id: str) -> None:
             if not self.reopen_slots or self.job is None or self.job_store is None:
                 return
             try:
-                record = await self._records.read_submission(self._job_id, submission_id)
-                if record is None:
-                    return
-                outcome = await record_prompt_failure(
-                    self.job_store, self.job, int(record["prompt_index"]), submission_id,
-                    **(draw_failure_slot(record) if has_draw(self.job) else {}))
-                if outcome is False:
-                    logger.warning("eval job %s: prompt %s exhausted its attempts",
-                                   self._job_id, record["prompt_index"])
-            except Exception:
-                # Retried at the next start's reconcile; never stops the auditor.
+                await self._reopen_once(submission_id)
+            except Exception as exc:
+                # Retried at the next start's reconcile, or now in a judge process; never stops the auditor.
                 logger.exception("eval job %s: failure of %s not recorded in the ledger",
                                  self._job_id, submission_id[:12])
+                if self.retry_reopens and isinstance(exc, _reopen_retried()):
+                    self._retry_reopen(submission_id)
+
+        def _retry_reopen(self, submission_id: str) -> None:
+            if submission_id not in self._reopening:
+                task = asyncio.ensure_future(self._reopen_until_landed(submission_id))
+                self._reopening[submission_id] = task
+
+        async def _reopen_until_landed(self, submission_id: str) -> None:
+            """A failure that lost its ledger race (the front writes that ledger all the time), tried until it lands."""
+            delay = REOPEN_RETRY_SECONDS
+            try:
+                while True:
+                    await asyncio.sleep(delay * (0.5 + random.random() / 2))
+                    try:
+                        await self._reopen_once(submission_id)
+                        logger.info("eval job %s: failure of %s recorded after retrying", self._job_id,
+                                    submission_id[:12])
+                        return
+                    except _reopen_retried():
+                        delay = min(MAX_REOPEN_RETRY_SECONDS, 2 * delay)
+                    except Exception:
+                        logger.exception("eval job %s: failure of %s left to the next start's reconcile",
+                                         self._job_id, submission_id[:12])
+                        return
+            finally:
+                self._reopening.pop(submission_id, None)
 
         async def _write(self, submission_id, verdict):
             stored, written = await super()._write(submission_id, verdict)
@@ -907,36 +1101,124 @@ def eval_auditor(**kwargs):
             prompt without its slot)."""
             if not self.reopen_slots:
                 return 0
+            from reliquary.validator.corpus_auditor import failed_verdicts
+
             ids = list(await self._records.list_verdict_ids(self._job_id))
-            lister = getattr(self._records, "list_voided_ids", None)
-            voided = set(await lister(self._job_id)) if lister is not None else set()
-            failed = []
-            for submission_id in ids:
-                verdict = await self._records.read_verdict(self._job_id, submission_id)
-                if verdict and (not verdict.get("passed") or submission_id in voided):
-                    failed.append(submission_id)
+            failed = await failed_verdicts(self._records, self._job_id, ids)
             for submission_id in failed:
                 await self._record_failure(submission_id)
             return len(failed)
 
-        async def run(self):
+        async def restore_scored(self) -> int:
+            """A judge process that restarted: which executor scored each pass a quarantine could still void
+            (unsettled, or settled inside the hold, as ``reaudit_executor`` chooses), read back from the verdicts,
+            then the re-audit of those scored by an executor already quarantined."""
+            from reliquary.validator.corpus_auditor import RECONCILE_READS
+
+            ids = list(await self._records.list_verdict_ids(self._job_id))
+            lister = getattr(self._records, "list_voided_ids", None)
+            voided = set(await lister(self._job_id)) if lister is not None else set()
+            state, _ = await self._records.read_settlement(self._job_id)
+            settled = set((state or {}).get("settled") or ())
+            gate = asyncio.Semaphore(RECONCILE_READS)
+
+            async def read(submission_id):
+                async with gate:
+                    return submission_id, await self._records.read_verdict(self._job_id, submission_id)
+
+            now, restored = self._clock(), 0
+            listed: dict[str, set[str]] = {}
+            wanted = [sid for sid in ids if sid not in voided]
+            for start in range(0, len(wanted), RECONCILE_READS):
+                for sid, verdict in await asyncio.gather(*map(read, wanted[start:start + RECONCILE_READS])):
+                    if not verdict or not verdict.get("passed") or not verdict.get("audited"):
+                        continue
+                    if sid in settled and now - float(verdict.get("audited_at") or 0.0) > self._params.hold_seconds:
+                        continue
+                    for executor_id in verdict.get("scored_by") or ():
+                        known = listed.setdefault(executor_id, set(self._remote_scored.get(executor_id, ())))
+                        if sid not in known:
+                            known.add(sid)
+                            self._remote_scored.setdefault(executor_id, []).append(sid)
+                            restored += 1
+            # Last: a quarantine heard while reading took only what was listed by then.
+            quarantined = self._remote.quarantined()
+            for executor_id in sorted(set(self._remote_scored) & quarantined):
+                await self.reaudit_executor(executor_id)
+            return restored
+
+        async def _restore_behind(self):
+            await self.seeded.wait()
+            delay = REOPEN_RETRY_SECONDS
+            while True:
+                try:
+                    restored = await self.restore_scored()
+                    logger.info("eval job %s: %d executor score(s) restored for re-audit", self._job_id, restored)
+                    self.scores_restored.set()
+                    return
+                except Exception:
+                    logger.exception("eval job %s: executor scores not restored; retrying", self._job_id)
+                    await asyncio.sleep(delay)
+                    delay = min(MAX_REOPEN_RETRY_SECONDS, 2 * delay)
+
+        async def _reconcile_behind(self):
             try:
                 await self.reconcile_failures()
             except Exception:
                 logger.exception("eval job %s: failure reconcile failed", self._job_id)
-            await super().run()
+
+        async def run(self):
+            # Behind the audit, not before it: a restarted control must not leave the job unaudited while
+            # its verdicts are read (2026-11-11: ~10 minutes for 10k verdicts).
+            # The base run reconciles a forced-draw job's failures itself (`_reconcile_quietly`).
+            reconcile = (None if getattr(self, "_slot_store", None) is not None
+                         else asyncio.ensure_future(self._reconcile_behind()))
+            restore = asyncio.ensure_future(self._restore_behind()) if self.restores_scored else None
+            try:
+                await super().run()
+            finally:
+                if reconcile is not None:
+                    reconcile.cancel()
+                if restore is not None:
+                    restore.cancel()
+                    await asyncio.gather(restore, return_exceptions=True)
+                late = list(self._late_reaudits.values())
+                for task in late:
+                    task.cancel()
+                await asyncio.gather(*late, return_exceptions=True)
+                retries = list(self._reopening.values())
+                for task in retries:
+                    task.cancel()
+                await asyncio.gather(*retries, return_exceptions=True)
 
     vocab_size = kwargs.pop("vocab_size")
     job = kwargs.pop("job", None)
     job_store = kwargs.pop("job_store", None)
     # Off unless asked: only an eval job reopens a slot on a failed audit.
     reopen_slots = kwargs.pop("reopen_slots", False)
+    retry_reopens = kwargs.pop("retry_reopens", False)
+    restores_scored = kwargs.pop("restores_scored", False)
     auditor = EvalAuditor(model=_VocabularyOnly(vocab_size), **kwargs)
     auditor.reopen_slots = bool(reopen_slots)
+    # A judge process: a reopen that lost every ledger attempt is tried again until it lands.
+    auditor.retry_reopens = bool(retry_reopens)
+    auditor._reopening = {}
+    # A judge process: who scored what survives its restart (`restore_scored`).
+    auditor.restores_scored = bool(restores_scored)
+    auditor.scores_restored = asyncio.Event()
+    auditor._late_reaudits = {}
     auditor.parked_ids = set()
     auditor._current_ids, auditor._current_records = [], []
     auditor.job, auditor.job_store = job, job_store
     return auditor
+
+
+def _reopen_retried() -> tuple:
+    """What a slot reopen is tried again after: a lost ledger race or a store fault."""
+    from reliquary.infrastructure.corpus_job_store import CorpusStoreConflict
+    from reliquary.validator.corpus_miner_states import _TRANSIENT_ERRORS
+
+    return (CorpusStoreConflict, *_TRANSIENT_ERRORS)
 
 
 class _Parked(str):
@@ -1065,9 +1347,11 @@ def order_job_refusal(entry, job) -> str | None:
     if is_eval_job_id(entry.job_id):
         if not is_eval_source(job.prompt_source):
             return f"prompt source {job.prompt_source!r} is not an eval set"
-        if getattr(job, "episode", None) is not None and not is_signed_sandbox(job):
-            # Its steps would be trusted to the miner's box (or replayed by a grader this control lacks).
-            return "an order plays an episode only in the signed sandbox"
+        episode = getattr(job, "episode", None)
+        if episode is not None and not (is_signed_sandbox(job) or getattr(episode, "is_suite", False)):
+            # A replayed SWE episode's steps would be trusted to the miner's box. A suite episode is replayed
+            # here, its every observation recomputed (``suite_intake``).
+            return "an order plays an episode only in the signed sandbox or as a replayed suite episode"
     elif is_gen_job_id(entry.job_id):
         from reliquary.eval.qualification import order_environment_refusal
         from reliquary.validator.corpus_service import CHAT_TEMPLATE_RENDERERS
@@ -1110,7 +1394,8 @@ def order_job_refusal(entry, job) -> str | None:
     if getattr(job, "episode", None) is not None:
         from reliquary.eval.episode_jobs import episode_renderer_refusal
 
-        refusal = episode_renderer_refusal(architecture, job.episode.renderer)
+        refusal = episode_renderer_refusal(architecture, job.episode.renderer,
+                                           suite=getattr(job.episode, "is_suite", False))
         if refusal is not None:
             return refusal
     if (profile.model_id, profile.model_revision) != (job.checkpoint_repo,
@@ -1347,15 +1632,91 @@ def model_facts(repo: str, revision: str) -> dict:
     """The model's architecture and eos (``turn_end_token_id``), read here from its own files (CPU):
     never taken from an executor. ValueError: the model can never be served
     (no config, no tokenizer, not public); any other error is transient."""
+    from reliquary.constants import architecture_of
     from reliquary.shared.modeling import turn_end_token_id
 
     directory = _model_files(repo, revision)
     config = _model_config(directory, repo, revision)
-    architectures = config.get("architectures") or []
+    architecture = architecture_of(config)
     eos = turn_end_token_id(_cpu_tokenizer(directory, repo, revision), _declared_stops(directory))
-    if not architectures or eos is None:
+    if architecture is None or eos is None:
         raise ValueError(f"{repo}@{revision} names no architecture or eos")
-    return {"architecture": str(architectures[0]), "eos_token_id": int(eos)}
+    return {"architecture": architecture, "eos_token_id": int(eos)}
+
+
+def _also(first, second):
+    """A ``(submission_id, verdict)`` hook calling ``first`` then ``second``; ``second`` failing never breaks it."""
+
+    def both(submission_id, verdict) -> None:
+        first(submission_id, verdict)
+        try:
+            second(submission_id, verdict)
+        except Exception:
+            logger.exception("verdict hook failed for %s", submission_id)
+
+    return both
+
+
+def wire_order_judge(w, *, records, job_store, remote, params, miner_states, beacon, round_at,
+                     settle_archives=None, operator_of=None, arrivals_covered=None, threads=None,
+                     settle_executor=None, retry_reopens: bool = False,
+                     restores_scored: bool = False) -> None:
+    """One order's miner book, settler and auditor on ``w`` (``entry``, ``cap``, ``job``, ``tokenizer``,
+    ``proof``, ``vocab_size``, ``stats``, and ``grader`` for an episode order), in whichever process judges it."""
+    from reliquary.eval.prompt_source import is_eval_source
+    from reliquary.infrastructure.corpus_period_store import R2PeriodArchives
+    from reliquary.validator import corpus_periods as cp
+    from reliquary.validator.corpus_miner_status import (
+        MinerBook, feed, proof_thresholds, read_recent_windows,
+    )
+    from reliquary.validator.corpus_period_settlement import CorpusPeriodSettler, oldest_of
+    from reliquary.validator.corpus_settlement import SETTLE_FULL_LIST_SECONDS, settler_fed
+
+    entry, job, cap = w.entry, w.job, w.cap
+    # The miner status route's view (`/corpus/jobs/{job}/miners/{hotkey}`), fed by the same reports.
+    # A draw job carries no TOPLOC proof: its judge is in the contract.
+    w.miners = MinerBook(job_id=job.job_id, task_id=entry.task_id, records=records,
+                         read_windows=read_recent_windows,
+                         thresholds=None if has_draw(job) else proof_thresholds(w.proof))
+    on_verdict, on_settled = feed(w.stats, w.miners)
+    on_read = w.stats.observe
+    if job.episode is not None:
+        # Its audited tokens per episode, for the status's `sandbox` (`order_sandbox_status`).
+        from reliquary.validator.order_sandbox_status import EpisodeTokens
+
+        w.episode_tokens = EpisodeTokens()
+        on_verdict, on_read = _also(on_verdict, w.episode_tokens.observe), _also(on_read, w.episode_tokens.observe)
+    # Paid by period, as every corpus task (design 2026-10-03): a period
+    # closes once the auditor holds nothing undecided received in it -- and, for an
+    # episode order, its grader nothing ungraded (ruling P21): never paid ungraded.
+    grader = getattr(w, "grader", None)
+    pending = [lambda: w.auditor.oldest_pending_received_at()]
+    if grader is not None:
+        pending.append(grader.oldest_unready_received_at)
+        grader.on_voided = w.miners.voided
+    w.settler = CorpusPeriodSettler(
+        task_id=entry.task_id, job_id=job.job_id, cap=cap, records=records,
+        archives=R2PeriodArchives(guard=settle_archives),
+        oldest_pending=oldest_of(*pending), ready=grader.ready if grader is not None else None,
+        on_settled=on_settled, full_list_every_seconds=SETTLE_FULL_LIST_SECONDS, executor=settle_executor,
+        max_price=cp.max_price(entry.params), max_input_price=cp.max_input_price(entry.params))
+    w.auditor = eval_auditor(
+        job_id=job.job_id, records=records, tokenizer=w.tokenizer, proof=w.proof,
+        params=params, miner_states=miner_states, beacon=beacon, round_at=round_at,
+        on_verdict=settler_fed(w.settler, on_verdict), on_voided=w.miners.voided, vocab_size=w.vocab_size,
+        job=job, job_store=job_store, reopen_slots=is_eval_source(job.prompt_source) or has_draw(job),
+        draw_job=job if has_draw(job) else None, operator_of=operator_of, remote=remote,
+        arrivals_covered=arrivals_covered, threads=threads, retry_reopens=retry_reopens,
+        restores_scored=restores_scored)
+    w.settler.on_window = w.miners.window
+    w.settler.on_read = on_read
+    # The stake weighs a record's prompt as the settler pays it (`corpus_periods.work_value`).
+    output_price, input_price = cp.max_price(entry.params), cp.max_input_price(entry.params)
+    if input_price and output_price:
+        w.auditor.stake_input_weight = float(input_price) / float(output_price)
+    elif input_price:
+        # Prompts paid at a price no output price compares with: the corpus rule, never a guessed stake.
+        w.auditor.stake_at_receipt = False
 
 
 def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
@@ -1365,7 +1726,8 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                        read_entries=None, clock: Callable[[], float] = time.time,
                        refresh_every_seconds: float = 60.0, qualification_store=None,
                        order_jobs=None, sandbox=None, sandbox_down: str | None = None,
-                       model_dir_for=None, signed_wiring=None):
+                       model_dir_for=None, signed_wiring=None, suite_replayer_for=None,
+                       operator_of: Callable[[str], str | None] | None = None, order_judge=None):
     """The app and the job set of the eval control. Each wired job gets its own
     tokenizer, renderer, router, auditor (an executor pair per batch) and
     settler; ``read_entries`` makes the set hot.
@@ -1374,16 +1736,17 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
     orders as the corpus validator does: the session route, each job's signed intake and
     its grader, whose grades gate the job's pay. Without it (``sandbox_down`` says why) an
     episode order is refused. ``model_dir_for(repo, revision)``: the model's tokenizer files
-    the turn renderer loads; ``signed_wiring``: extra ``wire_signed_job`` arguments (tests)."""
+    the turn renderer loads; ``signed_wiring``: extra ``wire_signed_job`` arguments (tests).
+    A suite episode order needs no sandbox: replayed here, by ``suite_replayer_for(tokenizer)``
+    (``suite_intake.PoolSuiteReplayer`` by default). ``operator_of(hotkey)``: its registration's coldkey (None:
+    unknown), whose hotkeys every auditor stakes and forfeits together (``CorpusAuditor._operator``).
+    ``order_judge`` (``order_judge.OrderJudgeFront``): non-episode orders are judged and paid in its process."""
     from fastapi import FastAPI
 
     from reliquary.eval.prompt_source import job_prompt_lines, parse_eval_source
     from reliquary.protocol.profiles import profile_from_contract, toploc_proof
     from reliquary.validator.corpus_hot_jobs import OTHER_MODEL, CorpusJobSet, job_drained
     from reliquary.validator.corpus_job_status import JobStats
-    from reliquary.validator.corpus_miner_status import (
-        MinerBook, feed, proof_thresholds, read_recent_windows,
-    )
     from reliquary.validator.corpus_service import (
         CorpusJobRoutes,
         build_corpus_jobs_router,
@@ -1393,10 +1756,6 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         prompt_job_for_spec,
         renderer_for_job,
     )
-    from reliquary.infrastructure.corpus_period_store import R2PeriodArchives
-    from reliquary.validator import corpus_periods as cp
-    from reliquary.validator.corpus_period_settlement import CorpusPeriodSettler, oldest_of
-    from reliquary.validator.corpus_settlement import SETTLE_FULL_LIST_SECONDS, settler_fed
     from reliquary.validator.corpus_validator import (
         WINDOW_SETTLED,
         add_public_corpus_routes,
@@ -1406,6 +1765,12 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
 
     tokenizers: dict[ModelKey, tuple[Any, int]] = {}
     served: dict[str, Any] = {}
+    suite_replayers: dict[ModelKey, Any] = {}
+    if suite_replayer_for is None:
+        def suite_replayer_for(tokenizer):
+            from reliquary.validator.suite_intake import PoolSuiteReplayer
+
+            return PoolSuiteReplayer.for_tokenizer(tokenizer)
     model_dir_for = model_dir_for or _model_files
     grade_parse_threads = None
     if sandbox is not None:
@@ -1428,7 +1793,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
     def router_for(w):
         from reliquary.validator.corpus_validator import _lease_verifier
 
-        return build_corpus_router(
+        router = build_corpus_router(
             job_id=str(w.entry.job_id), store=store, tokenizer=w.tokenizer,
             renderer=w.renderer, verify_signature=verify_signature,
             verify_skip_signature=verify_skip_signature, prompt_job_for=w.prompt_job_for,
@@ -1437,8 +1802,24 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             # A draw job's samples carry no proof: the draw is their check.
             proof_chunk_tokens=None if has_draw(w.job) else w.proof.chunk_tokens, vocab_size=w.vocab_size,
             is_banned=w.is_banned, registration=registration, seen_index=w.seen_index,
+            suspect_until=getattr(w, "suspect_until", None),
             job=getattr(w, "job", None), durable_records=False, auction=_auction_of(w),
+            lease_fault=_lease_fault_of(w),
+            # Held by this control for its audit (a restart's seed, a judge down): no lease runs out meanwhile.
+            lease_held=functools.partial(routes.lease_clock_stopped, str(w.entry.job_id)),
             episode_intake=getattr(w, "episode_intake", None))
+        w.sync_lease_clock = router.sync_lease_clock
+        return router
+
+    def _lease_fault_of(w):
+        """A signed episode order's draw leases our sandbox failed: released uncharged
+        (``sandbox.corpus_lease_faults``)."""
+        job = getattr(w, "job", None)
+        if sandbox is None or job is None or job.episode is None or not is_signed_sandbox(job):
+            return None
+        from reliquary.sandbox.corpus_lease_faults import corpus_lease_fault
+
+        return corpus_lease_fault(sandbox.issuer, str(job.job_id))
 
     def _auction_of(w):
         """The job's token auction when its entry prices it so (``corpus.token_auction``), its leases opened by
@@ -1450,12 +1831,17 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             w.auction = job_auction(
                 getattr(w.entry, "params", None),
                 backlog=lambda: w.auditor.audit_backlog() + dispatcher.pending_items(job_id),
-                state_path=state_path_for(job_id))
+                state_path=state_path_for(job_id), job=getattr(w, "job", None))
+            job = getattr(w, "job", None)
+            if w.auction is not None and w.auction.measures and job is not None:
+                # The merit order fills what the model's audit cards verify, at the share this job audits.
+                model = (job.checkpoint_repo, job.checkpoint_revision)
+                w.auction.bind_merit(audit=lambda: dispatcher.audit_pace(model),
+                                     q=lambda: w.auditor.audit_share(),
+                                     q_weight=lambda: w.auditor.audit_decisions())
         return w.auction
 
     async def wire(entry, cap, job):
-        from reliquary.eval.prompt_source import is_eval_source
-
         refusal = order_job_refusal(entry, job)
         if refusal is None and window_settled(entry):
             refusal = WINDOW_SETTLED
@@ -1465,7 +1851,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             if declared is not None and declared.get("qualification_id"):
                 record, _ = await qualification_store.read(declared["qualification_id"])
             refusal = qualification_refusal(entry, job, declared, record)
-        if refusal is None and job.episode is not None and sandbox is None:
+        if refusal is None and job.episode is not None and is_signed_sandbox(job) and sandbox is None:
             refusal = ("a signed-sandbox episode order and this order control serves no sandbox: "
                        + (sandbox_down or "RELIQUARY_ORDER_SANDBOX_KEY_FILE/_KEY_ID are not set"))
         if refusal is not None:
@@ -1501,64 +1887,65 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                             audit_executors=order_audit_executors(declared),
                             vocab_size=vocab_size, proof=proof, renderer=renderer,
                             prompt_job_for=prompt_job_for, seen_index=seen_index,
-                            is_banned=is_banned, stats=JobStats())
+                            is_banned=is_banned, suspect_until=_suspect_reader(miner_states, params),
+                            stats=JobStats())
         if job.episode is not None:
             # Published to the session issuer only at the end, once the whole job is wired.
             await wire_episode(w)
-        # The miner status route's view (`/corpus/jobs/{job}/miners/{hotkey}`), fed by the same reports.
-        # A draw job carries no TOPLOC proof: its judge is in the contract.
         w.audit_params, w.miner_states = params, miner_states
-        w.miners = MinerBook(job_id=job.job_id, task_id=entry.task_id, records=records,
-                             read_windows=read_recent_windows,
-                             thresholds=None if has_draw(job) else proof_thresholds(proof))
-        on_verdict, on_settled = feed(w.stats, w.miners)
-        # Paid by period, as every corpus task (design 2026-10-03): a period
-        # closes once the auditor holds nothing undecided received in it -- and, for an
-        # episode order, its grader nothing ungraded (ruling P21): never paid ungraded.
+        judged_apart = order_judge is not None and job.episode is None
         grader = getattr(w, "grader", None)
-        pending = [lambda: w.auditor.oldest_pending_received_at()]
-        if grader is not None:
-            pending.append(grader.oldest_unready_received_at)
-            grader.on_voided = w.miners.voided
-        w.settler = CorpusPeriodSettler(
-            task_id=entry.task_id, job_id=job.job_id, cap=cap, records=records,
-            archives=R2PeriodArchives(guard=settle_archives),
-            oldest_pending=oldest_of(*pending), ready=grader.ready if grader is not None else None,
-            on_settled=on_settled, full_list_every_seconds=SETTLE_FULL_LIST_SECONDS,
-            max_price=cp.max_price(entry.params), max_input_price=cp.max_input_price(entry.params))
-        w.auditor = eval_auditor(
-            job_id=job.job_id, records=records, tokenizer=tokenizer, proof=proof,
-            params=params, miner_states=miner_states, beacon=beacon, round_at=round_at,
-            on_verdict=settler_fed(w.settler, on_verdict), on_voided=w.miners.voided, vocab_size=vocab_size,
-            job=job, job_store=store, reopen_slots=is_eval_source(job.prompt_source) or has_draw(job),
-            draw_job=job if has_draw(job) else None,
-            remote=dispatcher.view(job.checkpoint_repo, job.checkpoint_revision, proof,
-                                   job.job_id, job.judge if has_draw(job) else None))
+        if judged_apart:
+            # Its auditor, settler and book run in the judge process.
+            order_judge.attach(w, records=records, store=store)
+        else:
+            wire_order_judge(
+                w, records=records, job_store=store, params=params, miner_states=miner_states, beacon=beacon,
+                round_at=round_at, settle_archives=settle_archives, operator_of=operator_of,
+                remote=dispatcher.view(job.checkpoint_repo, job.checkpoint_revision, proof,
+                                       job.job_id, job.judge if has_draw(job) else None))
 
-        w.settler.on_window = w.miners.window
-        w.settler.on_read = w.stats.observe
-        # The stake weighs a record's prompt as the settler pays it (`corpus_periods.work_value`).
-        output_price, input_price = cp.max_price(entry.params), cp.max_input_price(entry.params)
-        if input_price and output_price:
-            w.auditor.stake_input_weight = float(input_price) / float(output_price)
-        elif input_price:
-            # Prompts paid at a price no output price compares with: the corpus rule, never a guessed stake.
-            w.auditor.stake_at_receipt = False
+            def on_accepted(submission_id: str) -> None:
+                w.stats.accepted()
+                w.auditor.enqueue(submission_id)
+                if grader is not None:
+                    grader.enqueue(submission_id)
 
-        def on_accepted(submission_id: str) -> None:
-            w.stats.accepted()
-            w.auditor.enqueue(submission_id)
-            if grader is not None:
-                grader.enqueue(submission_id)
-
-        w.on_accepted = on_accepted
-        if job.episode is not None:
+            w.on_accepted = on_accepted
+        if job.episode is not None and is_signed_sandbox(job):
             # Only now: a job still being wired is never visible to the session issuer.
             sandbox.publish(w)
         # Miners wait for the audit: what they would send before an executor of the model has
         # loaded it would only wait unaudited, or be lost on an order that never gets one.
-        protocol = AUDIT_PROTOCOL_V3 if has_draw(job) else None
-        routes.hold(str(job.job_id), lambda: dispatcher.audit_ready(key, protocol))
+        protocol = job_audit_protocol(job)
+        # And until its auditor has read the job back (a restart): what miners send before would pile up unjudged.
+        # An episode order also waits for a gateway serving its env: miners refused sessions give up on it.
+        gateway_ready = episode_gateway_ready(w) if job.episode is not None and is_signed_sandbox(job) else None
+
+        def why_held() -> str | None:
+            if gateway_ready is not None and not gateway_ready():
+                return HELD_NO_GATEWAY
+            if not (w.auditor.seeded.is_set() and dispatcher.audit_ready(key, protocol)):
+                return HELD_AWAITING_AUDIT
+            return None
+
+        routes.stop_lease_clock_on(str(job.job_id), HELD_AWAITING_AUDIT)
+        if judged_apart:
+            # Open once its audit is first ready, as below; held again whenever its judge is not up and seeded.
+            opened = False
+
+            def why_held_apart() -> str | None:
+                nonlocal opened
+                if not w.auditor.seeded.is_set():
+                    return HELD_AWAITING_AUDIT
+                if not opened and not dispatcher.audit_ready(key, protocol):
+                    return HELD_AWAITING_AUDIT
+                opened = True
+                return None
+
+            routes.hold(str(job.job_id), lambda: why_held_apart() is None, why=why_held_apart, latch=False)
+        else:
+            routes.hold(str(job.job_id), lambda: why_held() is None, why=why_held)
         if (declared or {}).get("reuse_auditors_only") is True:
             dispatcher.reuse_only_jobs.add(job.job_id)
         served[job.job_id] = w
@@ -1566,7 +1953,11 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
 
     async def wire_episode(w) -> None:
         """A signed episode order, as the corpus validator wires one: its signed intake and
-        session view (published once the whole job is wired), its grader."""
+        session view (published once the whole job is wired), its grader. A suite one: its
+        replaying intake and the grader that replays it again (``suite_grading``)."""
+        if w.job.episode.is_suite:
+            await wire_suite_episode(w)
+            return
         from reliquary.validator.sandbox_wiring import wire_signed_grader, wire_signed_job
 
         job = w.job
@@ -1576,8 +1967,45 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             tokenizer=w.tokenizer, vocab_size=w.vocab_size, chunk_tokens=w.proof.chunk_tokens,
             publish=False, **(signed_wiring or {})))
         wire_signed_grader(w, judge_records=records, parse_executor=grade_parse_threads)
+        # The options digest its sessions are placed under (its first task's), for the gateway hold.
+        w.env_options_sha256 = None
+        try:
+            task = await asyncio.wait_for(w.sandbox_view.resolve_task(0), GATEWAY_DIGEST_TIMEOUT_S)
+            w.env_options_sha256 = getattr(task, "env_options_sha256", None)
+        except Exception as exc:
+            logger.warning("episode order %s: its options digest is unresolved (%s); held for a gateway "
+                           "at its package only", job.job_id, type(exc).__name__)
+
+    async def wire_suite_episode(w) -> None:
+        """A suite episode order, as the corpus validator wires a suite job: no sandbox, no gateway. One
+        replay pool per checkpoint tokenizer, shared by its orders' intakes and graders."""
+        from reliquary.validator import suite_intake
+        from reliquary.validator.suite_grading import LocalEpisodeGrader
+
+        job = w.job
+        key = (job.checkpoint_repo, job.checkpoint_revision)
+        if key not in suite_replayers:
+            suite_replayers[key] = suite_replayer_for(w.tokenizer)
+        w.episode_intake = await asyncio.to_thread(
+            suite_intake.build_suite_intake, job, tokenizer=w.tokenizer, vocab_size=w.vocab_size,
+            chunk_tokens=w.proof.chunk_tokens, replayer=suite_replayers[key])
+        w.grader = LocalEpisodeGrader(job=job, records=records, replayer=w.episode_intake.replayer,
+                                      source=w.episode_intake.source)
+
+    def episode_gateway_ready(w) -> Callable[[], bool]:
+        """Whether a fresh, active gateway serves the episode's env at its package and options (the
+        placement's own check) and has slots for it. Once released, a job stays open (`routes.hold`)."""
+        spec = w.job.episode.sandbox
+        options = getattr(w, "env_options_sha256", None)
+
+        def ready() -> bool:
+            return sandbox.fleet.slots_serving_env(str(spec.env), str(spec.env_package),
+                                                   env_options_sha256=options) > 0
+        return ready
 
     async def settle_forever(w, every: float = 60.0) -> None:
+        # After the auditor's start: its listing and reads come first after a restart.
+        await w.auditor.seeded.wait()
         while True:
             try:
                 await w.settler.settle_once()
@@ -1639,6 +2067,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
     app = FastAPI()
     app.include_router(build_corpus_jobs_router(routes, legacy=False))
     if sandbox is not None:
+        routes.sandbox_hotkey = getattr(sandbox, "validator_hotkey", None)
         # /corpus/jobs/{job_id}/sandbox/sessions: the episode orders' sessions, under this control's key.
         app.include_router(sandbox.router)
         app.state.corpus_sandbox = sandbox
@@ -1668,7 +2097,14 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         from reliquary.eval.prompt_source import is_order_job_id
 
         # Only an order job's status is ever looked up (stored ones included).
-        status = await job_set.status(job_id) if is_order_job_id(job_id) else None
+        try:
+            status = await job_set.status(job_id) if is_order_job_id(job_id) else None
+        except Exception as exc:
+            from reliquary.validator.order_judge import JudgeUnavailable
+
+            if isinstance(exc, JudgeUnavailable):
+                raise HTTPException(status_code=503, detail="order_judge_unavailable") from exc
+            raise
         if status is None:
             raise HTTPException(status_code=404, detail="corpus_job_not_served")
         return status
@@ -1678,9 +2114,12 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                                                   qualifications=qualifications))
     job_set = CorpusJobSet(
         routes=routes, router_for=router_for, wire=wire,
-        jobs_of=lambda w: [guarded(w, w.auditor.run()), guarded(w, settle_forever(w)),
-                           *([guarded(w, w.grader.run())] if getattr(w, "grader", None) is not None else [])],
-        read_entries=read_entries, read_job=read_job, admit=admit, screen=screen,
+        jobs_of=lambda w: ([] if getattr(w, "judge_link", None) is not None else [
+            guarded(w, w.auditor.run()), guarded(w, settle_forever(w)),
+            *([guarded(w, w.grader.run())] if getattr(w, "grader", None) is not None else [])]),
+        read_entries=(order_judge.watching(read_entries) if order_judge is not None and read_entries
+                      else read_entries),
+        read_job=read_job, admit=admit, screen=screen,
         on_unwired=unwired, refresh_every_seconds=refresh_every_seconds,
         # A drained order's status outlives this process; a retired one is
         # finished after a restart.
@@ -1692,17 +2131,20 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
     drain_seconds = order_audit_drain_seconds()
     max_executors = order_max_audit_executors()
     sizing = ExecutorSizing(clock=clock)
+    sandbox_models: dict[str, tuple[str, str]] = {}   # signed episode job -> its model, while it may forecast
 
     async def control_status() -> dict:
         """The dispatcher's status, with each served job's completeness, and per model the executors
         its orders' expected audits want (`executors_wanted`)."""
         document = dispatcher.status()
         document["reuse_auditors_only"] = True
+        document["at"] = time.time()
         # Per model served, its orders' expected audit items; None while one of them is unknown.
         backlog: dict[tuple[str, str], float | None] = {}
         # Per model, the most executors its orders allow (the fastest order's choice), within the control's.
         allowed: dict[tuple[str, str], int] = {}
         released: list[str] = []
+        statuses: dict[str, dict] = {}
         for w in list(served.values()):
             if w.job.job_id in dispatcher.reuse_only_jobs:
                 continue
@@ -1720,16 +2162,36 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                 continue
             if status is None:
                 continue
+            statuses[job_id] = status
             entry = document["jobs"].setdefault(
                 job_id, {"needs_attention": False, "parked_batches": 0, "reasons": []})
             entry.update({key: status.get(key) for key in (
                 "state", "prompts_total", "prompts_full", "prompts_complete",
                 "prompts_exhausted", "complete")})
+            # Kept from miners, and why (``no_gateway``, ``awaiting_audit``); absent once open.
+            held = routes.held_reason(job_id)
+            if held is not None:
+                entry["held"] = held
+            else:
+                entry.pop("held", None)
+            # What sizes its cap (``admin.cap_sizing``): its model, cards, and what it paid and has accrued.
+            settler = getattr(served.get(job_id), "settler", None)
+            # Judged apart and its snapshot stale: no sizing, rather than a cap resized on zeros.
+            if settler is not None and getattr(settler, "sizing_known", True):
+                job = served[job_id].job
+                entry["sizing"] = {"model": f"{job.checkpoint_repo}@{job.checkpoint_revision}",
+                                   "audit_executors": getattr(served[job_id], "audit_executors", 1),
+                                   "recent_paid": list(settler.recent_paid),
+                                   "open_value": settler.open_value()}
             # What the fleet needs to keep an audit executor for it: none once nothing left may need one.
             auditor = getattr(served.get(job_id), "auditor", None)
             if auditor is not None:
                 pending = auditor.audits_pending()
                 entry["audits_pending"] = pending
+                # Why the records judged since this process started were audited (`CorpusAuditor._audit_reason`).
+                entry["audit_reasons"] = dict(getattr(auditor, "audit_reasons", {}))
+                # Outcomes scored ahead and thrown away: card work no verdict used (`CorpusAuditor.ahead_wasted`).
+                entry["ahead_wasted"] = int(getattr(auditor, "ahead_wasted", 0))
                 entry["audits_idle_since"] = auditor.audits_idle_since
                 if job_id in dispatcher.reuse_only_jobs:
                     continue
@@ -1744,6 +2206,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             key = f"{model[0]}@{model[1]}"
             live, idle = dispatcher.executor_ids(model)
             rate = dispatcher.items_per_second(model)
+            tokens = dispatcher.tokens_per_second(model)
             # Unknown backlog (a job seeding, a status unreadable): what is wanted stays as it was.
             target = None if expected is None else executors_for_backlog(
                 expected, rate, drain_seconds=drain_seconds,
@@ -1759,12 +2222,75 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             entry.update({"executors_allowed": min(max_executors, allowed.get(model, 1)),
                           "expected_audits": None if expected is None else round(expected),
                           "items_per_second": rate, "executors_wanted": wanted,
+                          "audit_tokens_per_second": None if tokens is None else tokens[0],
+                          "audit_prompt_tokens_per_second": None if tokens is None else tokens[1],
                           "executors": live, "idle_executors": idle, "releasing": releasing})
             if wanted:
                 entry["executors_needed"] = max(entry.get("executors_needed", 0), wanted - len(live))
         sizing.forget({f"{m[0]}@{m[1]}" for m in backlog})
         dispatcher.set_releasing(released)
+        sandbox_jobs(document, statuses)
         return document
+
+    def sandbox_jobs(document: dict, statuses: dict[str, dict]) -> None:
+        """Per served signed episode order, what its sandbox gateways are sized from (`order_sandbox_status`)."""
+        from reliquary.validator.order_sandbox_status import (
+            FLEET_FULL_WINDOW_S, activity_by_hotkey, book_sessions, held_by_hotkey, job_demand, sandbox_status,
+        )
+
+        episodes = [w for w in list(served.values()) if w.job.episode is not None and is_signed_sandbox(w.job)]
+        if sandbox is None or not episodes:
+            return
+        now = int(clock())
+        try:
+            sessions = book_sessions(sandbox.book, now)
+            holders = held_by_hotkey(sandbox.book, now)
+            shown = activity_by_hotkey(sandbox.book, now)
+        except Exception:
+            logger.warning("sandbox status: the session book is unreadable", exc_info=True)
+            return
+        quota = getattr(sandbox, "quota", None)
+        declarations: dict = {}
+        if quota is not None and hasattr(quota, "declarations"):
+            try:
+                declarations = quota.declarations(now)
+            except Exception:
+                logger.warning("sandbox status: the declared wants are unreadable", exc_info=True)
+        for w in episodes:
+            sandbox_models[str(w.job.job_id)] = (w.job.checkpoint_repo, w.job.checkpoint_revision)
+        for job_id in [j for j in sandbox_models if j not in declarations and j not in served]:
+            del sandbox_models[job_id]                    # nothing left to forecast from
+        serving = {str(w.job.job_id) for w in episodes}
+
+        def low_yield(hotkey: str) -> bool:
+            try:
+                return quota is not None and quota.lane(hotkey) == "low_yield"
+            except Exception:
+                return False
+
+        for w in episodes:
+            job_id, job = str(w.job.job_id), w.job
+            model = (job.checkpoint_repo, job.checkpoint_revision)
+            held, finished = sessions.get(job_id, (0, []))
+            tokens = getattr(w, "episode_tokens", None)
+            try:
+                entry = document["jobs"].setdefault(
+                    job_id, {"needs_attention": False, "parked_batches": 0, "reasons": []})
+                sizing_of = document["models"].get(f"{model[0]}@{model[1]}", {})
+                share = getattr(getattr(w, "auditor", None), "audit_share", None)
+                entry["sandbox"] = sandbox_status(
+                    job=job, status=statuses.get(job_id),
+                    reopens=bool(getattr(w.auditor, "reopen_slots", False)), held=held, finished=finished,
+                    tokens_per_episode=None if tokens is None else tokens.mean(),
+                    tokens_per_second=dispatcher.tokens_per_second(model),
+                    executors_wanted=sizing_of.get("executors_wanted"),
+                    fleet_refusals=0 if quota is None else quota.fleet_refusals(job_id, now, FLEET_FULL_WINDOW_S),
+                    demand=job_demand(job_id, now=now, declarations=declarations, held=holders, activity=shown,
+                                      model_of=sandbox_models, served=serving, excluded=low_yield),
+                    executors_allowed=sizing_of.get("executors_allowed"),
+                    audit_share=share() if callable(share) else None)
+            except Exception:
+                logger.warning("sandbox status of %s unavailable", job_id, exc_info=True)
 
     app.state.control_status = control_status
     app.state.corpus_jobs = job_set
@@ -1791,7 +2317,6 @@ async def run_eval_control(*, netuid: int, http_host: str, http_port: int,
         verify_corpus_signature,
         verify_corpus_skip_signature,
     )
-    from reliquary.validator.corpus_validator import JUDGE_POOL_CONNECTIONS
     registered = None
     if registration_gate:
         from reliquary.validator.corpus_registration import (
@@ -1827,16 +2352,23 @@ async def run_eval_control(*, netuid: int, http_host: str, http_port: int,
         registration=registered.reason if registered is not None else None)
     job_set = None
     archives = OrderArchives(served=lambda: job_set.task_ids() if job_set else ())
+    # RELIQUARY_ORDER_SPLIT_JUDGE=1: non-episode orders are judged and paid in a child process.
+    from reliquary.validator.order_judge import OrderJudgeFront, order_judge_enabled
+
+    order_judge = (OrderJudgeFront.from_env(
+        dispatcher=dispatcher, coldkeys=registered.coldkeys if registered is not None else None)
+        if order_judge_enabled() else None)
     app, job_set = build_eval_control(
-        # Every order's auditors and the miners' intake share these connections: the corpus
-        # validator's pool, not botocore's 10.
-        store=BucketJobStore(), records=BucketRecordStore(max_pool_connections=JUDGE_POOL_CONNECTIONS),
+        # Every order's auditors and the miners' intake share these connections (`ORDER_POOL_CONNECTIONS`).
+        store=BucketJobStore(), records=BucketRecordStore(max_pool_connections=ORDER_POOL_CONNECTIONS),
         dispatcher=dispatcher,
         directory=directory, verify_signature=verify_corpus_signature,
         verify_skip_signature=verify_corpus_skip_signature, qualifications=qualifications,
         registration=registered.reason if registered is not None else None,
+        operator_of=registered.coldkey if registered is not None else None,
         settle_archives=archives, read_entries=read_entries,
-        refresh_every_seconds=refresh_every_seconds or 60.0, sandbox=sandbox, sandbox_down=sandbox_down)
+        refresh_every_seconds=refresh_every_seconds or 60.0, sandbox=sandbox, sandbox_down=sandbox_down,
+        order_judge=order_judge)
 
     async def refresh_qualifications():
         while True:
@@ -1853,10 +2385,14 @@ async def run_eval_control(*, netuid: int, http_host: str, http_port: int,
         background.append(registered.refresh_forever())
     if sandbox is not None:
         background.extend(sandbox.background())
+    if order_judge is not None:
+        background.append(order_judge.run())
     server = uvicorn.Server(uvicorn.Config(app, host=http_host, port=http_port, log_level="info"))
     try:
         await asyncio.gather(server.serve(), *background)
     finally:
+        if order_judge is not None:
+            order_judge.stop()
         if sandbox is not None:
             await sandbox.stop()
 
@@ -1932,13 +2468,29 @@ def _verify_environment(env: str) -> None:
                          f"catalog's {pinned}")
 
 
+def _verify_rl_environment(env: str) -> None:
+    """An env a training order may name, loadable by its RL controller: an
+    external one's package installed at the version and artifact the registry
+    pins; a built-in one is checked against its manifest at import."""
+    from reliquary.environment.agentic.external import verify_external_artifact
+    from reliquary.environment.registry import ENVIRONMENT_SPECS
+
+    spec = ENVIRONMENT_SPECS[env]
+    if spec.external_distribution is not None:
+        verify_external_artifact(spec)
+
+
 def order_control_runtime_check() -> dict:
     """Everything the order control needs at runtime, checked without a GPU
-    or a network: ``{"imports", "environments", "ok"}``, each entry "ok" or
-    why not (`reliquary corpus order-control-check`, run at image build)."""
+    or a network: ``{"imports", "environments", "rl_environments", "ok"}``,
+    each entry "ok" or why not (`reliquary corpus order-control-check`, run
+    at image build). ``rl_environments``: every env a training order may
+    name (``admin.training.trainable_environments``), for the RL controllers
+    `reliquary rl supervise` runs from the same image."""
+    from reliquary.admin.training import trainable_environments
     from reliquary.eval.qualification import ORDER_ENVIRONMENTS
 
-    report: dict[str, Any] = {"imports": {}, "environments": {}}
+    report: dict[str, Any] = {"imports": {}, "environments": {}, "rl_environments": {}}
     for name in ORDER_CONTROL_IMPORTS:
         try:
             _import(name)
@@ -1951,7 +2503,13 @@ def order_control_runtime_check() -> dict:
             report["environments"][env] = "ok"
         except Exception as exc:
             report["environments"][env] = f"{type(exc).__name__}: {exc}"
-    report["ok"] = all(v == "ok" for part in ("imports", "environments")
+    for env in trainable_environments():
+        try:
+            _verify_rl_environment(env)
+            report["rl_environments"][env] = "ok"
+        except Exception as exc:
+            report["rl_environments"][env] = f"{type(exc).__name__}: {exc}"
+    report["ok"] = all(v == "ok" for part in ("imports", "environments", "rl_environments")
                        for v in report[part].values())
     return report
 
@@ -1965,6 +2523,7 @@ __all__ = [
     "BatchParked",
     "OrderArchives",
     "build_order_control",
+    "wire_order_judge",
     "order_control_runtime_check",
     "qualification_refusal",
     "pinned_order_refusal",

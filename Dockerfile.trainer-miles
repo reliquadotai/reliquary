@@ -1,0 +1,47 @@
+# The async RL trainer on a Miles Tinker gateway (RELIQUARY_TRAINER_BACKEND=miles).
+#
+# Two Pythons, one reliquary source (/opt/reliquary):
+# * the image's Python runs the gateway: Miles (the reliquadotai/miles fork, branch ``reliquary``), Megatron, Ray,
+#   and reliquary installed without dependencies (the reliquary_gate loss imports its constants and Gumbel noise);
+# * /opt/trainer-venv runs ``reliquary train-async``: reliquary's full runtime (bittensor for the signed checkpoint
+#   index, boto3 for R2, wandb) on CPU torch. The trainer holds no GPU; the gateway holds them all.
+# At start the trainer refuses a gateway whose reliquary would judge differently (``check_gateway_constants``).
+# No RELIQUARY_MILES_* is needed beyond the ones below: card count, TP, model type, flags and chunk have defaults
+# (``trainer/miles_gateway.py``), and the protocol profile comes from the controller (``/rl/trainer/config``).
+#
+#   docker build -f Dockerfile.trainer-miles -t reliquary-trainer-miles:<tag> .
+ARG MILES_IMAGE=radixark/miles:dev-202611142055
+FROM ${MILES_IMAGE}
+
+ARG MILES_REPO=https://github.com/reliquadotai/miles.git
+ARG MILES_COMMIT=df9efc86cd7559d4d68b8b066206759932b6df32
+
+ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# The fork in place of the image's checkout (the image imports miles from /root/miles).
+RUN rm -rf /root/miles \
+ && git clone --filter=blob:none "${MILES_REPO}" /root/miles \
+ && git -C /root/miles checkout --detach "${MILES_COMMIT}"
+
+COPY . /opt/reliquary
+
+# Gateway side: Miles' stack stays as the image built it. miles-python execs it (a symlink would lose its venv).
+RUN pip install --no-deps -e /opt/reliquary \
+ && pip install "tinker==0.36.0" \
+ && printf '#!/bin/sh\nexec %s "$@"\n' "$(command -v python)" > /usr/local/bin/miles-python \
+ && chmod +x /usr/local/bin/miles-python \
+ && miles-python -c "import torch, miles, reliquary.trainer.miles_gateway"
+
+# Trainer side: reliquary's pinned runtime in its own venv, CPU torch.
+RUN pip install uv \
+ && uv venv -p 3.12 /opt/trainer-venv \
+ && uv pip install --python /opt/trainer-venv/bin/python torch==2.7.0 --index-url https://download.pytorch.org/whl/cpu \
+ && uv pip install --python /opt/trainer-venv/bin/python -e "/opt/reliquary[miles]" boto3 wandb
+
+ENV RELIQUARY_TRAINER_BACKEND=miles \
+    RELIQUARY_MILES_LAUNCHER=/root/miles/scripts/run_reliquary_tinker.py \
+    RELIQUARY_MILES_PYTHON=/usr/local/bin/miles-python \
+    RELIQUARY_MILES_OUTPUT_DIR=/root/trainer/miles
+
+ENTRYPOINT ["/opt/trainer-venv/bin/reliquary"]
+CMD ["train-async"]

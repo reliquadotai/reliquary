@@ -47,8 +47,12 @@ def resolve_task_config(
     *,
     profile_id: str,
     generation_contract: Any,
+    allow_retired_training: bool = False,
 ) -> TaskConfig:
-    """This task's settings, or a refusal naming exactly what disagrees."""
+    """This task's settings, or a refusal naming exactly what disagrees.
+
+    ``allow_retired_training``: an async controller may boot on a retired training order's task, to settle its
+    last period (it leases nothing)."""
     try:
         validate_registry(entries)
     except RegistryError as exc:
@@ -60,7 +64,8 @@ def resolve_task_config(
         raise TaskConfigError(
             f"task {task_id!r} is not declared in the registry (declared: {declared})"
         )
-    if entry.status != "active":
+    settling = (allow_retired_training and entry.status == "retired" and "training_order" in entry.params)
+    if entry.status != "active" and not settling:
         raise TaskConfigError(f"task {task_id!r} is {entry.status}, not active")
     if entry.profile_id != profile_id:
         raise TaskConfigError(

@@ -205,7 +205,7 @@ class _StubRenderer:
 
     def _token_id(self, name):
         return {"<tool_response>": 3, "</tool_response>": 4, "<|im_start|>": 5,
-                "<think>": 6, "</think>": 7}[name]
+                "<think>": 6, "</think>": 7, "<|im_end|>": 8}[name]
 
     def render(self, messages, tools, add_generation_prompt):
         self.rendered.append((messages, tools))

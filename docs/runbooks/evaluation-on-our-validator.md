@@ -97,7 +97,7 @@ Miners need a build that knows eval-set jobs (main at or after the merge of this
 runbook's PR):
 
 ```bash
-reliquary corpus mine --validator-url http://<validator>:<port> --job-id <job> ...
+reliquary corpus mine --validator-url https://api.reliqua.ai --job-id <job> ...
 ```
 
 Follow it with `reliquary jobs status <job>` until `drained: yes`.
@@ -298,7 +298,7 @@ reliquary jobs create --fleet-knows-corpus-generation \
   them at `/corpus/jobs/<job>/eval-prompts`; miners fetch them there.
 - Miners need a release containing this branch; an older release refuses the
   manifest (unknown `prompt_source`), by design. They mine with
-  `reliquary corpus mine-agentic --validator-url http://<validator>:<port> --job-id <job> ...`
+  `reliquary corpus mine-agentic --validator-url https://api.reliqua.ai --job-id <job> ...`
   (needs only the environment's pinned wheel).
 - Validator: section 3, on a Lium card holding the checkpoint
   (`RELIQUARY_TASK_ID=<job>`, the job's contract, `reliquary validate ...`).
@@ -337,11 +337,17 @@ Before the first run, in order:
    miner would mine the wrong rows), `jobs create --eval-set ... --episode-file ...`,
    miners with `mine-agentic --validator-hotkey <validator-ss58>`, validator on a
    card, `eval grade`, `eval compare`, retire, stop.
+   Rows no box can pass (tests that need the internet: our boxes have none) leave the
+   sample with `build-set --exclude-file <{instance id: reason}.json>`: they are dropped
+   before sampling and listed on the card (`selection.exclude`).
+
 
 ## 9. Other bridged envs: TMax `tmax_sft` (signed sandbox)
 
 **Status: not run yet.** An eval job may run a bridged env other than `reliquary-swe`
-(`corpus.job.BRIDGED_EVAL_PACKAGES`, today `reliquary-terminal`): signed sandbox and
+(`corpus.job.BRIDGED_EVAL_PACKAGES`: `reliquary-terminal`, `reliquary-deepswe` (see
+`docs/design/2026-11-12-deepswe-automationbench.md`), `reliquary-swebench-pro` and
+`reliquary-nl2repo` (see `docs/design/2026-11-13-swebench-pro-nl2repo.md`)): signed sandbox and
 eval only. Its episode carries `bridge`, the options its gateway serves the env with
 and the digest of its image lock, and every side reads the env through
 `BridgedEpisodeSource`, as an RL run does. The contract environment is

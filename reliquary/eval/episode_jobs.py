@@ -7,11 +7,16 @@ import hashlib
 from collections.abc import Mapping
 
 # The turn renderer a signed episode order plays with, by model architecture: only the
-# Qwen3.5/3.8 family has one (`renderers:qwen38`).
+# Qwen3.5/3.8 family has one (`renderers:qwen38`). Its MoE (Qwen3.5/3.6-35B-A3B) shares
+# the family's tokenizer byte for byte, so it renders the same IDs.
 EPISODE_RENDERER_FAMILIES = {
     "Qwen3_5ForConditionalGeneration": "renderers:qwen38@",
     "Qwen3_5ForCausalLM": "renderers:qwen38@",
+    "Qwen3_5MoeForConditionalGeneration": "renderers:qwen38@",
 }
+# A suite episode (a replayed tool world) renders through Catalyst's own ChatML tools
+# renderer, the one its registry spec names; served for the same model family.
+SUITE_EPISODE_RENDERERS = frozenset({"reliquary-chatml-tools-v1"})
 
 
 def set_contract_environment(card: Mapping) -> str:
@@ -30,19 +35,57 @@ def set_contract_environment(card: Mapping) -> str:
     return contract_environment_for(card)
 
 
-def episode_renderer_refusal(architecture: str | None, renderer: str | None) -> str | None:
-    """Why a model of ``architecture`` cannot play an episode rendered by ``renderer``, or None."""
+def episode_renderer_refusal(architecture: str | None, renderer: str | None, *,
+                             suite: bool = False) -> str | None:
+    """Why a model of ``architecture`` cannot play an episode rendered by ``renderer``, or None.
+    ``suite``: a suite episode, rendered by one of ``SUITE_EPISODE_RENDERERS``."""
     family = EPISODE_RENDERER_FAMILIES.get(str(architecture))
     if family is None:
         return (f"episode_renderer_unavailable: no episode renderer serves {architecture!r} "
                 f"(only {sorted(EPISODE_RENDERER_FAMILIES)})")
+    if suite:
+        if renderer not in SUITE_EPISODE_RENDERERS:
+            return (f"episode_renderer_mismatch: a suite episode renders through "
+                    f"{sorted(SUITE_EPISODE_RENDERERS)}, not {renderer!r}")
+        return None
     if not str(renderer or "").startswith(family):
         return f"episode_renderer_mismatch: {architecture!r} plays {family}*, not {renderer!r}"
     return None
 
 
+def prompt_budget_refusal(card, *, model, revision, renderer_id, count, max_prompt_tokens):
+    """The selected prefix's measured length applies only to its own model revision and renderer."""
+    from reliquary.miner.corpus_miner import PROMPT_ALLOWANCE_TOKENS
+
+    measured = card.get("prompt_tokens")
+    if (card.get("interaction", "single_turn") != "single_turn" or not isinstance(measured, dict)
+            or not revision or measured.get("revision") != revision or measured.get("tokenizer") != model
+            or measured.get("renderer_id") != renderer_id):
+        return None
+    lengths = measured.get("per_problem")
+    if lengths is not None:
+        if not isinstance(lengths, list) or len(lengths) != card.get("count"):
+            return "prompt_measurements_invalid: expected one token count per frozen prompt"
+        prefix = lengths[:count]
+        if any(type(length) is not int or length <= 0 for length in prefix):
+            return "prompt_measurements_invalid: expected positive token counts"
+        longest = max(prefix)
+    elif count == card.get("count") and "max" in measured:
+        longest = measured["max"]
+        if type(longest) is not int or longest <= 0:
+            return "prompt_measurements_invalid: expected a positive maximum"
+    else:
+        # A whole-set maximum cannot prove that a shorter prefix exceeds its allowance.
+        return None
+    allowance = max(PROMPT_ALLOWANCE_TOKENS, max_prompt_tokens or 0)
+    if longest > allowance:
+        return f"max_prompt_tokens_too_small: the selected prompts need {longest} tokens, the job reserves {allowance}"
+    return None
+
+
 def eval_job_source(*, job_id, eval_set, prompt_count, prompt_start, renderer_id, audit_q,
-                    grader_id, threshold, from_profile, episode=None):
+                    grader_id, threshold, from_profile, episode=None, model=None, revision=None,
+                    max_prompt_tokens=None):
     """What an evaluation job served by our own validator is declared from: the
     set's first N problems as its prompt source (checked against the lines'
     sha256), the set's environment as its contract's, a seed from its id.
@@ -51,10 +94,12 @@ def eval_job_source(*, job_id, eval_set, prompt_count, prompt_start, renderer_id
     A set of episode or SWE tasks is references: the job is the episode job
     (``episode``, from ``--episode-file``) that plays them, at the set's split."""
     from reliquary.eval.prompt_source import eval_source_for, register_eval_prompts
+    from reliquary.eval.protocol import validate_set
     from reliquary.eval.storage import read_published_set
     from reliquary.validator.corpus_service import CHAT_TEMPLATE_RENDERERS
 
     card, prompts = read_published_set(eval_set)
+    validate_set(card, current_grader=True)
     interaction = card.get("interaction", "single_turn")
     if interaction == "single_turn":
         if episode is not None:
@@ -78,6 +123,10 @@ def eval_job_source(*, job_id, eval_set, prompt_count, prompt_start, renderer_id
     count = int(card["count"]) if prompt_count is None else int(prompt_count)
     if not 1 <= count <= int(card["count"]):
         raise ValueError(f"set {eval_set} holds {card['count']} problems, not {count}")
+    refusal = prompt_budget_refusal(card, model=model, revision=revision, renderer_id=renderer_id,
+                                   count=count, max_prompt_tokens=max_prompt_tokens)
+    if refusal:
+        raise ValueError(refusal)
     source = eval_source_for(eval_set, prompts, count)
     register_eval_prompts(source, prompts)
     seed = int(hashlib.sha256(job_id.encode()).hexdigest()[:15], 16)
@@ -132,5 +181,5 @@ def refuse_episode_disagreeing_with_set(card, eval_set, episode, renderer_id):
                          f"{episode.get('renderer')!r}, the set {card.get('renderer_id')!r}")
 
 
-__all__ = ["EPISODE_RENDERER_FAMILIES", "episode_renderer_refusal", "eval_job_source",
+__all__ = ["EPISODE_RENDERER_FAMILIES", "SUITE_EPISODE_RENDERERS", "episode_renderer_refusal", "eval_job_source",
            "refuse_episode_disagreeing_with_set", "set_contract_environment"]

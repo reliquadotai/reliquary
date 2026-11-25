@@ -112,8 +112,8 @@ class PayWeights:
     """
 
     def __init__(self, base_url: str, *, fetch: Callable[[str], Any] = _http_get_json,
-                 clock: Callable[[], float] = time.monotonic, background: bool = True) -> None:
-        self._url = base_url.rstrip("/") + "/rl/pay"
+                 clock: Callable[[], float] = time.monotonic, background: bool = True, prefix: str = "/rl") -> None:
+        self._url = base_url.rstrip("/") + prefix + "/pay"
         self._fetch, self._clock, self._background = fetch, clock, background
         self._value: dict[str, float] | None = None
         self._at: float | None = None

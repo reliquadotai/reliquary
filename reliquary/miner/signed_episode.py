@@ -34,7 +34,14 @@ errors carry exception types and statuses, never a request body.
 Live sessions. A validator running the corpus quota names the hotkey's `allowance` (the sessions it may hold at
 once: its fair share of the fleet) on every grant and in its quota refusals; the runner then holds up to
 `min(max_live, allowance)` sessions at once (at least one), growing and shrinking with it. A validator that names
-none keeps the runner at `LEGACY_ALLOWANCE` (its fixed per-job cap)."""
+none keeps the runner at `LEGACY_ALLOWANCE` (its fixed per-job cap).
+
+Declared want. The allowance follows the fleet, so a miner that only ever grows to it never shows the validator how
+many sessions its GPU could run. Once the validator says it reads a declaration (`declares_want` on a grant or a
+quota refusal), every open carries the runner's `want` (its batch: `max_live` unless told less) in its signed
+engagement; the order control sizes the sandbox fleet from it (design 2026-11-13-sandbox-sizing-miner-demand). An
+older validator never sees the field (it refuses unknown ones): an open with a want refused `malformed_request`
+(the validator rolled back) turns the declaration off and is sent again without it, under a fresh request id."""
 
 from __future__ import annotations
 
@@ -50,16 +57,14 @@ from typing import Any
 
 from reliquary.miner.agentic_episode import EpisodeResult
 from reliquary.miner.corpus_miner import retry_after_seconds
-from reliquary.protocol.sandbox_session import (
-    SessionRefused, sandbox_close_path, sandbox_open_path,
+from reliquary.protocol.sandbox_session import (  # noqa: F401  (the deadline constants are re-exported)
+    GRADING_GRACE_S, MAX_SESSION_WANT, OPEN_WINDOW_S, SUBMIT_MARGIN_S, WANT_ACCEPTED, SessionRefused,
+    sandbox_close_path, sandbox_open_path, signed_episode_deadline,
 )
 from reliquary.protocol.signatures import build_sandbox_close_binding, build_sandbox_open_binding
 
 logger = logging.getLogger(__name__)
 
-OPEN_WINDOW_S = 900
-GRADING_GRACE_S = 1800
-SUBMIT_MARGIN_S = 120
 SS58_FORMAT = 42
 THROTTLED = frozenset({429, 503})
 DEFAULT_RETRY_AFTER_S = 10.0
@@ -151,10 +156,12 @@ class HttpSandboxSessions:
 
 def signed_open_request(*, hotkey: str, job_id: str, prompt_index: int,
                         sign_binding: Callable[[bytes], str], now: float, request_id: str,
-                        validator_hotkey: str, path: str) -> dict:
+                        validator_hotkey: str, path: str, want: int | None = None) -> dict:
+    engagement = {"kind": "corpus", "job_id": job_id, "prompt_index": int(prompt_index)}
+    if want is not None:                     # only to a validator that reads it (`WANT_ACCEPTED`)
+        engagement["want"] = max(1, min(MAX_SESSION_WANT, int(want)))
     body = {"miner_hotkey": hotkey, "request_id": request_id, "at": int(now),
-            "engagement": {"kind": "corpus", "job_id": job_id, "prompt_index": int(prompt_index)},
-            "signature": ""}
+            "engagement": engagement, "signature": ""}
     body["signature"] = sign_binding(build_sandbox_open_binding(
         body, validator_hotkey=validator_hotkey, path=path))
     return body
@@ -226,13 +233,20 @@ def transcript_refusal(transcript: Any, *, job, hotkey: str, index: int,
     spec = job.episode.sandbox
     # The engagement names the row; the session token names the task it runs.
     task = job_row_map(job).ref(int(index))
+    from reliquary.corpus.job import model_closed, scores_model_closes
+
+    # A profile's model-budget close is submitted too (a scored 0): its final is not `graded`.
+    graded_only = not scores_model_closes(job.episode)
     expected = Expected(hotkey=hotkey, engagement=corpus_engagement(job.job_id, index),
                         env=spec.env, split=task.split, index=task.index,
-                        checkpoint=job.checkpoint_sha256, require_graded=True)
+                        checkpoint=job.checkpoint_sha256, require_graded=graded_only)
     result = verify_transcript(transcript, _NoKeys(), _claims_of, expected)
     reasons = [reason.value for reason in result.reasons if reason is not Reason.UNKNOWN_KEY]
     if reasons:
         return REASON_SANDBOX_TRANSCRIPT, {"reasons": reasons}
+    if not graded_only and result.final.status != "graded" and not model_closed(
+            job.episode, result.final.status, result.final.reason):
+        return REASON_SANDBOX_TRANSCRIPT, {"final": result.final.status, "reason": result.final.reason}
     deadline = result.claims.expires_at + GRADING_GRACE_S
     if now > deadline:
         return REASON_SANDBOX_EXPIRED, {"now": int(now), "deadline": deadline}
@@ -349,7 +363,8 @@ class SignedSweEpisodeRunner:
                  new_request_id: Callable[[], str] = lambda: uuid.uuid4().hex,
                  sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
                  monotonic: Callable[[], float] = time.monotonic,
-                 max_live: int = DEFAULT_MAX_LIVE_PER_JOB, harness=None, variant: int = 0) -> None:
+                 max_live: int = DEFAULT_MAX_LIVE_PER_JOB, harness=None, variant: int = 0,
+                 want: int | None = None) -> None:
         from reliquary.environment.agentic_swe import job_harness, job_signed_source
 
         if ss58_format_42(hotkey) != hotkey:
@@ -383,6 +398,10 @@ class SignedSweEpisodeRunner:
         self._runners_lock = asyncio.Lock()
         self._stack = AsyncExitStack()
         self._max_live = int(max_live)
+        # The live sessions this hotkey wants on the job (its batch), declared once the validator reads it.
+        self.want = max(1, min(self._max_live, MAX_SESSION_WANT, int(want or self._max_live)))
+        self.declares_want = False
+        self._wants: dict[str, int] = {}       # request id -> the want its engagement declares (resent unchanged)
         self.allowance: int | None = None      # the validator's last announced allowance (None: never named)
         self._live = _LiveLimit(min(self._max_live, LEGACY_ALLOWANCE) if self.follows_allowance
                                 else self._max_live)
@@ -414,8 +433,7 @@ class SignedSweEpisodeRunner:
 
     def deadline(self, index: int) -> float:
         """Open, the agent's wall budget, grading inside the verification window, submit."""
-        return float(OPEN_WINDOW_S + self._job.episode.sandbox.budgets.wall_s
-                     + GRADING_GRACE_S + SUBMIT_MARGIN_S)
+        return signed_episode_deadline(self._job.episode.sandbox.budgets.wall_s)
 
     def _default_runner(self, url: str):
         from reliquary.miner.harness_episode import HarnessEpisodeRunner
@@ -445,12 +463,22 @@ class SignedSweEpisodeRunner:
         while (wait := self._not_before - self._monotonic()) > 0:
             await self._sleep(wait)
 
+    def _declared_want(self) -> int | None:
+        """What a new open declares: the want, once the validator reads it (a corpus allowance follower only)."""
+        return self.want if self.follows_allowance and self.declares_want else None
+
     def _open_body(self, index: int, request_id: str) -> dict:
         return signed_open_request(hotkey=self._hotkey, job_id=self._job.job_id,
                                    prompt_index=index, sign_binding=self._sign,
                                    now=self._clock(), request_id=request_id,
                                    validator_hotkey=self._validator,
-                                   path=sandbox_open_path(self._prefix))
+                                   path=sandbox_open_path(self._prefix), want=self._wants.get(request_id))
+
+    def _note_declares(self, answer: Mapping) -> None:
+        if answer.get(WANT_ACCEPTED) is True and not getattr(self, "declares_want", False):
+            self.declares_want = True
+            logger.info("the validator reads %s's declared want on job %s", self._hotkey[:12],
+                        getattr(self._job, "job_id", "?"))
 
     def _note_allowance(self, value: Any) -> None:
         """The validator named the sessions this hotkey may hold at once: the live limit follows it (within
@@ -472,6 +500,7 @@ class SignedSweEpisodeRunner:
         detail = refused.detail if isinstance(refused.detail, Mapping) else {}
         if "allowance" in detail:
             self._note_allowance(detail.get("allowance"))
+        SignedSweEpisodeRunner._note_declares(self, detail)
         if refused.retry_after:
             self._hold_opens(refused.retry_after)
         else:
@@ -516,6 +545,7 @@ class SignedSweEpisodeRunner:
         for lost in list(self._unconfirmed):
             if self._monotonic() > lost.give_up_at:
                 self._unconfirmed.remove(lost)
+                self._wants.pop(lost.request_id, None)
                 lost.slot.free()
                 continue
             try:
@@ -526,6 +556,7 @@ class SignedSweEpisodeRunner:
             except Exception:
                 continue                     # still unreachable: kept
             self._unconfirmed.remove(lost)
+            self._wants.pop(lost.request_id, None)
             if isinstance(grant, Mapping) and "session_id" in grant:
                 await self._close(str(grant["session_id"]), "open_failed", None)
             lost.slot.free()
@@ -540,10 +571,20 @@ class SignedSweEpisodeRunner:
         """One signed open of `index`, resent (same request id) after transport errors; a refusal
         moves the gate (`_note_refusal`) and is raised."""
         request_id = self._new_request_id()
+        want = self._declared_want()
+        if want is not None:
+            self._wants[request_id] = want
         for attempt in range(OPEN_ATTEMPTS):
             try:
                 grant = await self._send_open(self._open_body(index, request_id))
             except SessionRefused as refused:
+                declared = self._wants.pop(request_id, None)
+                if declared is not None and refused.reason == "malformed_request":
+                    # The validator no longer reads the field (a rollback): stop declaring, send it again.
+                    self.declares_want = False
+                    logger.warning("the validator refused %s's declared want on job %s: no longer declaring it",
+                                   self._hotkey[:12], getattr(self._job, "job_id", "?"))
+                    return await self._send_attempts(index, slot)
                 if attempt:
                     await self._close_reused(refused)
                 raise self._note_refusal(refused) from None
@@ -555,8 +596,11 @@ class SignedSweEpisodeRunner:
                     await self._sleep(2.0 ** attempt)
                 continue
             self._backoff = self._unavailable = 0
+            self._wants.pop(request_id, None)
             if isinstance(grant, Mapping) and "allowance" in grant:
                 self._note_allowance(grant.get("allowance"))
+            if isinstance(grant, Mapping):
+                self._note_declares(grant)
             return grant
         slot.keep = True
         self._unconfirmed.append(_Unconfirmed(
@@ -682,8 +726,12 @@ class SignedSweEpisodeRunner:
             return EpisodeResult(trace_id, "", stop, False, None, error=error,
                                  final_status=status if status != "graded" else None)
 
-        exhausted = (self.takes_budget_exhausted and status == "budget_exhausted" and not result.error
-                     and stop == "episode_closed")
+        from reliquary.corpus.job import model_closed
+
+        # An RL lease takes every budget close; an eval profile the model's own (a scored 0).
+        exhausted = ((self.takes_budget_exhausted or model_closed(
+                         getattr(getattr(self, "_job", None), "episode", None), status, final.get("reason")))
+                     and status == "budget_exhausted" and not result.error and stop == "episode_closed")
         if result.error or (status != "graded" and not exhausted):
             # Unpaid: not graded, or the run did not complete (a gateway close raised
             # as EpisodeClosed is a run error).

@@ -53,10 +53,22 @@ def episode_protocol(episode) -> dict:
     and the bounds. Machine and sandbox pins are left out (they do not change a grade)."""
     env = episode.env
     spec = episode.harness_spec
-    return {"env": f"{env.package}@{env.version}", "split": env.split,
-            "harness": f"{spec['id']}@{spec['version']}" if spec else episode.harness,
-            "renderer": episode.renderer, "max_turns": episode.max_turns,
-            "max_tokens_per_turn": episode.max_tokens_per_turn, "max_total_tokens": episode.max_total_tokens}
+    protocol = {"env": f"{env.package}@{env.version}", "split": env.split,
+                "harness": f"{spec['id']}@{spec['version']}" if spec else episode.harness,
+                "renderer": episode.renderer, "max_turns": episode.max_turns,
+                "max_tokens_per_turn": episode.max_tokens_per_turn,
+                "max_total_tokens": episode.max_total_tokens}
+    from reliquary.corpus.job import limit_cuts_fail
+
+    if getattr(episode, "profile", None) is not None:
+        protocol["profile"] = episode.profile
+    if limit_cuts_fail(episode):
+        # Limits that score (a profile, or limits stated directly): its command timeout, call
+        # and wall budgets bound the score too; a run a model limit cut scored 0.
+        budgets = episode.sandbox.budgets
+        protocol.update(limit_cut_fails=True, per_call_timeout_s=budgets.per_call_timeout_s,
+                        max_calls=budgets.max_calls, wall_s=budgets.wall_s)
+    return protocol
 
 
 async def _thresholds(job_id: str, entries: Callable | None) -> tuple[str | None, dict | None]:

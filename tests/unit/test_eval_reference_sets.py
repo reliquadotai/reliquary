@@ -162,6 +162,62 @@ def test_build_source_set_swe(tmp_path, monkeypatch):
     assert all(p["interaction"] == "swe" and p["split"] == "train" for p in prompts)
 
 
+def _fake_swe(monkeypatch, length=50):
+    monkeypatch.setattr(bridged_swe, "split_length", lambda split: length)
+    monkeypatch.setattr(bridged_swe, "instance_id_of", lambda split, i: f"repo__x-{i}")
+    monkeypatch.setattr(bridged_swe, "package_version", lambda: "9.9.9")
+
+
+def test_an_exclusion_leaves_the_range_before_sampling(tmp_path, monkeypatch):
+    import random
+
+    _fake_swe(monkeypatch)
+    exclude = {"repo__x-3": "needs network", "repo__x-0": "image missing"}
+    card = build_source_set("reliquary-swe", split="eval", sample=10, seed=7,
+                            exclude=exclude, out=tmp_path / "s")
+    indices = [p["source_index"] for p in rows_of(tmp_path / "s", "prompts.jsonl")]
+    assert indices == random.Random(7).sample([i for i in range(50) if i not in (0, 3)], 10)
+    assert card["set_id"] == "reliquary-swe-eval-r0-n50-x2-k10-s7"
+    assert card["selection"]["exclude"] == {"repo__x-0": "image missing",
+                                            "repo__x-3": "needs network"}
+    assert list(card["selection"]["exclude"]) == ["repo__x-0", "repo__x-3"]
+    assert "selection.exclude" in card["order"]
+    again = build_source_set("reliquary-swe", split="eval", sample=10, seed=7,
+                             exclude=dict(reversed(exclude.items())), out=tmp_path / "t")
+    assert again["prompts_sha256"] == card["prompts_sha256"]
+
+
+def test_no_exclusion_keeps_the_card_as_it_was(tmp_path, monkeypatch):
+    _fake_swe(monkeypatch)
+    card = build_source_set("reliquary-swe", split="eval", sample=5, seed=7, exclude={},
+                            out=tmp_path / "s")
+    assert card["set_id"] == "reliquary-swe-eval-r0-n50-k5-s7"
+    assert "exclude" not in card["selection"]
+    assert card["order"].startswith("random.Random(seed).sample(index_range, sample)")
+
+
+@pytest.mark.parametrize("exclude, match", [
+    ({"repo__x-99": "gone"}, "not in"),
+    ({"repo__x-1": " "}, "needs a reason"),
+])
+def test_a_bad_exclusion_is_refused(tmp_path, monkeypatch, exclude, match):
+    _fake_swe(monkeypatch)
+    with pytest.raises(ValueError, match=match):
+        build_source_set("reliquary-swe", split="eval", exclude=exclude, out=tmp_path / "s")
+
+
+def test_an_exclusion_too_large_for_the_sample_is_refused(tmp_path, monkeypatch):
+    _fake_swe(monkeypatch, length=5)
+    with pytest.raises(ValueError, match="4 usable rows, fewer than 5"):
+        build_source_set("reliquary-swe", split="eval", sample=5, seed=1,
+                         exclude={"repo__x-2": "broken"}, out=tmp_path / "s")
+
+
+def test_a_single_turn_set_takes_no_exclusion(tmp_path):
+    with pytest.raises(ValueError, match="episode and SWE sets only"):
+        build_source_set("verifiers:fake", exclude={"a": "b"}, out=tmp_path / "s")
+
+
 def test_swe_source_is_exactly_reliquary_swe(tmp_path):
     with pytest.raises(ValueError, match="not a catalog environment"):
         build_source_set("reliquary_swe", out=tmp_path / "s")
@@ -174,3 +230,24 @@ def test_instance_id_of_reads_the_task_data(monkeypatch):
         data=SimpleNamespace(instance_id=f"{split}-{i}")))
     monkeypatch.setattr(bridged_swe, "bridged_env", lambda: env)
     assert bridged_swe.instance_id_of("train", 3) == "train-3"
+
+
+def test_build_set_cli_reads_the_exclude_file(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+
+    _fake_swe(monkeypatch, length=20)
+    exclude = tmp_path / "exclude.json"
+    exclude.write_text(json.dumps({"repo__x-4": "needs network"}))
+    result = CliRunner().invoke(app, ["eval", "build-set", "--source", "reliquary-swe",
+                                      "--split", "eval", "--sample", "5", "--seed", "7",
+                                      "--exclude-file", str(exclude), "--out", str(tmp_path / "s")])
+    assert result.exit_code == 0, result.output
+    card = json.loads((tmp_path / "s" / "set.json").read_text())
+    assert card["selection"]["exclude"] == {"repo__x-4": "needs network"}
+    exclude.write_text("[]")
+    refused = CliRunner().invoke(app, ["eval", "build-set", "--source", "reliquary-swe",
+                                       "--split", "eval", "--exclude-file", str(exclude),
+                                       "--out", str(tmp_path / "t")])
+    assert refused.exit_code == 1 and "JSON object" in refused.output

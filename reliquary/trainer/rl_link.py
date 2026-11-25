@@ -3,7 +3,7 @@
 The buffer, the submissions, the lease book and the prices live in the validator's process (one SQLite file on the
 controller); the trainer runs on its own GPU box, as the window trainer does today. ``TrainerLink`` is the one
 object ``AsyncTrainer`` takes as ``buffer``, ``submissions``, ``book`` and ``prices``: each call is one HTTPS
-request with the bearer token.
+request with the bearer token (plain HTTP only on loopback or with ``RELIQUARY_RL_TRAINER_INSECURE=1``).
 
 Every call retries transport errors, 429 and 5xx with backoff for about ``patience_s`` (a validator restart must not
 cost the trainer its optimizer state), then raises ``TrainerLinkError``. A report whose answer was lost is resent;
@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import base64
 import logging
+import math
+import re
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -32,14 +34,42 @@ class TrainerLinkError(RuntimeError):
         self.status = status
 
 
+INSECURE_ENV = "RELIQUARY_RL_TRAINER_INSECURE"
+
+
+def check_link_url(base_url: str, environ: Mapping[str, str]) -> None:
+    """ValueError unless ``base_url`` is HTTPS, plain HTTP on loopback, or plain HTTP with ``INSECURE_ENV=1``
+    (a private network only)."""
+    import ipaddress
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(base_url)
+    if parts.scheme == "https":
+        return
+    if parts.scheme != "http":
+        raise ValueError(f"the trainer link URL must be https, got {base_url!r}")
+    host = parts.hostname or ""
+    try:
+        loopback = host == "localhost" or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = False
+    if not loopback and str(environ.get(INSECURE_ENV, "")).strip() != "1":
+        raise ValueError(f"the trainer link URL {base_url!r} is plain HTTP off loopback: use https, or set "
+                         f"{INSECURE_ENV}=1 on a private network")
+
+
 class TrainerLink:
     def __init__(self, base_url: str, token: str, *, client=None, prefix: str = "/rl/trainer",
                  patience_s: float = PATIENCE_S, backoff_s: Sequence[float] = BACKOFF_S,
-                 sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic) -> None:
+                 sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
+                 timeout_s: float = 120.0, environ: Mapping[str, str] | None = None) -> None:
+        import os
+
         import httpx
 
+        check_link_url(base_url, os.environ if environ is None else environ)
         self._base = base_url.rstrip("/") + prefix
-        self._client = client or httpx.Client(timeout=httpx.Timeout(120.0, connect=15.0))
+        self._client = client or httpx.Client(timeout=httpx.Timeout(timeout_s, connect=min(15.0, timeout_s)))
         self._headers = {"Authorization": f"Bearer {token}"}
         self._patience, self._backoff, self._sleep, self._clock = patience_s, tuple(backoff_s), sleep, clock
 
@@ -81,6 +111,16 @@ class TrainerLink:
     def config(self) -> dict:
         """``task_id``, ``run`` (the checkpoint index's), ``targets`` (the env mix) and ``latest``."""
         return self._call("GET", "config")
+
+    def runtime(self) -> dict:
+        return self._call("GET", "runtime", patience_s=10.0)
+
+    def runtime_ready(self, identity: Mapping[str, str]) -> dict:
+        return self._call("POST", "runtime/ready", identity, patience_s=10.0)
+
+    def runtime_quiesced(self, identity: Mapping[str, str], latest_checkpoint: int) -> dict:
+        return self._call("POST", "runtime/quiesced", {**identity, "latest_checkpoint": latest_checkpoint},
+                          patience_s=10.0)
 
     def checkpoint(self) -> dict:
         """The validator's signed checkpoint answer (``/rl/checkpoint``'s body, served on the link: the trainer
@@ -134,6 +174,16 @@ class TrainerLink:
         """Tell the validator this trainer is alive (it pays miners for the time the trainer is down)."""
         self._call("POST", "heartbeat", {}, patience_s=patience_s)
 
+    # --- the checkpoint bucket, through the validator's presigned URLs ---------------------------------------------
+    def upload_urls(self, keys: Sequence[str]) -> dict[str, str]:
+        return dict(self._call("POST", "uploads", {"keys": list(keys)})["urls"])
+
+    def read_urls(self, keys: Sequence[str]) -> dict[str, str]:
+        return dict(self._call("POST", "reads", {"keys": list(keys)})["urls"])
+
+    def delete_keys(self, keys: Sequence[str]) -> None:
+        self._call("POST", "deletes", {"keys": list(keys)}, resend_ok=True)
+
     # --- the audits (trainer.audits) ------------------------------------------------------------------------------
     def take_audits(self, limit: int) -> list[SubmittedGroup]:
         """Up to ``limit`` queued out-of-zone audits (the validator drops the stale ones first)."""
@@ -146,7 +196,64 @@ class TrainerLink:
             resend_ok=True)
 
 
-__all__ = ["TrainerLink", "TrainerLinkError"]
+class TrainerRuntime:
+    """The managed worker trusts only fresh answers for its exact supervisor-owned runtime."""
+
+    def __init__(self, link, identity: Mapping[str, str], *, clock=time.time):
+        if set(identity) != {"task_id", "order_sha256", "run_id", "runtime_id"}:
+            raise ValueError("managed training needs an exact runtime identity")
+        if not isinstance(identity["order_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", identity["order_sha256"]):
+            raise ValueError("managed training needs the pinned order digest")
+        if not all(isinstance(v, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}", v)
+                   for k, v in identity.items() if k != "order_sha256"):
+            raise ValueError("invalid managed runtime identity")
+        self.link, self.identity, self.clock = link, dict(identity), clock
+
+    def _accept(self, reply: Any) -> dict:
+        if not isinstance(reply, dict) or reply.get("schema") != "reliquary/training-runtime/v1":
+            raise TrainerLinkError("invalid managed runtime snapshot")
+        if any(reply.get(k) != v for k, v in self.identity.items()):
+            raise TrainerLinkError("managed runtime identity changed")
+        if not all(isinstance(reply.get(k), bool) for k in (
+                "controller_ready", "trainer_ready", "admission_closed", "drain_requested", "trainer_quiesced", "drained")):
+            raise TrainerLinkError("invalid managed runtime state")
+        if ((reply["drain_requested"] and not reply["admission_closed"])
+                or (reply["trainer_quiesced"] and not reply["drain_requested"])
+                or (reply["drained"] and not reply["trainer_quiesced"])):
+            raise TrainerLinkError("inconsistent managed drain state")
+        observed = reply.get("observed_at")
+        if (isinstance(observed, bool) or not isinstance(observed, (int, float)) or not math.isfinite(observed)
+                or not -5 <= self.clock() - observed <= 10):
+            raise TrainerLinkError("stale managed runtime snapshot")
+        latest = reply.get("latest_checkpoint")
+        if latest is not None and (isinstance(latest, bool) or not isinstance(latest, int) or latest < 0):
+            raise TrainerLinkError("invalid managed checkpoint")
+        return reply
+
+    def snapshot(self) -> dict:
+        return self._accept(self.link.runtime())
+
+    def drain_requested(self) -> bool:
+        return self.snapshot()["drain_requested"]
+
+    def ready(self, latest_checkpoint: int) -> None:
+        if isinstance(latest_checkpoint, bool) or not isinstance(latest_checkpoint, int) or latest_checkpoint < 0:
+            raise TrainerLinkError("invalid initialized checkpoint")
+        reply = self._accept(self.link.runtime_ready(self.identity))
+        if (not reply["controller_ready"] or not reply["trainer_ready"] or reply["trainer_quiesced"]
+                or reply["latest_checkpoint"] != latest_checkpoint):
+            raise TrainerLinkError("controller did not acknowledge the initialized trainer")
+
+    def quiesced(self, latest_checkpoint: int) -> None:
+        if isinstance(latest_checkpoint, bool) or not isinstance(latest_checkpoint, int) or latest_checkpoint < 0:
+            raise TrainerLinkError("invalid quiesced checkpoint")
+        reply = self._accept(self.link.runtime_quiesced(self.identity, latest_checkpoint))
+        if (not reply["drain_requested"] or not reply["admission_closed"] or not reply["trainer_quiesced"]
+                or reply["latest_checkpoint"] != latest_checkpoint):
+            raise TrainerLinkError("controller did not acknowledge trainer quiescence")
+
+
+__all__ = ["TrainerLink", "TrainerLinkError", "TrainerRuntime"]
 
 
 class TrainerHeartbeat:
@@ -162,8 +269,12 @@ class TrainerHeartbeat:
         self._thread.start()
         return self
 
-    def stop(self) -> None:
+    def stop(self, timeout_s: float = 35.0) -> None:
         self._stop.set()
+        if self._thread.ident is not None:
+            self._thread.join(timeout_s)
+            if self._thread.is_alive():
+                raise TrainerLinkError("trainer heartbeat has not stopped")
 
     def _run(self) -> None:
         while not self._stop.is_set():

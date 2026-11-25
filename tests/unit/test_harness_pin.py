@@ -74,3 +74,15 @@ def test_a_lease_variant_is_its_nonces_lease_and_prompt_alone():
     assert v(BASH_SURFACE_V1, lease()) == v(BASH_SURFACE_V1, lease(checkpoint=3, hotkey="x"))
     draws = {v(BASH_SURFACE_V1, lease(nonce=f"{i:064x}")) for i in range(64)}
     assert draws == {0, 1, 2, 3}
+
+
+def test_a_contract_at_the_previous_harness_release_is_still_served():
+    """reliquary-harness d680d5e added terminus-2@1 and moved every digest without changing
+    what the earlier specs render: a job pinning one of them at 7d559fd keeps running."""
+    for key, previous in agentic_swe.PREVIOUS_HARNESS_DIGESTS.items():
+        harness_id, version = key.split("@")
+        assert previous != agentic_swe.HARNESS_DIGESTS[key]
+        assert agentic_swe.harness_pin_refusal(
+            {"id": harness_id, "version": version, "digest": previous}, variants=True) is None
+    assert agentic_swe.harness_pin_refusal(
+        {"id": "terminus-2", "version": "1", "digest": "0" * 64}, variants=False) is not None

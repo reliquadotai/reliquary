@@ -80,12 +80,17 @@ from reliquary.validator.rl_lease_quota import QuotaController
 logger = logging.getLogger(__name__)
 
 TAKEN, COOLING, BLACKLISTED, QUOTA, STALE, BANNED = "taken", "cooling", "blacklisted", "quota", "stale", "banned"
+# An auctioned task: no live offer on the env, or an offer above what the env pays now (repost lower).
+NO_ASK, ASK_ABOVE_PRICE = "no_ask", "ask_above_price"
 FULL = "full"     # the global cap: buffered groups reached ``max_pending_groups``
-REFUSALS = frozenset({TAKEN, COOLING, BLACKLISTED, QUOTA, STALE, BANNED, FULL})
+REFUSALS = frozenset({TAKEN, COOLING, BLACKLISTED, QUOTA, STALE, BANNED, FULL, NO_ASK, ASK_ABOVE_PRICE})
+# ``corpus.token_auction``'s refusals as lease answers: an allowance used, or the env's budget out, is ``full``.
+AUCTION_REFUSALS = {"no_ask": NO_ASK, "ask_above_price": ASK_ABOVE_PRICE, "allowance_full": FULL}
 OPEN, SUBMITTED, EXPIRED, RELEASED = "open", "submitted", "expired", "released"
 # Why a lease closed without a submission (``rl_leases.cause``): charged ones, then released ones.
 EXPIRED_CAUSE, FORFEITED, BOX_FAILED_OVER_BUDGET = "expired", "forfeited", "box_failed_over_budget"
 BOX_FAILED = "box_failed"                # a released cause the gateway can also give for the agent's own doing
+ORDER_DRAIN = "order_drain"              # the controller ended the order; never a miner miss or sandbox failure
 DAY_S = 86_400.0
 IN_ZONE, TOO_EASY, TOO_HARD, TRUNCATED = "in_zone", "too_easy", "too_hard", "truncated"
 VERDICTS = frozenset({IN_ZONE, TOO_EASY, TOO_HARD, TRUNCATED})
@@ -301,11 +306,16 @@ def _private_file(path: Path) -> None:
 
 
 class LeaseBook:
-    def __init__(self, path: str | os.PathLike[str], config: LeaseBookConfig, *, quota: QuotaController,
+    def __init__(self, path: str | os.PathLike[str], config: LeaseBookConfig, *, quota: QuotaController | None,
                  clock: Callable[[], float] = time.time,
-                 rng: random.Random | None = None) -> None:
+                 rng: random.Random | None = None, auctions=None) -> None:
+        if (quota is None) == (auctions is None):
+            raise ValueError("a lease book is bounded by a quota or by an auction (rl_auction.RlAuctions), not both")
         self.config = config
         self.quota = quota
+        # A task priced by auction (``rl_auction.RlAuctions``): an env's leases go to its offers, cheapest first,
+        # under a budget from the trainer's batch; each lease keeps its price and its holder's offer.
+        self.auctions = auctions
         self.clock = clock
         self._rng = rng or random.SystemRandom()
         self.lock = threading.RLock()
@@ -328,14 +338,21 @@ class LeaseBook:
             for column, kind in (("state", "TEXT"), ("until_k", "INTEGER")):   # a book from before the scan log
                 if column not in columns:
                     self.db.execute(f"ALTER TABLE rl_prompt_scans ADD COLUMN {column} {kind}")
-            if "cause" not in {row[1] for row in self.db.execute("PRAGMA table_info(rl_leases)")}:
+            columns = {row[1] for row in self.db.execute("PRAGMA table_info(rl_leases)")}
+            if "cause" not in columns:
                 self.db.execute("ALTER TABLE rl_leases ADD COLUMN cause TEXT")   # a book from before releases
+            for column in ("price", "offer"):                                     # a book from before the auction
+                if column not in columns:
+                    self.db.execute(f"ALTER TABLE rl_leases ADD COLUMN {column} REAL")
             columns = {row[1] for row in self.db.execute("PRAGMA table_info(rl_prompt_state)")}
             for column, kind in (("start_k", "INTEGER"), ("revised", "INTEGER NOT NULL DEFAULT 0")):
                 if column not in columns:                                     # a book from before revisions
                     self.db.execute(f"ALTER TABLE rl_prompt_state ADD COLUMN {column} {kind}")
             self.db.commit()
-            quota.attach(self.db, self.lock)
+            if quota is not None:
+                quota.attach(self.db, self.lock)
+            if auctions is not None:
+                auctions.bind(self)
             self._boot()
         except BaseException:
             self.db.close()
@@ -388,7 +405,8 @@ class LeaseBook:
             self.db.execute("UPDATE rl_leases SET expires_at=? WHERE state=? AND expires_at<?", (floor, OPEN, floor))
             counts = dict(self.db.execute("SELECT hotkey, COUNT(*) FROM rl_leases WHERE state=? GROUP BY hotkey",
                                           (OPEN,)).fetchall())
-            self.quota.reconcile(counts)
+            if self.quota is not None:
+                self.quota.reconcile(counts)
             # A cooldown recorded before revisions: it started at the latest checkpoint when its scan was recorded
             # (the scan's k when that is later), the rule ``record_outcome`` applies.
             self.db.execute(
@@ -534,7 +552,13 @@ class LeaseBook:
     def _close_unsubmitted(self, lease: Lease, now: float, charged: str) -> str:
         """Close an open lease that will not be submitted: released when the sandbox side verifiably failed it (no
         quota cut, no scan), charged as its expiry otherwise. Returns its new state."""
-        failure = self._verified_failure(lease)
+        meta = dict(self.db.execute("SELECT key,value FROM rl_lease_meta WHERE key IN "
+                                    "('training_runtime_id','training_trainer_quiesced','training_registry_stop','training_limit_stop')"))
+        cancelled = (meta.get("training_runtime_id")
+                     and meta.get("training_trainer_quiesced") == meta["training_runtime_id"]
+                     and (meta.get("training_registry_stop") or meta.get("training_limit_stop")))
+        failure = ((ORDER_DRAIN, "order closed after trainer quiescence") if cancelled
+                   else self._verified_failure(lease))
         if failure is not None and failure[0] == BOX_FAILED:
             used = self.db.execute("SELECT COUNT(*) FROM rl_leases WHERE hotkey=? AND state=? AND cause=? AND "
                                    "closed_at>?", (lease.hotkey, RELEASED, BOX_FAILED, now - DAY_S)).fetchone()[0]
@@ -548,12 +572,13 @@ class LeaseBook:
         if failure is None:
             self.db.execute("UPDATE rl_leases SET state=?, closed_at=?, cause=? WHERE lease_id=?",
                             (EXPIRED, now, charged, lease.lease_id))
-            self.quota.record_expiry(lease.hotkey, lease, now=now)
+            self._charge_miss(lease, now)
             return EXPIRED
         cause, detail = failure
         self.db.execute("UPDATE rl_leases SET state=?, closed_at=?, cause=? WHERE lease_id=?",
                         (RELEASED, now, cause, lease.lease_id))
-        self.quota.record_release(lease.hotkey, lease, now=now)
+        if self.quota is not None:
+            self.quota.record_release(lease.hotkey, lease, now=now)
         logger.warning("rl lease %s of %s (%s prompt %d) released without penalty: %s (%s)",
                        lease.lease_id[:12], lease.hotkey[:12], lease.environment, lease.prompt_idx, cause, detail)
         return RELEASED
@@ -579,6 +604,35 @@ class LeaseBook:
         with self._txn():
             return self._expire(now)
 
+    def release_for_order_drain(self, *, runtime_id: str, now: float | None = None) -> int:
+        """After the controller's grace period, release a sealed order's unsubmitted leases without penalty.
+
+        The caller measures the grace with its own monotonic clock. Submissions already held for grading keep
+        their leases until their real outcome is recorded; no client-supplied timestamp ends another's work.
+        """
+        now = float(self.clock()) if now is None else float(now)
+        if not math.isfinite(now):
+            raise ValueError("invalid order drainage time")
+        with self._txn():
+            meta = dict(self.db.execute("SELECT key,value FROM rl_lease_meta"))
+            if (not isinstance(runtime_id, str) or not runtime_id
+                    or meta.get("training_runtime_id") != runtime_id
+                    or meta.get("training_trainer_quiesced") != runtime_id
+                    or not (meta.get("training_registry_stop") or meta.get("training_limit_stop"))):
+                raise ValueError("order drainage is not authorized for this runtime")
+            rows = self.db.execute(f"SELECT {_COLUMNS} FROM rl_leases WHERE state=?", (OPEN,)).fetchall()
+            released = 0
+            for row in rows:
+                lease = self._lease(row)
+                if lease.lease_id in self._submitting:
+                    continue
+                self.db.execute("UPDATE rl_leases SET state=?,closed_at=?,cause=? WHERE lease_id=? AND state=?",
+                                (RELEASED, now, ORDER_DRAIN, lease.lease_id, OPEN))
+                if self.quota is not None:
+                    self.quota.record_release(lease.hotkey, lease, now=now)
+                released += 1
+            return released
+
     def grant(self, requests: list[LeaseRequest], now: float | None = None) -> list[LeaseAnswer]:
         """Resolve one interval's requests together. Raises ValueError if any request is malformed. A banned hotkey,
         or one without room (``quota - in_use``, and its share of the global cap), is refused up front; a request is
@@ -603,10 +657,17 @@ class LeaseBook:
                                        (hotkey, OPEN)).fetchall()
                 for lease in map(self._lease, rows):
                     held[(hotkey, lease.environment, lease.prompt_idx, lease.checkpoint)] = lease
+                if self.auctions is not None:            # the auction bounds each env: no room per hotkey
+                    room[hotkey] = MAX_PROMPTS_PER_REQUEST * len(requests)
+                    continue
                 limit = self.quota.quota(hotkey, now)
                 if cap is not None:
                     limit = min(limit, HOTKEY_MAX_OPEN)
                 room[hotkey] = max(0, limit - len(rows))
+            if self.auctions is not None:                # every requester of the interval counts before any is served
+                for request in requests:
+                    if room.get(request.hotkey, -1) >= 0:
+                        self.auctions.note_request(request.environment, request.hotkey)
             claims = []
             for i, request in enumerate(requests):
                 hotkey, asked = request.hotkey, 0
@@ -659,14 +720,26 @@ class LeaseBook:
                     answers[i].refused[prompt] = FULL
                     self._full.add(env)
                     continue
-                lease = Lease(_secrets.token_hex(16), hotkey, env, prompt, k,
-                              lease_nonce(bytes(secrets_by_k[k]), env, prompt, k).hex(), now,
-                              now + float(self.config.expiry_s[env]), OPEN)
-                self.db.execute(f"INSERT INTO rl_leases({_COLUMNS}) VALUES(?,?,?,?,?,?,?,?,?)",
-                                (lease.lease_id, hotkey, env, prompt, k, lease.nonce, lease.issued_at,
-                                 lease.expires_at, OPEN))
+                expiry, terms = float(self.config.expiry_s[env]), None
+                if self.auctions is not None:
+                    terms = self.auctions.admit(env, hotkey)
+                    if isinstance(terms, str):
+                        answers[i].refused[prompt] = AUCTION_REFUSALS.get(terms, QUOTA)
+                        continue
+                    expiry = self.auctions.lease_seconds(env, hotkey, expiry, self._open_on(hotkey, env))
+                try:
+                    lease = Lease(_secrets.token_hex(16), hotkey, env, prompt, k,
+                                  lease_nonce(bytes(secrets_by_k[k]), env, prompt, k).hex(), now, now + expiry, OPEN)
+                    self.db.execute(f"INSERT INTO rl_leases({_COLUMNS}, price, offer) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                                    (lease.lease_id, hotkey, env, prompt, k, lease.nonce, lease.issued_at,
+                                     lease.expires_at, OPEN, None if terms is None else terms.price,
+                                     None if terms is None else terms.offer))
+                finally:
+                    if terms is not None:
+                        self.auctions.unreserve(env, terms)
                 room[hotkey] -= 1
-                self.quota.record_lease(hotkey, now=now)
+                if self.quota is not None:
+                    self.quota.record_lease(hotkey, now=now)
                 granted[i][prompt] = lease
         for i, request in enumerate(requests):
             answers[i].leases = [granted[i][p] for p in request.prompt_ids if p in granted[i]]
@@ -762,7 +835,13 @@ class LeaseBook:
             if failure is None:
                 self.db.execute("UPDATE rl_leases SET state=?, closed_at=? WHERE lease_id=?",
                                 (SUBMITTED, now, lease_id))
-                if delivered:
+                if self.auctions is not None:
+                    if delivered:
+                        _, offer = self._terms(lease_id)
+                        self.auctions.delivered(lease.environment, hotkey, now - lease.issued_at, offer)
+                    else:
+                        self._charge_miss(lease, now)
+                elif delivered:
                     self.quota.record_submission(hotkey, lease, in_zone=bool(in_zone), now=now)
                 else:
                     self.quota.record_expiry(hotkey, lease, now=now, cause="rejected")
@@ -777,8 +856,42 @@ class LeaseBook:
         with self._txn():
             row = self.db.execute("SELECT hotkey, issued_at, closed_at FROM rl_leases WHERE lease_id=? AND state=?",
                                   (lease_id, SUBMITTED)).fetchone()
-            if row is not None:
+            if row is not None and self.quota is not None:
                 self.quota.record_paid(row[0], issued_at=float(row[1]), submitted_at=float(row[2]), now=now)
+
+    # --- auction terms ---------------------------------------------------------------------------------------
+    def _terms(self, lease_id: str) -> tuple[float | None, float | None]:
+        row = self.db.execute("SELECT price, offer FROM rl_leases WHERE lease_id=?", (lease_id,)).fetchone()
+        return (None, None) if row is None else (row[0], row[1])
+
+    def lease_price(self, lease_id: str) -> float | None:
+        """The price per matched token a lease was granted at (an auctioned task), else None."""
+        with self.lock:
+            return self._terms(lease_id)[0]
+
+    def _charge_miss(self, lease: Lease, now: float) -> None:
+        """A lease ended undelivered by the miner's doing: the quota's cut, or the auction's charge."""
+        if self.auctions is not None:
+            self.auctions.missed(lease.environment, lease.hotkey, self._terms(lease.lease_id)[0])
+        else:
+            self.quota.record_expiry(lease.hotkey, lease, now=now)
+
+    def _open_on(self, hotkey: str, env: str) -> int:
+        return int(self.db.execute("SELECT COUNT(*) FROM rl_leases WHERE hotkey=? AND environment=? AND state=?",
+                                   (hotkey, env, OPEN)).fetchone()[0])
+
+    def quota_of(self, hotkey: str, now: float | None = None) -> int:
+        """The leases ``hotkey`` may hold at once: its quota, or on an auctioned task its allowances over the envs
+        (0 without a live offer). Not under the book's lock: an auction reads the book itself."""
+        if self.auctions is not None:
+            return self.auctions.allowance(hotkey)
+        return self.quota.quota(hotkey, float(self.clock()) if now is None else now)
+
+    def open_by_hotkey(self, env: str) -> dict[str, int]:
+        """Open leases per hotkey on ``env`` (an auction's holdings)."""
+        with self.lock:
+            return {str(h): int(n) for h, n in self.db.execute(
+                "SELECT hotkey, COUNT(*) FROM rl_leases WHERE environment=? AND state=? GROUP BY hotkey", (env, OPEN))}
 
     # --- bans (set by the audit regime of the submission path) ----------------------------------------------
     def _banned(self, hotkey: str, now: float) -> bool:
@@ -953,7 +1066,7 @@ class LeaseCollector:
 
 __all__ = [
     "BANNED", "BLACKLISTED", "BOX_FAILED", "BOX_FAILED_OVER_BUDGET", "COMMIT_DOMAIN", "COOLDOWN", "COOLING", "EXPIRED", "EXPIRED_CAUSE", "FORFEITED", "FULL", "IN_ZONE", "NONCE_DOMAIN", "OPEN", "QUOTA",
-    "VALIDATOR_UNAVAILABLE",
+    "VALIDATOR_UNAVAILABLE", "ORDER_DRAIN", "NO_ASK", "ASK_ABOVE_PRICE", "AUCTION_REFUSALS",
     "REFUSALS", "RELEASED", "SECRET_REVEAL_LAG", "STALE", "SUBMITTED", "TAKEN", "TOO_EASY", "TOO_HARD", "TRUNCATED", "VERDICTS",
     "Lease", "LeaseAnswer", "LeaseBook", "LeaseBookConfig", "LeaseCollector", "LeaseRequest", "Scan",
     "classify_group", "lease_expiry_s", "lease_nonce", "secret_commitment", "verify_reveal",

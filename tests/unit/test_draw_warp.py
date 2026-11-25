@@ -478,3 +478,96 @@ def test_far_misses_are_counted_on_every_path(warp):
         edited[row] = int(torch.argmin(logits[row]))
     d = _diag(logits, edited, us, warp)
     assert d.n_far_miss == 3 and fs._FAR_MISS < d.max_cdf_miss
+
+
+def test_one_shared_ranking_gives_every_warp_the_masks_warp_support_gives():
+    torch.manual_seed(0)
+    x = torch.randn(7, 300) * 3
+    x[0, :5] = 2.0  # ties
+    base = Warp(t=1.0, top_p=0.9, min_p=0.02)
+    for warps in ([base, base.widened(-0.05), base.widened(0.05)],
+                  [Warp(top_p=0.97), Warp(top_p=0.97).widened(0.05)],  # the loose cut reaches 1
+                  [Warp(min_p=0.1), Warp()]):
+        assert all(torch.equal(got, fs.warp_support(x, w)) for got, w in zip(fs._warp_supports(x, warps), warps))
+
+
+def test_a_top_k_cut_keeps_its_own_ranking():
+    x = torch.randn(3, 50)
+    warps = [Warp(top_k=5, top_p=0.9), Warp(top_k=7, top_p=0.95)]
+    assert all(torch.equal(got, fs.warp_support(x, w)) for got, w in zip(fs._warp_supports(x, warps), warps))
+
+
+def test_the_forward_packs_only_under_flash_attention_without_linear_layers(monkeypatch):
+    from types import SimpleNamespace
+
+    from reliquary.validator.corpus_audit import _packed
+
+    def model(attn, layers=None):
+        return SimpleNamespace(config=SimpleNamespace(_attn_implementation=attn, layer_types=layers))
+
+    assert not _packed(model("flash_attention_2"))  # off unless asked
+    monkeypatch.setenv("RELIQUARY_PACKED_FORWARD", "1")
+    assert _packed(model("flash_attention_2"))
+    assert not _packed(model("sdpa"))
+    assert not _packed(model("flash_attention_2", ["linear_attention", "full_attention"]))
+
+
+def test_a_greedy_flip_is_judged_on_the_logit_gap_alone():
+    """top_k 1 is greedy: the pick is the argmax whatever the noise, so an honest flip between two near-tied
+    logits is a near-tie, never the difference of the two tokens' noises (logistic: over 4 about 2 % of the
+    time); a far token is still far."""
+    greedy = Warp(t=1.0, top_k=1)
+    x = torch.tensor([[3.0, 2.99, 0.5, -1.0]] * 64)
+    us = _us(64)
+    assert _picks(x, us, greedy) == [0] * 64
+    for chunk in (fs._gumbel_warp_chunk_stats, fs._gumbel_warp_chunk_stats_dense):
+        exact, miss, _ = chunk(x, torch.ones(64, dtype=torch.long), us, greedy, 0.15, 0.95)
+        assert not exact.any()
+        assert torch.allclose(-torch.log1p(-miss), torch.full((64,), 0.01), atol=1e-5)
+    flips = _diag(x, [1] * 64, us, greedy)
+    assert -math.log1p(-flips.max_cdf_miss) == pytest.approx(0.01, abs=1e-5)
+    # Past the widened top 2 a token is not impossible: its raw logit gap measures it (2.5 here).
+    assert -math.log1p(-_diag(x, [2] * 64, us, greedy).max_cdf_miss) == pytest.approx(2.5, abs=1e-4)
+
+
+def test_an_honest_greedy_pick_third_in_a_near_tie_is_a_near_miss():
+    """2026-11-14, SciCode: three tokens within 0.02 logits and the miner's argmax third in the validator's
+    order. Ranked out of the widened top 2 it read as impossible (max_gap null) on three of three attempts;
+    scored on the logit gap it is the near-tie it is, and the order is judged a pass."""
+    from reliquary.corpus import eval_draw
+    from reliquary.corpus.job import DEFAULT_DRAW_JUDGE
+
+    greedy = Warp(t=1.0, top_k=1)
+    x = torch.full((400, 64), -10.0)
+    x[:, 0], x[:, 1], x[:, 2] = 3.0, 2.99, 2.98
+    tokens = [0] * 400
+    tokens[200] = 2
+    us = _us(400)
+    for chunk in (fs._gumbel_warp_chunk_stats, fs._gumbel_warp_chunk_stats_dense):
+        exact, miss, _ = chunk(x, torch.tensor(tokens), us, greedy, 0.15, 0.95)
+        assert not exact[200]
+        assert (-torch.log1p(-miss[200].double())).item() == pytest.approx(0.02, abs=1e-4)
+    ok, detail = eval_draw.judge([_diag(x, tokens, us, greedy)], DEFAULT_DRAW_JUDGE)
+    assert ok and detail["max_gap"] == pytest.approx(0.02, abs=1e-3)
+
+
+@pytest.mark.parametrize("t", [1.0, 5.0])
+def test_a_greedy_gap_is_in_raw_logits_whatever_the_temperature(t):
+    """The reviewer's case: eight runner-ups 19 logits below the top at T 5 read as a 3.8 gap when divided by the
+    temperature, and passed. Scored on raw logits they are far misses, refused and charged."""
+    from reliquary.corpus import eval_draw
+    from reliquary.corpus.job import DEFAULT_DRAW_JUDGE
+
+    greedy = Warp(t=t, top_k=1)
+    x = torch.full((400, 64), -40.0)
+    x[:, 0] = 0.0
+    x[:, 1] = -19.0
+    tokens = [0] * 400
+    for p in range(10, 400, 48):
+        tokens[p] = 1
+    us = _us(400)
+    for chunk in (fs._gumbel_warp_chunk_stats, fs._gumbel_warp_chunk_stats_dense):
+        _, miss, _ = chunk(x, torch.tensor(tokens), us, greedy, 0.15, 0.95)
+        assert (-torch.log1p(-miss[10].double())).item() > 18 or miss[10].item() == 1.0
+    ok, detail = eval_draw.judge([_diag(x, tokens, us, greedy)], DEFAULT_DRAW_JUDGE)
+    assert not ok and detail["penalty"] is True and detail["max_gap"] > 4.0

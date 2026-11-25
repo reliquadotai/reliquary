@@ -39,7 +39,8 @@ the share of the period the trainer was down. Before the first heartbeat nothing
 counts as a beat (``trainer_beat``, throttled). The validator's own downtime (``rl_validator_downtime``, written by
 the lease book) is cut out of the outages: the trainer could not reach it, and its late step report pays then. A
 piece shorter than the grace is dropped. With the fill on, a period settles ``outage_grace_s`` after its end at the
-earliest, so an outage at its very end is seen before it is archived.
+earliest, so an outage at its very end is seen before it is archived. A training order's run is
+over at its stop (``stopped_at``): no outage is filled past it.
 """
 from __future__ import annotations
 
@@ -81,6 +82,7 @@ CREATE TABLE IF NOT EXISTS rl_pay_periods(work_period INTEGER PRIMARY KEY, entry
     doc TEXT NOT NULL, published INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS rl_trainer_beat(id INTEGER PRIMARY KEY CHECK(id=0), last_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS rl_trainer_outages(start REAL NOT NULL, end REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS rl_order_stop(id INTEGER PRIMARY KEY CHECK(id=0), at REAL NOT NULL);
 """
 # Archives a period's outage fill is averaged over (only those with less than half the period in outage).
 OUTAGE_REFERENCE_PERIODS = 6
@@ -123,12 +125,33 @@ def paid_tokens(detail: dict, floor: float) -> int:
 class RlPayLedger:
     def __init__(self, book, submissions, prices, config: LedgerConfig,
                  clock: Callable[[], float] = time.time) -> None:
-        """``prices.token_price(env)`` prices a matched token (``AsyncPriceController``)."""
+        """``prices.token_price(env)`` prices a matched token (``AsyncPriceController``), unless the book's leases
+        carry their own price (``book.auctions``: a task priced by auction)."""
         self.book, self.submissions, self.prices, self.config, self.clock = book, submissions, prices, config, clock
+        self.auctions = getattr(book, "auctions", None)
         self._board: tuple[float, dict] | None = None
         self._beat_at: float | None = None        # the last trainer_beat write (memory only)
+        self.settled_through: int | None = None   # the last period the latest settle closed (memory only)
         with book.lock:
             book.db.executescript(_SCHEMA)
+            columns = {row[1] for row in book.db.execute("PRAGMA table_info(rl_accruals)")}
+            if "budget_tokens" not in columns:
+                book.db.execute("ALTER TABLE rl_accruals ADD COLUMN budget_tokens REAL")
+            # Old first scans lost their gross value to penalties: unknown usage must not reopen a budget.
+            book.db.execute("UPDATE rl_accruals SET budget_tokens=matched_tokens WHERE kind=? AND budget_tokens IS NULL",
+                            (TRAINED,))
+            book.db.executescript("""
+                CREATE TRIGGER IF NOT EXISTS rl_accrual_usage_immutable BEFORE UPDATE ON rl_accruals
+                WHEN NEW.seq IS NOT OLD.seq OR NEW.lease_id IS NOT OLD.lease_id OR
+                    NEW.hotkey IS NOT OLD.hotkey OR NEW.environment IS NOT OLD.environment OR
+                    NEW.kind IS NOT OLD.kind OR NEW.at IS NOT OLD.at OR NEW.matched_tokens IS NOT OLD.matched_tokens OR
+                    NEW.token_price IS NOT OLD.token_price OR
+                    (NEW.budget_tokens IS NOT OLD.budget_tokens AND NOT
+                        (OLD.budget_tokens IS NULL AND OLD.kind='trained' AND NEW.budget_tokens IS OLD.matched_tokens))
+                BEGIN SELECT RAISE(ABORT,'rl_gross_usage_immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS rl_accrual_usage_no_delete BEFORE DELETE ON rl_accruals
+                BEGIN SELECT RAISE(ABORT,'rl_gross_usage_immutable'); END;
+            """)
             book.db.execute("INSERT OR IGNORE INTO rl_pay_cursor(id, seq) VALUES(0, 0)")
             book.db.commit()
 
@@ -143,6 +166,15 @@ class RlPayLedger:
                                     "ORDER BY seq DESC LIMIT ?",
                                     (environment, TRAINED, self.config.reference_groups)).fetchall()
         return sum(r[0] for r in rows) / len(rows) if rows else float(self.config.default_group_tokens)
+
+    def _price(self, lease_id: str, environment: str) -> float:
+        """A matched token's price: its lease's, on a task priced by auction; else the env's price at ingestion."""
+        if self.auctions is not None:
+            row = self.book.db.execute("SELECT price FROM rl_leases WHERE lease_id=?", (lease_id,)).fetchone()
+            if row is not None and row[0] is not None:
+                return float(row[0])
+            return 0.0                            # a lease gone from the book, or granted before the auction
+        return float(self.prices.token_price(environment))
 
     def _banned(self, hotkey: str, at: float) -> bool:
         row = self.book.db.execute("SELECT until FROM rl_pay_bans WHERE hotkey=?", (hotkey,)).fetchone()
@@ -168,28 +200,37 @@ class RlPayLedger:
                 if kind == TRAINED:
                     environment = detail["environment"]
                     tokens = paid_tokens(detail, self.config.floor)
-                    price = float(self.prices.token_price(environment))
+                    budget_tokens = float(tokens)
+                    price = self._price(event["lease_id"], environment)
                     amount = tokens * price
                 elif kind == FIRST_SCAN:
                     row = db.execute("SELECT environment FROM rl_groups WHERE lease_id=?",
                                      (event["lease_id"],)).fetchone()
                     environment = row[0]
                     tokens = 0
-                    price = float(self.prices.token_price(environment))
-                    amount = float(detail["fraction"]) * price * self._reference_tokens(environment)
+                    price = self._price(event["lease_id"], environment)
+                    reference = self._reference_tokens(environment)
+                    budget_tokens = float(detail["fraction"]) * reference
+                    amount = float(detail["fraction"]) * price * reference
                 else:
                     continue                      # untrained, first_scan_forfeited: no money
                 status = FORFEITED if self._banned(hotkey, at) else ACCRUED
+                if self.auctions is not None and status == ACCRUED:
+                    if kind == TRAINED:
+                        self.auctions.trained_tokens(environment, tokens)
+                    # An undelivered lease's charge is taken back from the hotkey's next pay on the env.
+                    amount -= self.auctions.take_debit(environment, hotkey, amount)
                 db.execute("INSERT INTO rl_accruals(seq, lease_id, hotkey, environment, kind, at, period, "
-                           "matched_tokens, token_price, amount, status) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                           "matched_tokens, token_price, amount, status, budget_tokens) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                            (event["seq"], event["lease_id"], hotkey, environment, kind, at, self._open_period(at),
-                            tokens, price, amount, status))
+                            tokens, price, amount, status, budget_tokens))
             db.execute("UPDATE rl_pay_cursor SET seq=? WHERE id=0", (events[-1]["seq"],))
         return len(events)
 
     # --- settlement ----------------------------------------------------------------------------------------
     def settle(self, now: float | None = None) -> list[dict]:
-        """Archive every closed period holding accruals, oldest first (each once); returns the new archives."""
+        """Archive every closed period holding accruals, oldest first (each once); returns the new archives.
+        ``settled_through``: the last closed period of this pass."""
         now = float(self.clock()) if now is None else now
         genesis = self.config.genesis
         slack = max(self.config.slack_s, self.config.outage_grace_s) if self.config.outage_fill else self.config.slack_s
@@ -238,6 +279,7 @@ class RlPayLedger:
                            (period, entry, json.dumps(doc, sort_keys=True), _UNATTEMPTED))
                 db.execute("UPDATE rl_accruals SET status=? WHERE status=? AND period=?", (SETTLED, ACCRUED, period))
                 out.append(doc)
+        self.settled_through = closed
         return out
 
     def _due_periods(self, closed: int, outages: list[tuple[float, float]] = ()) -> list[int]:
@@ -281,6 +323,27 @@ class RlPayLedger:
             db.execute("DELETE FROM rl_trainer_outages WHERE end<?", (now - OUTAGE_KEEP_S,))
         self._beat_at = now
 
+    def stopped_at(self, now: float | None = None) -> float | None:
+        """When the training order first reached a limit or was retired (``RlAuctions.stopped``; a deadline at the
+        deadline, the rest when first seen), kept once seen; None: not stopped, or no order."""
+        if self.auctions is None or not (getattr(self.auctions, "limits", None) or getattr(self.auctions, "retired",
+                                                                                                False)):
+            return None
+        with self.book.lock:
+            row = self.book.db.execute("SELECT at FROM rl_order_stop WHERE id=0").fetchone()
+        if row is not None:
+            return float(row[0])
+        reason = self.auctions.stopped()
+        # An admission pause, a stale registry read or pending ledger ingestion can clear.
+        # Only an order limit or retirement ends the interval for the ledger.
+        if reason not in ("retired", "deadline", "max_steps", "max_tokens"):
+            return None
+        now = float(self.clock()) if now is None else now
+        at = min(now, float(self.auctions.limits["deadline_at"])) if reason == "deadline" else now
+        with self.book.transaction():
+            self.book.db.execute("INSERT OR IGNORE INTO rl_order_stop(id, at) VALUES(0, ?)", (at,))
+            return float(self.book.db.execute("SELECT at FROM rl_order_stop WHERE id=0").fetchone()[0])
+
     def _validator_downtime(self) -> list[tuple[float, float]]:
         try:
             return [(float(s), float(e)) for s, e in
@@ -299,6 +362,9 @@ class RlPayLedger:
         row = db.execute("SELECT last_at FROM rl_trainer_beat WHERE id=0").fetchone()
         if row is not None and now - row[0] > self.config.outage_grace_s:
             spans.append((float(row[0]), now))
+        stop = self.stopped_at(now)
+        if stop is not None:                      # a training order's run is over at its stop: nothing to fill
+            spans = [(s, min(e, stop)) for s, e in spans if s < stop]
         down = sorted(self._validator_downtime())
         out = []
         for s, e in spans:
@@ -488,9 +554,25 @@ class RlPayLedger:
         with self.book.lock:
             periods = [(w, e, p) for w, e, p in self.book.db.execute(
                 "SELECT work_period, entry_period, published FROM rl_pay_periods ORDER BY work_period DESC LIMIT 12")]
-        environments = self.prices.board()
+        if self.auctions is not None:             # each lease's own price: the auction's view per env
+            environments = {name: {"auction": view} for name, view in
+                            self.auctions.view()["environments"].items()}
+        else:
+            environments = self.prices.board()
         for name, entry in environments.items():
             entry["recent"] = self._recent(name)
+        if self.auctions is not None:
+            return {"policy": "pay-per-matched-token/v1", "pricing": "auction", "floor": self.config.floor,
+                    "cap": self.config.cap, "period": cp.period_of(now, self.config.genesis),
+                    "period_seconds": cp.PERIOD_SECONDS, "environments": environments, "hotkeys": balances,
+                    "settled_periods": [{"work_period": w, "entry_period": e, "published": p == 1}
+                                        for w, e, p in periods],
+                    "note": ("Units are fractions of the task's emission cap. A trained rollout at or above the floor "
+                             "earns its matched tokens x its lease's price (the auction's price of the moment when "
+                             "granted, never under the holder's offer); an out-of-zone first scan earns 25 % of that "
+                             "price x the env's mean matched tokens per trained group. A lease not delivered is "
+                             "charged its price x that mean, taken from the next pay on the env. A period pays at "
+                             "most the cap.")}
         return {"policy": "pay-per-matched-token/v1", "floor": self.config.floor, "cap": self.config.cap,
                 "start_pool": getattr(self.prices, "start_pool", self.config.cap),
                 "period": cp.period_of(now, self.config.genesis), "period_seconds": cp.PERIOD_SECONDS,

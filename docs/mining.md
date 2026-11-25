@@ -1,5 +1,8 @@
 # Running a Reliquary Miner
 
+> **Mining today is on Batch and Evals orders: see [Mining orders](mining-orders.md).** The RL run this guide
+> describes ended on 2026-11-02.
+
 Operational guide for running a miner on Bittensor subnet 81. For conceptual background see [docs/concepts.md](concepts.md).
 
 ## Boot sequence
@@ -345,9 +348,13 @@ teacher forcing are not bit-identical on every supported stack.
 ```bash
 git clone <repo-url> reliquary
 cd reliquary
-python3.11 -m venv .venv && source .venv/bin/activate
-pip install -e .
+uv venv --python 3.12 .venv && source .venv/bin/activate
+uv pip install -e ".[sandbox-miner]" vllm==0.30.0 --override miner-overrides.txt && reliquary miner-envs --sync
 ```
+
+To update: `git pull && uv pip install -e ".[sandbox-miner]" vllm==0.30.0 --override miner-overrides.txt && reliquary miner-envs --sync`.
+The override keeps verifiers' `mcp<2` against vLLM's `mcp>=2` (pip has no overrides, so this install needs uv);
+see `docs/mining-orders.md` for why, and for what the env packages serve.
 
 Verify:
 
@@ -471,7 +478,7 @@ On a healthy startup:
 
 If submissions are rejected, the `reason` field tells you why (see the rejection table above).
 
-Corpus (SFT) tasks: `reliquary corpus status --validator-url URL --job-id JOB
+Corpus (SFT) tasks: `reliquary corpus status --validator-url https://api.reliqua.ai --job-id JOB
 --hotkey SS58` (route `GET /corpus/jobs/<job>/miners/<hotkey>`) shows your audit
 state, verdict counts, recent failures with their TOPLOC measures, and what the
 task paid you; see [Corpus task launch §4.2](runbooks/corpus-task-launch.md#42-your-own-status-audit-state-failures-pay).
@@ -511,7 +518,7 @@ submission. No extra command is needed for that miner. Custom miners can run:
 
 ```bash
 reliquary watch-verdicts \
-  --validator-url http://62.238.81.36:8000 \
+  --validator-url https://api.reliqua.ai \
   --hotkey YOUR_PUBLIC_HOTKEY | tee -a verdicts.jsonl
 ```
 
@@ -542,7 +549,7 @@ repeat records or leave a historical gap. Use the targeted lookup documented in
 To recover stored final outcomes for an entire window (100 records per page):
 
 ```bash
-reliquary watch-verdicts --validator-url http://62.238.81.36:8000 \
+reliquary watch-verdicts --validator-url https://api.reliqua.ai \
   --hotkey YOUR_PUBLIC_HOTKEY --window 45829 | tee window-verdicts.jsonl
 ```
 

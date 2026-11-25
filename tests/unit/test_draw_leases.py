@@ -2,6 +2,7 @@
 vanished one, an older miner without leases still submits what no one holds."""
 from __future__ import annotations
 
+import json
 import random
 from types import SimpleNamespace
 
@@ -95,7 +96,9 @@ def test_a_hotkey_whose_leases_expire_unused_holds_fewer():
     assert leases.cap("a") == 10                      # a quarter of the job's 40 slots
     for _ in range(2):
         leases.grant("a", free)
-    clock.now += 101
+    clock.now += 101                                   # lapsed: still deliverable, not charged yet
+    assert leases.cap("a") == 10
+    clock.now += 100                                   # a lease time on, undelivered: charged
     assert leases.cap("a") == 2 and leases.cap("b") == 10
     clock.now += 101                                   # a lease time later, forgotten
     assert leases.cap("a") == 10
@@ -307,3 +310,182 @@ def test_a_refused_submission_releases_its_lease():
     client = Refusing([_granted(3, 1, "a" * 32)])
     _mine(client, _Gen(), sign_lease=lambda body: "lsig")
     assert client.released == ["a" * 32]
+
+
+def _episode(wall_s=7200, sandbox=True, max_total_tokens=60000):
+    budgets = SimpleNamespace(wall_s=wall_s)
+    return SimpleNamespace(max_total_tokens=max_total_tokens,
+                           sandbox=SimpleNamespace(budgets=budgets) if sandbox else None)
+
+
+def test_a_signed_episode_lease_outlasts_the_miners_episode_deadline():
+    from reliquary.corpus.draw_leases import EPISODE_LEASE_MARGIN_SECONDS, episode_lease_floor
+    from reliquary.miner.signed_episode import SignedSweEpisodeRunner
+
+    job = _job(episode=_episode())
+    # The miner's own bound on one episode, as its runner computes it.
+    runner = SignedSweEpisodeRunner.__new__(SignedSweEpisodeRunner)
+    runner._job = job
+    deadline = runner.deadline(0)
+    assert deadline == 900 + 7200 + 1800 + 120
+    assert episode_lease_floor(job) == deadline + EPISODE_LEASE_MARGIN_SECONDS
+    assert lease_seconds(job) >= deadline
+    ledger = SlotLedger(prompt_start=10, prompt_count=3, slots_per_prompt=2)
+    clock = Clock()
+    # Even a job or an auction asking for less: the lease still covers the episode.
+    leases = DrawLeases(job, clock=clock, seconds=100.0, limit_per_hotkey=False)
+    free = free_draw_slots(job, ledger, lambda p, s: False)
+    for asked in (None, 1.0, 520.0):
+        lease = leases.grant("a", free, seconds=asked)
+        assert lease.expires_at - lease.granted_at >= deadline
+
+
+def test_single_turn_and_unsigned_episode_leases_are_unchanged():
+    from reliquary.corpus.draw_leases import episode_lease_floor
+
+    assert lease_seconds(_job(max_new_tokens=1000)) == 300 + 100
+    unsigned = _job(episode=_episode(sandbox=False))
+    assert episode_lease_floor(unsigned) == 0 and lease_seconds(unsigned) == 300 + 6000
+    _, _, _, _, leases, free = _setup()
+    assert leases.seconds == 100.0
+    lease = leases.grant("a", free, seconds=40.0)
+    assert lease.expires_at - lease.granted_at == 40.0
+
+
+def test_each_lease_event_is_one_log_line(caplog):
+    import logging
+
+    _, _, _, clock, leases, free = _setup(prompts=1, slots=2)
+    with caplog.at_level(logging.INFO, logger="reliquary.corpus.draw_leases"):
+        a = leases.grant("5Aaaaaaaaaaaa", free)
+        b = leases.grant("5Bbbbbbbbbbbb", free)
+        leases.settle(a.prompt_index, a.slot)
+        leases.release("5Bbbbbbbbbbbb", b.lease_id)
+        c = leases.grant("5Cccccccccccc", free)
+        clock.now += 101
+        for _ in range(3):
+            len(leases)                       # polls log nothing
+        clock.now += 100
+        len(leases)
+    events = [r.getMessage().split()[2] for r in caplog.records]
+    assert events == ["granted", "granted", "taken", "released", "granted", "lapsed", "expired"]
+    assert f"prompt={c.prompt_index} slot={c.slot} hotkey=5Ccccccc secs=100" in caplog.records[4].getMessage()
+
+
+def test_a_restart_keeps_the_leases_still_running(tmp_path):
+    # 2026-11-14: a control restart dropped every lease in flight, and a job priced by auction refuses a submission
+    # without its lease. Written beside the auction's state, they come back; one taken before the restart does not.
+    path = tmp_path / "job.leases.json"
+    job, _, _, clock, leases, free = _setup(prompts=2, slots=1, limit_per_hotkey=False, state_path=path)
+    kept = leases.grant("a", free)
+    taken = leases.grant("b", free)
+    leases.settle(taken.prompt_index, taken.slot)
+    back = DrawLeases(job, clock=clock, rng=random.Random(1), seconds=100.0, limit_per_hotkey=False, state_path=path)
+    assert back.held("a", kept.prompt_index, kept.slot) == kept
+    assert back.holders(taken.prompt_index, taken.slot) == []
+    assert back.counts() == {"a": 1}
+
+
+def test_a_lease_that_ran_out_while_down_is_dropped_uncharged(tmp_path):
+    path = tmp_path / "job.leases.json"
+    job, _, _, clock, leases, free = _setup(prompts=1, slots=1, state_path=path)
+    leases.grant("a", free)
+    clock.now += 101
+    charged = []
+    back = DrawLeases(job, clock=clock, rng=random.Random(1), seconds=100.0, state_path=path,
+                      on_unused=lambda lease, held: charged.append(lease.hotkey))
+    assert len(back) == 0 and back.counts() == {} and charged == []
+
+
+def test_an_unreadable_lease_state_starts_empty(tmp_path):
+    path = tmp_path / "job.leases.json"
+    path.write_text("{not json")
+    job = _job()
+    assert len(DrawLeases(job, clock=Clock(), rng=random.Random(0), seconds=100.0, state_path=path)) == 0
+
+
+def test_first_lease_requests_at_once_share_one_lease_book(fake_r2, monkeypatch):
+    # 2026-11-15: grants run off the event loop, and two first requests at once each built a book; the losing one
+    # dropped the leases it had granted and both wrote the same state file.
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from reliquary.corpus import draw_leases
+
+    built = []
+    real = draw_leases.DrawLeases
+
+    class Slow(real):
+        def __init__(self, *args, **kwargs):
+            built.append(threading.get_ident())
+            time.sleep(0.2)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(draw_leases, "DrawLeases", Slow)
+    client = _route(fake_r2, prompts=4, slots=2)
+    with ThreadPoolExecutor(4) as pool:
+        got = list(pool.map(lambda i: _lease(client, f"5H{i}"), range(4)))
+    assert all(g["leased"] is True for g in got), got
+    assert len(built) == 1
+    assert len({(g["prompt_index"], g["slot"]) for g in got}) == 4
+
+
+def test_a_lapsed_lease_is_still_delivered_by_its_hotkey_uncharged():
+    unused = []
+    _, _, _, clock, leases, free = _setup(prompts=1, slots=1)
+    leases._on_unused = lambda lease, held: unused.append((lease.hotkey, held))
+    lease = leases.grant("a", free, price=1.0)
+    clock.now += 101                                   # past its time: the slot reopens
+    assert leases.counts() == {}
+    assert leases.held("a", lease.prompt_index, lease.slot) == lease
+    leases.settle(lease.prompt_index, lease.slot, "a")  # its late delivery
+    assert unused == [] and leases.cap("a") == leases.cap("b")
+    assert leases.held("a", lease.prompt_index, lease.slot) is None
+
+
+def test_a_lapsed_lease_is_charged_once_another_hotkey_takes_its_slot():
+    unused = []
+    _, _, _, clock, leases, free = _setup(prompts=1, slots=1)
+    leases._on_unused = lambda lease, held: unused.append((lease.hotkey, held))
+    lease = leases.grant("a", free, price=1.0)
+    clock.now += 101
+    other = leases.grant("b", free, price=1.0)
+    assert (other.prompt_index, other.slot) == (lease.prompt_index, lease.slot)
+    # The new lessee holds it now: the late holder may not submit over it.
+    assert leases.held("a", lease.prompt_index, lease.slot) is None
+    assert leases.refusal("a", lease.prompt_index, lease.slot) is not None
+    leases.settle(lease.prompt_index, lease.slot, "b")
+    assert unused == [("a", 1.0)]
+
+
+def test_lapsed_leases_survive_a_restart(tmp_path):
+    from reliquary.corpus.draw_leases import DrawLeases
+
+    path = tmp_path / "leases.json"
+    job, _, _, clock, leases, free = _setup(prompts=1, slots=1, state_path=path)
+    lease = leases.grant("a", free, price=1.0)
+    clock.now += 101
+    len(leases)
+    again = DrawLeases(job, clock=clock, seconds=100.0, state_path=path)
+    assert again.held("a", lease.prompt_index, lease.slot) == lease
+
+
+def test_a_save_encodes_only_the_leases_that_are_new(tmp_path, monkeypatch):
+    """Prod 2026-11-21: re-encoding every live lease on each change took half the control's core."""
+    import reliquary.corpus.draw_leases as module
+
+    path = tmp_path / "leases.json"
+    job, _, _, clock, leases, free = _setup(prompts=8, slots=1, limit_per_hotkey=False, state_path=path)
+    for _ in range(4):
+        leases.grant("hk", free)
+    encoded = []
+    real = module.asdict
+    monkeypatch.setattr(module, "asdict", lambda lease: encoded.append(lease.lease_id) or real(lease))
+    fifth = leases.grant("hk", free)
+    assert encoded == [fifth.lease_id]
+    saved = json.loads(path.read_text())
+    assert len(saved["leases"]) == 5 and saved["lapsed"] == [] and saved["unused"] == {}
+    assert real(fifth) in saved["leases"]
+    back = DrawLeases(job, clock=clock, rng=random.Random(1), seconds=100.0, limit_per_hotkey=False, state_path=path)
+    assert len(back) == 5

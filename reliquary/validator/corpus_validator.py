@@ -850,6 +850,8 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
             pending_record_arrivals=getattr(served, "pending_record_arrivals", None),
             durable_records=False if not hasattr(served, "pending_record_arrivals") else None,
             auction=_auction_of(served),
+            # A signed job's leases our sandbox failed: uncharged (set by `run_corpus_validator`).
+            lease_fault=getattr(served, "lease_fault", None),
         )
 
     def _auction_of(served):
@@ -862,7 +864,8 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
         auditor = getattr(served, "auditor", None)
         auction = job_auction(getattr(served.entry, "params", None),
                               backlog=getattr(auditor, "audit_backlog", None),
-                              state_path=state_path_for(str(served.entry.job_id)))
+                              state_path=state_path_for(str(served.entry.job_id)),
+                              job=getattr(served, "job", None))
         try:
             served.auction = auction          # one auction per job, whatever rebuilds its router
         except AttributeError:
@@ -964,7 +967,7 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
     return app
 
 
-async def _run_corpus_services(server, services, *, cleanup=None) -> None:
+async def _run_corpus_services(server, services, *, cleanup=None, check_worker_shutdown=False) -> None:
     """Stop and await every service when HTTP serving ends or a service fails."""
     from contextlib import nullcontext
 
@@ -983,9 +986,20 @@ async def _run_corpus_services(server, services, *, cleanup=None) -> None:
             serving.cancel()
             for task in workers:
                 task.cancel()
-            await asyncio.gather(serving, group, *workers, return_exceptions=True)
+            outcomes = await asyncio.gather(serving, group, *workers, return_exceptions=True)
             if cleanup is not None:
                 await cleanup()
+            if check_worker_shutdown:
+                for outcome in outcomes:
+                    if isinstance(outcome, BaseException) and not isinstance(outcome, asyncio.CancelledError):
+                        raise outcome
+
+
+def _set_lease_fault(w, services) -> None:
+    """A signed job's draw leases our sandbox failed are released uncharged (``sandbox.corpus_lease_faults``)."""
+    from reliquary.sandbox.corpus_lease_faults import corpus_lease_fault
+
+    w.lease_fault = corpus_lease_fault(services.issuer, str(w.job.job_id))
 
 
 def sandbox_validator_hotkey(config, wallet) -> str:
@@ -1507,6 +1521,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
             continue
         if sandbox_services is not None and is_signed_sandbox(w.job):
             sandbox_services.publish(w)
+            _set_lease_fault(w, sandbox_services)
     if not wiring and (served or not generation_only):
         raise RuntimeError("no corpus job left to serve: " + "; ".join(
             f"{task}: {why}" for task, why in sorted(unserved.items())))
@@ -1534,6 +1549,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
                                 contract=getattr(wiring[0].entry, "contract", None) if len(wiring) == 1 else None)
     routes_ref["routes"] = app.state.corpus_routes
     if sandbox_services is not None:
+        app.state.corpus_routes.sandbox_hotkey = sandbox_services.validator_hotkey
         app.include_router(sandbox_services.router)
         app.state.corpus_sandbox = sandbox_services
 
@@ -1571,6 +1587,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
             # the session issuer. Its router is adopted after this; until then an
             # open is refused `job_not_ready`.
             sandbox_services.publish(w)
+            _set_lease_fault(w, sandbox_services)
         unserved.pop(str(task_entry.task_id), None)       # served now
         return w
 

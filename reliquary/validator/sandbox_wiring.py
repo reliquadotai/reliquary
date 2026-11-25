@@ -208,6 +208,8 @@ class SandboxServices:
     quota: Any = None
     # The app's CorpusJobRoutes, read at call time (set by `wire_signed_job`).
     routes: Callable[[], Any] | None = None
+    # The ss58 address miners sign session requests to: `/corpus/jobs` names it (``sandbox_hotkey``).
+    validator_hotkey: str | None = None
     restore_attempts: int = RESTORE_ATTEMPTS
     restore_timeout_s: float = RESTORE_TIMEOUT_S
     restore_backoff_s: float = RESTORE_BACKOFF_S
@@ -341,7 +343,8 @@ def build_sandbox_services(config: SandboxValidatorConfig, *, validator_hotkey: 
     logger.info("sandbox services built: validator key %s, %d retired keys, corpus quota %s", config.key_id,
                 len(config.retired_keys), "on" if quota is not None else "off (fixed per-hotkey caps)")
     services = SandboxServices(signer=signer, token_verifier=token_verifier, fleet=fleet,
-                               book=book, issuer=issuer, router=router, jobs=jobs, quota=quota)
+                               book=book, issuer=issuer, router=router, jobs=jobs, quota=quota,
+                               validator_hotkey=validator_hotkey)
     return services
 
 

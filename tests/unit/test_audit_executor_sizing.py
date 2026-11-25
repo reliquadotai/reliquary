@@ -99,9 +99,13 @@ def test_throughput_is_items_per_second_an_executor_holds_a_lease():
         clock.now += 300                           # idle: not counted
         await _lease(d, clock, 100)
         assert d.items_per_second(MODEL_A) == pytest.approx(6 / 200)
+        # ITEMS: 4 completion and 3 prompt tokens a batch.
+        assert d.tokens_per_second(MODEL_A) == pytest.approx((12 / 200, 9 / 200))
         assert d.items_per_second(MODEL_B) is None
+        assert d.tokens_per_second(MODEL_B) is None
         clock.now += THROUGHPUT_WINDOW_SECONDS + 1
         assert d.items_per_second(MODEL_A) is None  # all of it left the window
+        assert d.tokens_per_second(MODEL_A) is None
 
     asyncio.run(go())
 
@@ -142,6 +146,9 @@ def test_expected_audits_are_items_at_the_jobs_audited_share():
     assert auditor.expected_audits(1000) == pytest.approx(1000 * 610 / 2050)
     auditor._decided = Counter({"audit": 100, "pass_unaudited": 1900})  # luck under q: never below q
     assert auditor.expected_audits(1000) == pytest.approx(200)
+    assert auditor.audit_share() == pytest.approx(0.2)            # the share the sandbox sizing reads
+    auditor._decided = Counter({"audit": 600, "pass_unaudited": 1400})
+    assert auditor.audit_share() == pytest.approx(610 / 2050)
 
 
 def test_idle_executors_are_those_holding_no_lease():

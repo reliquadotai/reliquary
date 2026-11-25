@@ -76,6 +76,9 @@ def admin(tmp_path, monkeypatch, registry):  # noqa: F811
                             subnet=SubnetEvalStore()))
 
     records = _JobRecords()
+    from reliquary.infrastructure.sandbox_store import MemorySessionStore
+
+    sessions = MemorySessionStore()
     # What the admin reads of a model's own files: per model, facts or an error.
     facts = {}
 
@@ -91,7 +94,7 @@ def admin(tmp_path, monkeypatch, registry):  # noqa: F811
                            deliveries=LocalDirectorySink(tmp_path / "p"),
                            open_environment=lambda source, split: GradingEnvironment(source),
                            grade_scorer=_plain_scorer, require_sandbox=lambda spec: None,
-                           work_dir=tmp_path / "work")
+                           work_dir=tmp_path / "work", order_sessions=sessions)
     client = TestClient(app)
     client.__enter__()
 
@@ -106,6 +109,7 @@ def admin(tmp_path, monkeypatch, registry):  # noqa: F811
     call.registry, call.bucket, call.records, call.root = registry, fake, records, tmp_path
     call.app, call.client = app, client
     call.facts = facts
+    call.sessions = sessions
     yield call
     client.__exit__(None, None, None)
 

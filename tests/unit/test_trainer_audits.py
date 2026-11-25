@@ -83,8 +83,8 @@ def test_the_trainer_loop_takes_judges_and_reports_within_its_budget():
     audits = TrainerAudits(source, audit_fn=audit_fn, clock=lambda: t[0])
     assert audits.run(object(), limit=4, budget_s=25.0) == 3              # the 4th waits: 30 s spent > 25 s
     assert judged == ["L0", "L1", "L2"] and set(source.reported) == {"L0", "L2"}   # L1 concluded meanwhile
-    assert audits.metrics() == {"async/audits": 3.0, "async/audit_s": 30.0}
-    assert audits.metrics() == {"async/audits": 0.0, "async/audit_s": 0.0}
+    assert audits.metrics() == {"async/audits": 3.0, "async/audit_s": 30.0, "async/audit_calls": 3.0}
+    assert audits.metrics() == {"async/audits": 0.0, "async/audit_s": 0.0, "async/audit_calls": 0.0}
     assert audits.run(object(), limit=0, budget_s=25.0) == 0 and source.asked == [4]
 
 
@@ -124,3 +124,61 @@ def test_audits_are_taken_a_few_at_a_time_so_the_budget_leaves_little_downloaded
     assert source.asked == [2, 2, 2, 1]
     source.asked.clear()
     assert audits.run(object(), limit=7, budget_s=15.0) == 2 and source.asked == [2]
+
+
+class Sized(Job):
+    def __init__(self, lease_id, rollouts=16):
+        super().__init__(lease_id)
+        self.completions = ((1,),) * rollouts
+
+
+def _batched(log, t, step=10.0, verdict=lambda g: AuditResult(True, None, (1.0,) * 16)):
+    def audit_fn(model, group):                     # the per-group path must not be used when ``many`` exists
+        raise AssertionError("judged one group at a time")
+
+    def many(model, groups):
+        log.append([g.lease_id for g in groups])
+        t[0] += step
+        return [verdict(g) for g in groups]
+
+    audit_fn.many = many
+    return audit_fn
+
+
+def test_batched_audits_pack_groups_up_to_the_rollouts_per_call():
+    t, calls = [0.0], []
+    source = Source([Sized("A"), Sized("B"), Sized("C", 40), Sized("D"), Sized("E", 80), Sized("F")])
+    audits = TrainerAudits(source, audit_fn=_batched(calls, t), clock=lambda: t[0], max_rollouts_per_call=64)
+    assert audits.run(object(), limit=10, budget_s=1000.0) == 6
+    # consecutive groups while they fit; a group over the cap goes alone
+    assert calls == [["A", "B"], ["C", "D"], ["E"], ["F"]]
+    assert set(source.reported) == {"A", "B", "C", "D", "E", "F"}
+
+
+def test_batched_audits_report_the_same_verdicts_as_group_by_group():
+    verdict = {f"L{i}": AuditResult(i % 3 != 0, None, (1.0,) * 16) for i in range(9)}
+
+    def one(model, group):
+        return verdict[group.lease_id]
+
+    t = [0.0]
+    by_group = Source([Sized(f"L{i}") for i in range(9)], gone={"L4"})
+    TrainerAudits(by_group, audit_fn=one, clock=lambda: t[0]).run(object(), limit=9, budget_s=1e9)
+    calls = []
+    batched = Source([Sized(f"L{i}") for i in range(9)], gone={"L4"})
+    TrainerAudits(batched, audit_fn=_batched(calls, t, verdict=lambda g: verdict[g.lease_id]),
+                  clock=lambda: t[0]).run(object(), limit=9, budget_s=1e9)
+    # L4 is concluded meanwhile: it stays at the queue's head and takes the last slot of the round, in both modes
+    assert batched.reported == by_group.reported and len(by_group.reported) == 7
+    assert calls == [["L0", "L1", "L2", "L3"], ["L4", "L5", "L6", "L7"], ["L4"]]
+
+
+def test_batched_audits_stop_between_calls_when_the_budget_is_spent():
+    t, calls = [0.0], []
+    source = Source([Sized(f"L{i}") for i in range(12)])
+    audits = TrainerAudits(source, audit_fn=_batched(calls, t, step=30.0), clock=lambda: t[0])
+    assert audits.run(object(), limit=12, budget_s=50.0) == 8                # 2 calls: 60 s > 50 s
+    assert len(calls) == 2 and audits.metrics() == {"async/audits": 8.0, "async/audit_s": 60.0,
+                                                "async/audit_calls": 2.0}
+    with pytest.raises(ValueError):
+        TrainerAudits(source, max_rollouts_per_call=0)

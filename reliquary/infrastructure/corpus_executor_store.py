@@ -24,13 +24,16 @@ EXECUTOR_PREFIX = "reliquary/corpus/executors/"
 EXECUTOR_STATUSES = frozenset({"active", "revoked", "quarantined"})
 # Which control an executor serves: the corpus control's audits, the eval
 # control, or the corpus control's grade leases (bound to an env pin, not a
-# model: model_id = env package, model_revision = env commit). A registration
-# without one is the corpus control's.
-EXECUTOR_SCOPES = frozenset({"corpus", "eval", "grade"})
+# model: model_id = env package, model_revision = env commit), or a training
+# order's trainer pod (bound to its task, ``task_id``). A registration without
+# one is the corpus control's.
+EXECUTOR_SCOPES = frozenset({"corpus", "eval", "grade", "trainer"})
 
 
 def scope_of(document: Mapping) -> str:
     return str(document.get("scope") or "corpus")
+# On a quarantined executor later revoked: its status no longer says so.
+WAS_QUARANTINED = "was_quarantined"
 WRITE_ATTEMPTS = 5
 READ_CONCURRENCY = 16
 
@@ -114,7 +117,8 @@ async def read_executor(executor_id: str, **client_kwargs) -> dict | None:
 async def register_executor(*, executor_id: str, token_sha256: str, model_id: str,
                             model_revision: str, expires_at: float, now: float,
                             provider_id: str | None = None, host: str | None = None,
-                            scope: str = "corpus", **client_kwargs) -> tuple[dict, bool]:
+                            scope: str = "corpus", task_id: str | None = None,
+                            **client_kwargs) -> tuple[dict, bool]:
     """Create-only. The same registration again returns the stored one; the
     same id with other credentials or another model is a conflict.
     ``provider_id``/``host`` say where it runs (the eval control pairs
@@ -147,6 +151,10 @@ async def register_executor(*, executor_id: str, token_sha256: str, model_id: st
     if scope == "grade" and not _COMMIT.fullmatch(model_revision):
         # A grade executor is bound to the env commit the job pins, never a branch.
         raise ValueError("a grade executor's model_revision is its env commit (40 hex)")
+    if scope == "trainer":
+        document["task_id"] = validated_executor_id(task_id)
+    elif task_id is not None:
+        raise ValueError("only a trainer executor is bound to a task")
     if scope != "corpus":
         # Written only off the default, so a corpus registration is unchanged.
         document["scope"] = scope
@@ -163,7 +171,7 @@ async def register_executor(*, executor_id: str, token_sha256: str, model_id: st
             continue
         same = all(stored.get(f) == document.get(f)
                    for f in ("token_sha256", "model_id", "model_revision", "expires_at",
-                             "provider_id", "host", "scope"))
+                             "provider_id", "host", "scope", "task_id"))
         if not same:
             raise ExecutorConflict(f"executor {executor_id!r} is already registered differently")
         return stored, False
@@ -195,6 +203,9 @@ async def set_executor_status(executor_id: str, status: str, *, reason: str | No
             return None
 
     def change(document: dict) -> dict:
+        if document.get("status") == "quarantined" and status == "revoked":
+            # A card released after its quarantine: what it scored must still be re-audited after a restart.
+            document[WAS_QUARANTINED] = True
         document["status"] = status
         if reason is not None:
             document["status_reason"] = reason
@@ -240,6 +251,7 @@ __all__ = [
     "EXECUTOR_SCHEMA",
     "EXECUTOR_STATUSES",
     "ExecutorConflict",
+    "WAS_QUARANTINED",
     "list_executors",
     "read_executor",
     "record_heartbeat",

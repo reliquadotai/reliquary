@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import logging
+import math
 import time
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
@@ -113,6 +114,32 @@ def pay_status(*, cap: float, price: Mapping | None, last_period: Mapping | None
             "paid_alpha_per_mtoken": (None if emission is None
                                       else paid / tokens * 1e6 * float(emission))}
     return pay
+
+
+def miner_pay(state: Mapping | None, miner_alpha_per_period: float | None) -> dict[str, Any]:
+    """What the job's miners were paid, per settled period: its verified tokens, the pool share paid for
+    them, and that share in alpha at the emission the job's price was set with (None without one). What
+    the platform bills an order on: the miners' pay at the auction's price (``corpus.token_auction``)."""
+    from reliquary.validator import corpus_periods as cp
+
+    paid = (state or {}).get("period_paid") or {}
+    tokens = (state or {}).get("period_tokens") or {}
+    emission = None if miner_alpha_per_period is None else float(miner_alpha_per_period)
+    periods = []
+    for period in sorted(paid, key=int):
+        share, count = float(paid[period]), int(tokens.get(period) or 0)
+        alpha = None if emission is None else share * emission
+        periods.append({
+            "work_period": int(period),
+            "ended_at": cp.period_end(int(period)),
+            "verified_tokens": count,
+            "paid_pool_share": share,
+            "paid_alpha": alpha,
+            "alpha_per_mtoken": None if alpha is None or count <= 0 else alpha / count * 1e6})
+    alphas = [p["paid_alpha"] for p in periods]
+    return {"periods": periods,
+            "verified_tokens": sum(p["verified_tokens"] for p in periods),
+            "paid_alpha": None if emission is None else math.fsum(alphas)}
 
 
 def _eval_prompt_counts(job: Any, slots: Any, *, unaudited: int) -> dict[str, Any]:

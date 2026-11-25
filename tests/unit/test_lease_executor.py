@@ -222,3 +222,38 @@ def test_the_client_never_reuses_a_connection_the_control_may_have_closed():
     # executor polls every 5 s, so a reused connection raced that close.
     limits = lease_executor.client_limits()
     assert limits.keepalive_expiry is not None and limits.keepalive_expiry < 5.0
+
+
+async def test_with_its_expiry_known_a_result_is_posted_again_until_the_lease_ends():
+    # 2026-11-11: a card's resolver failed one call in two; its results were dropped after 5 attempts.
+    http = _Flaky([httpx.ConnectError("name resolution")] * 8)
+    executor, slept = _executor(http)
+    await executor.post_result(LEASE, {"results": []}, expires_at=executor._wall_clock() + 300.0)
+    assert len(http.posts) == 9 > lease_executor.RESULT_POST_ATTEMPTS and executor.leases == 1
+    # Never past the lease, nor past RESULT_KEEP_SECONDS.
+    http = _Flaky([httpx.ConnectError("name resolution")] * 500)
+    executor, slept = _executor(http)
+    with pytest.raises(httpx.ConnectError):
+        await executor.post_result(LEASE, {"results": []}, expires_at=executor._wall_clock() + 100_000.0)
+    assert sum(slept) <= lease_executor.RESULT_KEEP_SECONDS
+
+
+def test_a_failed_name_lookup_answers_with_the_last_addresses(monkeypatch):
+    import socket
+
+    answers = [[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("203.0.113.7", 443))]]
+
+    def flaky(host, port, *args, **kwargs):
+        if not answers:
+            raise socket.gaierror(-3, "Temporary failure in name resolution")
+        return answers.pop()
+
+    monkeypatch.setattr(socket, "getaddrinfo", flaky)
+    monkeypatch.setattr(lease_executor, "_RESOLVED", {})
+    lease_executor.install_resolver_cache()
+    first = socket.getaddrinfo("api.example", 443)
+    assert socket.getaddrinfo("api.example", 443) == first           # the lookup failed: last addresses
+    with pytest.raises(socket.gaierror):
+        socket.getaddrinfo("never.example", 443)                     # never resolved: the failure stands
+    lease_executor.install_resolver_cache()                          # installing again wraps the real one once
+    assert socket.getaddrinfo.__wrapped__ is flaky

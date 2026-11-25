@@ -30,6 +30,7 @@ import logging
 import math
 import os
 import re
+import threading
 import time
 from typing import Any, NamedTuple, Protocol
 
@@ -84,6 +85,8 @@ JOB_PATH = "/corpus/job"
 CURSOR_PATH = "/corpus/cursor/{hotkey}"
 # Job-scoped reads, for a validator serving several jobs on one model.
 JOBS_PATH = "/corpus/jobs"
+# A served job's state in `JOBS_PATH`'s ``orders``.
+ORDER_OPEN, ORDER_STARTING, ORDER_PAUSED, ORDER_DRAINING = "open", "starting", "paused", "draining"
 JOB_SCOPED_PATH = "/corpus/jobs/{job_id}/job"
 CURSOR_SCOPED_PATH = "/corpus/jobs/{job_id}/cursor/{hotkey}"
 # Check before generating: where a hotkey's walk stands and whether that prompt
@@ -102,6 +105,8 @@ LEASE_SCOPED_PATH = "/corpus/jobs/{job_id}/lease"
 LEASE_RELEASE_SCOPED_PATH = "/corpus/jobs/{job_id}/lease/release"
 # A lease request is fresh within this many seconds of its ``issued_at``; its nonce is single-use meanwhile.
 LEASE_REQUEST_SKEW_SECONDS = 120.0
+# An accepted submission of a hotkey whose offer swaps carries up to this many next leases (its slots permitting).
+SWAP_LEASES = 4
 # A job priced by auction (``corpus.token_auction``): a hotkey's ask, and the job's public rounds.
 ASK_PATH = "/corpus/ask"
 ASK_SCOPED_PATH = "/corpus/jobs/{job_id}/ask"
@@ -1662,6 +1667,7 @@ def build_corpus_router(
     vocab_size: int | None = None,
     is_banned: Callable[[str], Awaitable[bool]] | None = None,
     registration: Callable[[str], Awaitable[str | None]] | None = None,
+    suspect_until: Callable[[str], Awaitable[float | None]] | None = None,
     ledger_lock_timeout: float = LEDGER_LOCK_TIMEOUT_SECONDS,
     seal_threshold: int = SEAL_THRESHOLD,
     segment_max: int = SEGMENT_MAX,
@@ -1672,6 +1678,8 @@ def build_corpus_router(
     durable_records: bool | None = None,
     pending_record_arrivals: dict[str, float] | None = None,
     auction=None,
+    lease_fault=None,
+    lease_held: Callable[[], bool] | None = None,
 ) -> APIRouter:
     """The corpus submission endpoint, over an already-bound job store.
 
@@ -1692,6 +1700,8 @@ def build_corpus_router(
     submit body cap, ``router.body_cap``; without it the minimum applies.
     ``auction`` (``corpus.token_auction.TokenAuction``) prices a draw job by auction: a lease goes only to a hotkey
     whose ask the round admits, carries the round's price, and only a slot the hotkey leased is accepted.
+    ``lease_fault`` (``sandbox.corpus_lease_faults.corpus_lease_fault``) names a lease our side failed: it ends
+    uncharged (``DrawLeases``' ``validator_fault``).
     """
 
     body_cap = worst_case_body(job) if job is not None else MIN_SUBMIT_BODY_BYTES
@@ -1722,8 +1732,13 @@ def build_corpus_router(
     announced: set[str] = set()
     record_lock = asyncio.Lock()
 
-    # A draw job's light leases (``corpus.draw_leases``), in this process: a restart drops them.
+    # A draw job's light leases (``corpus.draw_leases``), one book per job; an auctioned job's survive a restart.
     leases_by_job: dict[str, Any] = {}
+    # Leases are granted off the event loop: two first requests at once must not each build a lease book (the one
+    # that loses would drop the leases it granted, and both write the same state file).
+    leases_lock = threading.Lock()
+    # Serialize grant batches in the worker so HTTP cancellation cannot release the lock mid-batch.
+    grant_lock = threading.Lock()
     lease_nonces: dict[str, float] = {}
     # The taken keys of the ledger version last leased from: rebuilt once per version, not per request.
     lease_seen: dict[str, Any] = {}
@@ -1732,15 +1747,23 @@ def build_corpus_router(
         from reliquary.corpus.draw_leases import DrawLeases
 
         leases = leases_by_job.get(job.job_id)
-        if leases is None:
+        if leases is not None:
+            return leases
+        with leases_lock:
+            leases = leases_by_job.get(job.job_id)
+            if leases is not None:
+                return leases
             if auction is None:
-                leases = DrawLeases(job)
+                leases = DrawLeases(job, validator_fault=lease_fault, held=lease_held)
             else:
-                leases = DrawLeases(job, limit_per_hotkey=False,
-                                    on_unused=lambda lease, held: auction.lease_ended(lease.hotkey, lease.price, held))
+                # Beside the auction's state, so a control restart keeps the leases in flight.
+                leases = DrawLeases(job, limit_per_hotkey=False, validator_fault=lease_fault, held=lease_held,
+                                    on_unused=lambda lease, held: auction.lease_ended(lease.hotkey, lease.price, held),
+                                    state_path=(auction.state_path.with_suffix(".leases.json")
+                                                if auction.state_path is not None else None))
                 auction.bind_holdings(leases.counts)
-            leases = leases_by_job[job.job_id] = leases
-        return leases
+            leases_by_job[job.job_id] = leases
+            return leases
 
     def announce(sid: str) -> None:
         if sid not in announced and on_accepted is not None:
@@ -2080,7 +2103,7 @@ def build_corpus_router(
                 value = float(own.price) * sum(token_counts)
                 pricing = {"lease_price": float(own.price),
                            "lease_debit": auction.take_debit(request.miner_hotkey, value),
-                           "granted_at": own.granted_at}
+                           "granted_at": own.granted_at, "offer": own.offer}
 
         def unpriced() -> None:
             nonlocal pricing
@@ -2222,13 +2245,14 @@ def build_corpus_router(
         if pricing is not None:
             if written is not None and written.accepted:
                 auction.observe_tokens(sum(token_counts))
-                auction.observe_delivery(request.miner_hotkey, time.time() - pricing["granted_at"])
+                auction.observe_delivery(request.miner_hotkey, time.time() - pricing["granted_at"],
+                                         offer=pricing["offer"], tokens=sum(token_counts))
             else:
                 unpriced()
 
         if written is not None and drawn and (written.accepted or written.reason == CorpusRejectReason.DRAW_SLOT_TAKEN.value):
             # The slot is taken: its leases end.
-            _leases(job).settle(request.prompt_index, request.cursor)
+            _leases(job).settle(request.prompt_index, request.cursor, request.miner_hotkey)
         if written is not None:
             if record is not None and not written.accepted:
                 # Concurrent retries of the same signed request can share a
@@ -2244,7 +2268,12 @@ def build_corpus_router(
                         raise _ledger_corrupt(LedgerSnapshotError("existing accepted record differs"))
                     state = await _read_state(job)
                     written = Verdict(True, "accepted", slots_remaining=state.slots.remaining(request.prompt_index))
-            return _respond(written)
+            response = _respond(written)
+            if written.accepted and drawn and auction is not None:
+                swapped = await _swap_leases(job, request.miner_hotkey)
+                if swapped:
+                    response.detail["next_leases"] = swapped
+            return response
 
         logger.warning(
             "corpus ledgers for %s stayed contended over %d attempts (miner %s)",
@@ -2805,33 +2834,12 @@ def build_corpus_router(
         gated = await _hotkey_refusal(request.miner_hotkey)
         return _lease_refused(gated) if gated is not None else None
 
-    async def lease_corpus(request: CorpusLeaseRequest) -> CorpusLeaseResponse:
-        """A light lease on one of this draw job's free slots (``corpus.draw_leases``)."""
-        now = time.time()
-        if abs(now - request.issued_at) > LEASE_REQUEST_SKEW_SECONDS:
-            return _lease_refused("stale_request", {"now": int(now)})
-        for nonce in [n for n, until in lease_nonces.items() if until <= now]:
-            del lease_nonces[nonce]
-        if request.nonce in lease_nonces:
-            return _lease_refused("replayed_request")
-        refused = await _lease_gate(request)
-        if refused is not None:
-            return refused
-        lease_nonces[request.nonce] = now + 2 * LEASE_REQUEST_SKEW_SECONDS
-        job = await _read_job_checked()
-        if job is None:
-            return _lease_refused(CorpusRejectReason.JOB_UNKNOWN, {"job_id": job_id})
-        if not has_draw(job):
-            return _lease_refused("not_a_draw_job")
-        state = await _read_state(job)
-        if state.slots.is_complete:
-            return _lease_refused(CorpusRejectReason.JOB_COMPLETE)
-        wanted = 1 if request.count is None else int(request.count)
+    def _grant_leases(job, state, hotkey: str, wanted: int):
+        """Up to ``wanted`` leases for ``hotkey`` (off the event loop), and why the next one was not granted
+        (None when all were)."""
+        from reliquary.corpus.draw_leases import free_draw_slots
 
-        def grant():
-            """Up to ``wanted`` leases, and why the next one was not granted (None when all were)."""
-            from reliquary.corpus.draw_leases import free_draw_slots
-
+        with grant_lock:
             if lease_seen.get("state") is not state:
                 built = set(state.pending)
                 for ref in state.segments:
@@ -2846,16 +2854,15 @@ def build_corpus_router(
 
             granted = []
             for _ in range(wanted):
-                terms = None
-                seconds = None
-                if auction is not None:
-                    terms = auction.admit(request.miner_hotkey)
-                    if isinstance(terms, str):
-                        return granted, terms
-                    seconds = auction.lease_seconds(request.miner_hotkey, leases.seconds)
+                terms = None if auction is None else auction.admit(hotkey)
+                if isinstance(terms, str):
+                    return granted, terms
                 try:
-                    lease = leases.grant(request.miner_hotkey, free_draw_slots(job, ledger, taken),
-                                         price=None if terms is None else terms.price, seconds=seconds)
+                    seconds = None if terms is None else auction.lease_seconds(
+                        hotkey, leases.seconds, held=len(leases.held_by(hotkey)))
+                    lease = leases.grant(hotkey, free_draw_slots(job, ledger, taken),
+                                         price=None if terms is None else terms.price, seconds=seconds,
+                                         offer=None if terms is None else terms.offer)
                 finally:
                     if terms is not None:
                         auction.unreserve(terms)
@@ -2864,7 +2871,63 @@ def build_corpus_router(
                 granted.append(lease)
             return granted, None
 
-        granted, why = await asyncio.to_thread(grant)
+    async def _swap_leases(job, hotkey: str) -> list[dict]:
+        """An accepted submission of a hotkey whose offer swaps: its next leases, up to its slots, in the same
+        answer (docs/design/2026-11-17-lease-allocation.md 3.5). Never fails the submission."""
+        if auction is None or not auction.swaps(hotkey):
+            return []
+        try:
+            if suspect_until is not None and await suspect_until(hotkey) is not None:
+                return []                     # its audits just failed: no new work, as on the lease route
+            state = await _read_state(job)
+            if state.slots.is_complete:
+                return []
+            auction.note_progress(state.slots.filled, state.slots.total)
+            granted, _ = await asyncio.to_thread(_grant_leases, job, state, hotkey, SWAP_LEASES)
+        except Exception:
+            logger.warning("corpus swap leases for %s failed", hotkey[:12], exc_info=True)
+            return []
+        return [lease.to_wire() for lease in granted]
+
+    async def lease_corpus(request: CorpusLeaseRequest) -> CorpusLeaseResponse:
+        """A light lease on one of this draw job's free slots (``corpus.draw_leases``)."""
+        now = time.time()
+        if abs(now - request.issued_at) > LEASE_REQUEST_SKEW_SECONDS:
+            return _lease_refused("stale_request", {"now": int(now)})
+        for nonce in [n for n, until in lease_nonces.items() if until <= now]:
+            del lease_nonces[nonce]
+        if request.nonce in lease_nonces:
+            return _lease_refused("replayed_request")
+        refused = await _lease_gate(request)
+        if refused is not None:
+            return refused
+        if suspect_until is not None:
+            # A hotkey whose audits just failed gets no new work until its suspicion ends: everything it sends
+            # meanwhile is audited, most of it to be refused (2026-11-13: a caught hotkey's backlog held an
+            # order's audit for 25 minutes). Its offer steps aside so its share goes to the offers behind it.
+            try:
+                until = await suspect_until(request.miner_hotkey)
+            except Exception:
+                logger.warning("corpus suspect check for %s failed", request.miner_hotkey[:12], exc_info=True)
+                until = None
+            if until is not None:
+                if auction is not None:
+                    auction.set_aside(request.miner_hotkey, until)
+                return _lease_refused(CorpusRejectReason.MINER_SUSPECT, {"suspect_until": int(until)})
+        lease_nonces[request.nonce] = now + 2 * LEASE_REQUEST_SKEW_SECONDS
+        job = await _read_job_checked()
+        if job is None:
+            return _lease_refused(CorpusRejectReason.JOB_UNKNOWN, {"job_id": job_id})
+        if not has_draw(job):
+            return _lease_refused("not_a_draw_job")
+        state = await _read_state(job)
+        if state.slots.is_complete:
+            return _lease_refused(CorpusRejectReason.JOB_COMPLETE)
+        wanted = 1 if request.count is None else int(request.count)
+        if auction is not None:
+            auction.note_progress(state.slots.filled, state.slots.total)
+
+        granted, why = await asyncio.to_thread(_grant_leases, job, state, request.miner_hotkey, wanted)
         if not granted:
             return _lease_refused(why, None if auction is None else auction.view(request.miner_hotkey))
         detail = {}
@@ -2895,7 +2958,8 @@ def build_corpus_router(
         lease_nonces[request.nonce] = now + 2 * LEASE_REQUEST_SKEW_SECONDS
         if auction is None:
             return refused("not_priced_by_auction")
-        why = auction.post_ask(request.miner_hotkey, request.micro_alpha_per_mtoken / 1e6, request.capacity)
+        why = auction.post_ask(request.miner_hotkey, request.micro_alpha_per_mtoken / 1e6, request.capacity,
+                               swap=bool(request.swap))
         if why is not None:
             return refused(why)
         return CorpusAskResponse(accepted=True, reason="accepted", detail=auction.view(request.miner_hotkey))
@@ -2925,6 +2989,16 @@ def build_corpus_router(
     router.auction_view = auction_view
     router.auction = auction
     router.draw_leases = leases_by_job
+    if lease_held is not None and job is not None and has_draw(job):
+        # From now: a hold after a restart stops the clock of the leases restored, before any route reads them.
+        _leases(job)
+
+    def sync_lease_clock() -> None:
+        leases = leases_by_job.get(job_id)
+        if leases is not None:
+            leases.expire()
+
+    router.sync_lease_clock = sync_lease_clock
     router.slots_remaining = slots_remaining
     # The handlers themselves, so `build_corpus_jobs_router` can dispatch to
     # this job without a second copy of any of them.
@@ -2963,19 +3037,32 @@ class CorpusJobRoutes:
         self.contracts: dict[str, Any] = {}
         # Each job's prompt source: an eval job's names the set miners fetch.
         self.prompt_sources: dict[str, str] = {}
+        # Each job's spec, when the caller gave it: what `orders` tells miners of it.
+        self.specs: dict[str, Any] = {}
         self.retired: set[str] = set()
         self.paused: set[str] = set()
         # Jobs kept from miners until their condition holds (an order's audit executor ready).
         self.held: dict[str, Callable[[], bool]] = {}
+        # Why a held job is held, when its holder says (e.g. ``no_gateway``).
+        self.hold_reasons: dict[str, Callable[[], str | None]] = {}
+        # Held jobs whose hold is checked every time, never released for good.
+        self.unlatched: set[str] = set()
+        # Per job, the hold reason that stops its leases' clock and lets a miner release a lease.
+        self.lease_clock_reasons: dict[str, str] = {}
         # Handlers past the retired check. admission_pending also accounts for
         # taken turns that continue after their HTTP handler is cancelled.
         self.in_flight: collections.Counter = collections.Counter()
         self.default = default if default is not None else next(iter(self.routers), None)
+        # The ss58 address signed-sandbox session requests are signed for, when this app serves sessions:
+        # `JOBS_PATH` tells miners, so they need no ``--validator-hotkey``.
+        self.sandbox_hotkey: str | None = None
 
     def add(self, job_id: str, router: APIRouter, *, contract: Any = None,
-            prompt_source: str | None = None) -> None:
+            prompt_source: str | None = None, spec: Any = None) -> None:
         self.routers[job_id] = router
         self.contracts[job_id] = contract
+        if spec is not None:
+            self.specs[job_id] = spec
         if prompt_source is not None:
             self.prompt_sources[job_id] = prompt_source
         self.retired.discard(job_id)
@@ -2985,9 +3072,19 @@ class CorpusJobRoutes:
     def retire(self, job_id: str) -> None:
         self.retired.add(job_id)
 
-    def hold(self, job_id: str, until: Callable[[], bool]) -> None:
-        """Keep the job from miners, as paused, until ``until()`` first holds."""
+    def hold(self, job_id: str, until: Callable[[], bool], *, why: Callable[[], str | None] | None = None,
+             latch: bool = True) -> None:
+        """Keep the job from miners, as paused, until ``until()`` first holds (then never again); ``why()``
+        says why it is still held. ``latch=False``: held whenever ``until()`` is false, however often."""
         self.held[job_id] = until
+        if latch:
+            self.unlatched.discard(job_id)
+        else:
+            self.unlatched.add(job_id)
+        if why is not None:
+            self.hold_reasons[job_id] = why
+        else:
+            self.hold_reasons.pop(job_id, None)
 
     def is_held(self, job_id: str) -> bool:
         until = self.held.get(job_id)
@@ -2999,9 +3096,33 @@ class CorpusJobRoutes:
         except Exception:
             logger.exception("corpus job %s: its hold could not be checked; still held", job_id)
             return True
-        del self.held[job_id]
+        if job_id in self.unlatched:
+            return False
+        # Pop: a lease route reads this from its worker thread too.
+        self.held.pop(job_id, None)
+        self.hold_reasons.pop(job_id, None)
         logger.info("corpus job %s: released to miners", job_id)
         return False
+
+    def held_reason(self, job_id: str) -> str | None:
+        """Why the job is held (``held`` when its holder gives no reason), or None once released."""
+        if not self.is_held(job_id):
+            return None
+        why = self.hold_reasons.get(job_id)
+        try:
+            reason = why() if why is not None else None
+        except Exception:
+            logger.exception("corpus job %s: its hold reason could not be read", job_id)
+            reason = None
+        return reason or "held"
+
+    def stop_lease_clock_on(self, job_id: str, reason: str) -> None:
+        """While ``job_id`` is held for ``reason``, its leases' clock is stopped (``DrawLeases``)."""
+        self.lease_clock_reasons[job_id] = reason
+
+    def lease_clock_stopped(self, job_id: str) -> bool:
+        reason = self.lease_clock_reasons.get(job_id)
+        return reason is not None and self.held_reason(job_id) == reason
 
     def set_admission(self, job_id: str, admission: str) -> None:
         if admission == "paused":
@@ -3020,6 +3141,43 @@ class CorpusJobRoutes:
         return sorted(j for j in self.routers
                       if j not in self.retired and j not in self.paused and not self.is_held(j))
 
+    def state_of(self, job_id: str) -> str:
+        """What a miner may do on a served job: ``open`` (mine it), ``starting`` (held until its audit is
+        ready: fetch the model), ``paused``, or ``draining`` (it admits nothing more)."""
+        if job_id in self.retired:
+            return ORDER_DRAINING
+        if job_id in self.paused:
+            return ORDER_PAUSED
+        if self.is_held(job_id):
+            return ORDER_STARTING
+        return ORDER_OPEN
+
+    def orders(self) -> list[dict]:
+        """Every served job, open or not, with what a miner needs to choose one (`JOBS_PATH`)."""
+        listed = []
+        for job_id in sorted(self.routers):
+            spec = self.specs.get(job_id)
+            entry = {"job_id": job_id, "state": self.state_of(job_id)}
+            facts = {"model": getattr(spec, "checkpoint_repo", None),
+                     "revision": getattr(spec, "checkpoint_revision", None),
+                     "prompts": getattr(spec, "prompt_count", None),
+                     "samples_per_prompt": getattr(spec, "slots_per_prompt", None),
+                     "max_new_tokens": getattr(getattr(spec, "sampling", None), "max_new_tokens", None),
+                     "max_prompt_tokens": getattr(spec, "max_prompt_tokens", None)}
+            entry.update({k: v for k, v in facts.items() if v is not None})
+            view = getattr(self.routers[job_id], "auction_view", None)
+            try:
+                auction = view() if callable(view) else None
+            except Exception:
+                # Its pricing unknown for now: left out rather than told wrong.
+                logger.exception("corpus job %s: its auction view failed", job_id)
+            else:
+                entry["pricing"] = "auction" if auction is not None else "first_come"
+                if auction is not None:
+                    entry["auction"] = auction
+            listed.append(entry)
+        return listed
+
     def admission_pending(self, job_id: str) -> bool:
         """A write handler or its detached ledger/record work is still running."""
         if self.in_flight[job_id]:
@@ -3034,11 +3192,13 @@ class CorpusJobRoutes:
             await recover()
 
     @contextlib.asynccontextmanager
-    async def admission(self, job_id: str):
-        """The job's router for one write, refused once retired, counted while it runs."""
+    async def admission(self, job_id: str, *, releasing: bool = False):
+        """The job's router for one write, refused once retired, counted while it runs. ``releasing``: a lease
+        given back, which a hold that stopped the leases' clock lets through."""
         if job_id in self.retired:
             raise HTTPException(status_code=410, detail=JOB_RETIRED)
-        if job_id in self.paused or self.is_held(job_id):
+        if job_id in self.paused or (self.is_held(job_id)
+                                     and not (releasing and self.lease_clock_stopped(job_id))):
             raise HTTPException(status_code=409, detail="job_paused")
         router = self.routers.get(job_id)
         if router is None:
@@ -3105,7 +3265,11 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter] | CorpusJobRoutes,
 
     @router.get(JOBS_PATH)
     async def corpus_jobs() -> dict:
-        return {"jobs": routes.open_jobs()}
+        # ``jobs``: the ids open to mine now (older miners read it); ``orders``: every served job and its state.
+        listing = {"jobs": routes.open_jobs(), "orders": routes.orders()}
+        if routes.sandbox_hotkey:
+            listing["sandbox_hotkey"] = routes.sandbox_hotkey
+        return listing
 
     @router.get(JOB_SCOPED_PATH)
     async def corpus_job_scoped(job_id: str) -> dict:
@@ -3137,7 +3301,7 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter] | CorpusJobRoutes,
 
     @router.post(LEASE_RELEASE_SCOPED_PATH, response_model=CorpusLeaseResponse)
     async def release_corpus_lease_scoped(job_id: str, request: CorpusLeaseReleaseRequest) -> CorpusLeaseResponse:
-        async with routes.admission(job_id) as served:
+        async with routes.admission(job_id, releasing=True) as served:
             return await served.release_corpus_lease(request)
 
     @router.post(ASK_SCOPED_PATH, response_model=CorpusAskResponse)
@@ -3217,7 +3381,7 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter] | CorpusJobRoutes,
         if await _lease_target(request) is None:
             return CorpusLeaseResponse(leased=False, reason=CorpusRejectReason.JOB_NOT_SERVED.value,
                                        detail={"job_id": request.job_id, "serves": routes.open_jobs()})
-        async with routes.admission(request.job_id) as target:
+        async with routes.admission(request.job_id, releasing=True) as target:
             return await target.release_corpus_lease(request)
 
     @router.post(SUBMIT_PATH, response_model=CorpusSubmissionResponse)

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections.abc import Callable
 from typing import Any
@@ -18,8 +19,8 @@ from reliquary.validator.corpus_audit_protocol import (
     AUDIT_PROTOCOL,
     AUDIT_PROTOCOL_V2,
     AUDIT_PROTOCOL_V3,
+    AUDIT_PROTOCOL_V4,
     ITEM_ERROR,
-    PROTOCOLS,
     AuditLease,
 )
 from reliquary.validator.lease_executor import TOKEN_ENV, LeaseExecutor, serve_executor
@@ -44,6 +45,28 @@ DISK_MARGIN_BYTES = 4 * 1024**3
 LOAD_BUDGET_SECONDS = 1500.0
 # The download rate is judged only after this long (its first seconds are metadata and setup).
 DOWNLOAD_PROBE_SECONDS = 120.0
+
+# Packed batches stay this small on a card with less free memory than this once the model is loaded:
+# measured 2026-11-16, Qwen3.8-27B on an 80 GB H100 (about 26 GB free) overran at 131,072 tokens and
+# peaked at 72 GB at 65,536; a single 128k-token row still fit, at 81 of 85 GB.
+SMALL_CARD_FREE_BYTES = 40e9
+SMALL_CARD_BATCH_TOKENS = 65536
+BATCH_TOKENS_ENV = "RELIQUARY_CORPUS_AUDIT_BATCH_TOKENS"
+# Fragmentation alone failed the 128k row on that card: segments that grow keep it whole.
+ALLOC_CONF_ENV, ALLOC_CONF = "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"
+
+
+def batch_tokens_for(free_bytes: int | None, default: int) -> int:
+    """The packed batch for a card with ``free_bytes`` left after the load (None: unknown, the default)."""
+    if free_bytes is not None and free_bytes < SMALL_CARD_FREE_BYTES:
+        return min(default, SMALL_CARD_BATCH_TOKENS)
+    return default
+
+
+def _free_cuda_bytes() -> int | None:
+    import torch
+
+    return torch.cuda.mem_get_info()[0] if torch.cuda.is_available() else None
 
 
 class DiskTooSmall(RuntimeError):
@@ -149,6 +172,7 @@ class AuditExecutor(LeaseExecutor):
                  load_model: Callable[[str, str], Any] = load_public_model,
                  progress: Callable[[str, str], tuple[int, int]] | None = None,
                  batch_tokens: int | None = None,
+                 free_bytes: Callable[[], int | None] = _free_cuda_bytes,
                  heartbeat_seconds: float = HEARTBEAT_SECONDS,
                  idle_seconds: float = IDLE_SECONDS,
                  clock: Callable[[], float] = time.monotonic,
@@ -161,13 +185,18 @@ class AuditExecutor(LeaseExecutor):
         self._load_model = load_model
         self._progress = progress
         self._model = None
+        # Sized to the card once the model is loaded, unless the caller or the operator set it.
+        self._batch_sized = batch_tokens is not None or BATCH_TOKENS_ENV in os.environ
         if batch_tokens is None:
             from reliquary.validator.corpus_auditor import AUDIT_BATCH_TOKENS
 
             batch_tokens = AUDIT_BATCH_TOKENS
         self._batch_tokens = batch_tokens
-        self._v3 = True
-        self._v3_retry_at = 0.0
+        self._free_bytes = free_bytes
+        # What it offers beyond v1 (and the corpus control's v2): 2 the draws v3 and v4, 1 v3 only, 0 neither.
+        # An older control refuses a protocol it does not know: the executor steps down, and offers all again later.
+        self._draws = 2
+        self._draws_retry_at = 0.0
 
     def heartbeat_detail(self) -> dict:
         return {"leases": self.leases, "loaded": self._model is not None}
@@ -191,6 +220,11 @@ class AuditExecutor(LeaseExecutor):
             # go silent instead, so the fleet sees a dead pod and replaces it on another host.
             logger.critical("audit executor %s cannot run on this pod: %s", self._executor_id, exc)
             await asyncio.Event().wait()
+        if not self._batch_sized:
+            free = self._free_bytes()
+            self._batch_tokens = batch_tokens_for(free, self._batch_tokens)
+            logger.info("audit executor %s: %s GB free after the load, batches of %d tokens",
+                        self._executor_id, "?" if free is None else round(free / 1e9, 1), self._batch_tokens)
 
     async def _load_heartbeating(self):
         """Load the model while heartbeating, so a slow 27B download is not taken for a dead pod;
@@ -256,21 +290,20 @@ class AuditExecutor(LeaseExecutor):
         await self.heartbeat_if_due()
         body = {"executor_id": self._executor_id, "model_id": self.model_id,
                 "model_revision": self.model_revision}
-        if not self._v3 and self._clock() >= self._v3_retry_at:
-            self._v3 = True
-        if self._v3:
-            # The eval control scores v1 (pairs) and v3 (forced draws).
-            body["protocols"] = list(PROTOCOLS) if self._prefix == AUDIT_PREFIX else [AUDIT_PROTOCOL,
-                                                                                       AUDIT_PROTOCOL_V3]
-        elif self._prefix == AUDIT_PREFIX:
-            body["protocols"] = [AUDIT_PROTOCOL, AUDIT_PROTOCOL_V2]
+        if self._draws < 2 and self._clock() >= self._draws_retry_at:
+            self._draws = 2
+        base = [AUDIT_PROTOCOL, AUDIT_PROTOCOL_V2] if self._prefix == AUDIT_PREFIX else [AUDIT_PROTOCOL]
+        draws = [AUDIT_PROTOCOL_V3, AUDIT_PROTOCOL_V4][:self._draws]
+        if draws or self._prefix == AUDIT_PREFIX:
+            # The eval control scores v1 (pairs), v3 (forced draws) and v4 (greedy forced draws).
+            body["protocols"] = base + draws
         response = await self._post(f"{self._prefix}/claim", body)
-        if response.status_code == 422 and self._v3:
-            # A control that predates v3 refuses it: claim as before (corpus v1+v2; eval, no field), and offer v3
-            # again later, so an upgraded control gets it without a restart.
-            logger.warning("audit control at %s does not take v3; claiming without it", self._prefix)
-            self._v3 = False
-            self._v3_retry_at = self._clock() + V3_RETRY_SECONDS
+        if response.status_code == 422 and self._draws:
+            # A control that predates v4 (or v3) refuses it: claim without it (at last as before v3: corpus v1+v2,
+            # eval no field), and offer it again later, so an upgraded control gets it without a restart.
+            logger.warning("audit control at %s does not take %s; claiming without it", self._prefix, draws[-1])
+            self._draws -= 1
+            self._draws_retry_at = self._clock() + V3_RETRY_SECONDS
             return await self.step()
         if response.status_code == 204:
             return False
@@ -283,9 +316,11 @@ class AuditExecutor(LeaseExecutor):
 
 def run_audit_executor(*, control_url: str, executor_id: str, model_id: str | None = None,
                        model_revision: str | None = None, prefix: str = AUDIT_PREFIX) -> None:
+    # Before the first CUDA allocation, which fixes the allocator's settings.
+    os.environ.setdefault(ALLOC_CONF_ENV, ALLOC_CONF)
     serve_executor(control_url, lambda **client: AuditExecutor(
         executor_id=executor_id, model_id=model_id, model_revision=model_revision,
         progress=download_progress, prefix=prefix, **client))
 
 
-__all__ = ["AuditExecutor", "DiskTooSmall", "SlowDownload", "TOKEN_ENV", "load_public_model", "run_audit_executor"]
+__all__ = ["AuditExecutor", "DiskTooSmall", "batch_tokens_for", "SlowDownload", "TOKEN_ENV", "load_public_model", "run_audit_executor"]
