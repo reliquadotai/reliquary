@@ -279,10 +279,12 @@ class CorpusAuditor:
         self._next_due: dict[str, float] = {}
         # Write errors of the current judge_many, raised after its backward audit.
         self._deferred: list[BaseException] = []
-        # Forced-draw audits per hotkey [audited, refused], the job's totals, and the ids counted (`_count_refusal`).
+        # Forced-draw audits per hotkey [audited, refused], the job's totals, and the ids counted (`_count_refusal`);
+        # the ids a re-audit counted as refusals (`_recount_refusal`).
         self._draw_counts: dict[str, list[int]] = {}
         self._draw_totals = [0, 0]
         self._draw_counted: set[str] = set()
+        self._draw_recounted: set[str] = set()
         # Passes this process wrote, per hotkey (received_at, id), and whether the job's earlier ones
         # were read once: a forfeit then never lists the job again (`_void_forfeited`).
         self._paid: dict[str, list[tuple[float, str]]] = {}
@@ -1179,12 +1181,34 @@ class CorpusAuditor:
         counts[1] += int(refused)
         self._draw_totals[0] += 1
         self._draw_totals[1] += int(refused)
-        if refused and outcome.get("penalty") is False and frequent_refusals(
+        return self._charged_if_frequent(hotkey, outcome) if refused else outcome
+
+    def _charged_if_frequent(self, hotkey: str, outcome: dict) -> dict:
+        """A counted refusal without penalty, charged when its hotkey's counts are far above the job's other
+        hotkeys' (``frequent_refusals``)."""
+        counts = self._draw_counts[hotkey]
+        if outcome.get("penalty") is False and frequent_refusals(
                 counts[1], counts[0], self._draw_totals[1] - counts[1], self._draw_totals[0] - counts[0]):
             logger.warning("corpus job %s: %s refused %d of %d audits, far above the job's other hotkeys: charged",
                            self._job_id, hotkey[:12], counts[1], counts[0])
             return {**outcome, "penalty": True, "charged_for": "frequent_refusals"}
         return outcome
+
+    def _recount_refusal(self, submission_id: str, hotkey: str, outcome: dict) -> dict:
+        """A drift that the re-audit of a quarantined executor's pass repeats (`reaudit_executor`), counted as a
+        judging pass that refused it counts one (`_count_refusal`): the passing audit its judging pass counted
+        becomes a refusal, and the same rule charges it when its hotkey is now refused far more often than the
+        job's other hotkeys. A pass this process never counted (written before a restart) is counted in full.
+        Once per submission, as there: a later re-audit of it gets its outcome back as it is."""
+        if (self._draw_job is None or outcome.get("reason") != "draw_mismatch"
+                or submission_id in self._draw_recounted):
+            return outcome
+        self._draw_recounted.add(submission_id)
+        if submission_id not in self._draw_counted:
+            return self._count_refusal(submission_id, hotkey, outcome)
+        self._draw_counts.setdefault(hotkey, [0, 0])[1] += 1
+        self._draw_totals[1] += 1
+        return self._charged_if_frequent(hotkey, outcome)
 
     def _received(self, submission_id: str, record: Mapping | None = None) -> float | None:
         meta = self._meta.get(submission_id)
@@ -1768,7 +1792,9 @@ class CorpusAuditor:
         was already settled inside the hold window. A refusal without penalty
         (forced-draw drift) is voided uncharged, as a judging pass refuses it
         uncharged (`_audit_records_in_pass`), and its slot reopens at once, as
-        that pass reopens a refused sample's (`_write`)."""
+        that pass reopens a refused sample's (`_write`); it counts as a refusal
+        of its hotkey, and is charged when that pass would charge it for
+        frequent refusals (`_recount_refusal`)."""
         # Its outcomes computed ahead are not taken either: those records are audited again by their pass.
         self._ahead = {sid: outcome for sid, outcome in self._ahead.items()
                        if executor_id not in (outcome.get("scored_by") or ())}
@@ -1797,6 +1823,11 @@ class CorpusAuditor:
                 if isinstance(again, dict) and not again["passed"]:
                     failed[sid] = again
         if failed:
+            for sid, outcome in failed.items():
+                if not outcome.get("penalty", True):
+                    # Its judging pass counted a pass: a refusal now, charged if its hotkey is refused far more
+                    # often than the job's other hotkeys, as a judging pass that refused it would charge it.
+                    failed[sid] = self._recount_refusal(sid, records[sid]["hotkey"], outcome)
             by_hotkey: dict[str, list[str]] = {}
             for sid, outcome in failed.items():
                 # A refusal without penalty (forced-draw drift) is no confirmed failure: no suspicion, no ban,

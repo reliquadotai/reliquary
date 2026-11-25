@@ -776,6 +776,68 @@ def test_an_eval_auditor_reopens_a_reaudited_drift_in_its_ledger_once(monkeypatc
     assert records.voided[drift]["penalty"] is False and ledger == [drift]
 
 
+_PASSING = {"passed": True, "worst_exp": 0, "worst_mant_mean": 0.0, "worst_mant_median": 0.0}
+
+
+def _draw_reaudit(executors=("pod-1",)):
+    """A forced-draw job at q = 1 whose other hotkeys passed 2,000 audits. ``run.ids``: three records of 5X, and
+    ``run.cheat`` one of 5Cheat. A judging pass takes ``executors``' passing scores (an executor pair lists both);
+    this GPU refuses 5X's as drifts and 5Cheat's with a penalty."""
+    from reliquary.validator.corpus_auditor import CorpusAuditor
+
+    run = SimpleNamespace(ids=[f"{i:064x}" for i in range(1, 4)], cheat="f" * 64, states=_States())
+    run.records = _VoidingRecords({**{sid: {"hotkey": "5X", "token_count": 10} for sid in run.ids},
+                                   run.cheat: {"hotkey": "5Cheat", "token_count": 10}})
+    run.auditor = auditor = CorpusAuditor(job_id="j", records=run.records, model=None, tokenizer=None,
+                                          proof=PROOF, miner_states=run.states, clock=_Clock(100_000.0))
+    auditor._draw_job = object()
+    for i in range(2000):
+        auditor._count_refusal(f"h{i}", f"5Other{i % 50}", {"passed": True})
+
+    async def forward(records, *, local=False):
+        if local:
+            return [{**_DRAW_REFUSAL, **({"penalty": False} if r["hotkey"] == "5X" else {})} for r in records]
+        return [{**_PASSING, "scored_by": list(executors)} for _ in records]
+
+    auditor._forward = forward
+    return run
+
+
+def test_a_reaudited_drift_counts_as_a_refusal_and_frequent_ones_are_charged():
+    """A judging pass counts a drift as a refusal of its hotkey, and charges the one that leaves the hotkey refused
+    far more often than the job's other hotkeys (`_count_refusal`). The lying executor's passes were counted as
+    passing audits: the re-audit counts each drift it repeats as a refusal instead, once, and charges the third
+    of 5X's three as that pass would. 5Cheat's charged refusal is charged and counted as before."""
+    run = _draw_reaudit(executors=("pod-1", "pod-2"))
+    auditor, records = run.auditor, run.records
+    asyncio.run(auditor.audit_many([*run.ids, run.cheat]))
+    assert auditor._draw_counts["5X"] == [3, 0] and auditor._draw_totals == [2004, 0]
+    assert asyncio.run(auditor.reaudit_executor("pod-1")) == [*run.ids, run.cheat]
+    assert auditor._draw_counts["5X"] == [3, 3] and auditor._draw_totals == [2004, 3]
+    assert auditor._draw_counts["5Cheat"] == [1, 0]
+    first, second, third = (records.voided[sid] for sid in run.ids)
+    assert first["penalty"] is False and second["penalty"] is False
+    assert third["penalty"] is True and third["charged_for"] == "frequent_refusals"
+    charged = run.states.states["5X"]
+    assert charged.failure_ids == [run.ids[2]] and charged.suspect_until is not None
+    assert run.states.states["5Cheat"].failure_ids == [run.cheat]
+    # The pair's other executor quarantined too: the same drifts are re-audited again, and counted once.
+    asyncio.run(auditor.reaudit_executor("pod-2"))
+    assert auditor._draw_counts["5X"] == [3, 3] and run.states.states["5X"].failure_ids == [run.ids[2]]
+
+
+def test_after_a_restart_a_reaudited_drift_is_counted_in_full():
+    """The counts are kept per process: a pass written before a restart was counted by no judging pass of this
+    one. Its re-audited drift is counted as an audit and a refusal, as a judging pass counts one."""
+    run = _draw_reaudit()
+    # What `restore_scored` lists again after a restart: pod-1's passes, written by the process before.
+    run.auditor._remote_scored["pod-1"] = list(run.ids)
+    asyncio.run(run.auditor.reaudit_executor("pod-1"))
+    assert run.auditor._draw_counts.get("5X") == [3, 3] and run.auditor._draw_totals == [2003, 3]
+    assert run.records.voided[run.ids[2]]["charged_for"] == "frequent_refusals"
+    assert run.states.states["5X"].failure_ids == [run.ids[2]]
+
+
 def test_without_a_connected_executor_the_auditor_runs_locally():
     from reliquary.validator.corpus_auditor import CorpusAuditor
 
