@@ -523,6 +523,9 @@ class _VoidingRecords(_Records):
         self.voided, self.settlement = {}, {}
 
     async def write_voided(self, job_id, sid, document):
+        # Create-only, as `corpus_record_store.write_voided`: the first void of a submission stands.
+        if sid in self.voided:
+            return False
         self.voided[sid] = document
         return True
 
@@ -639,12 +642,13 @@ def test_a_quarantine_voids_a_repeated_drift_without_charging_its_miner(monkeypa
     assert charged.confirmed_failures and charged.suspect_until is not None and charged.audited_passed == 0
 
 
-def _sampled_reaudit(monkeypatch, refusal, *, voids_listed=False):
+def _sampled_reaudit(monkeypatch, refusal, *, voids_listed=False, q=0.25, settled=False):
     """At q = 0.25, two hotkeys of one coldkey: a pass of 5Drift and one of 5Sib scored by pod-2, then a later
     pass of 5Drift scored by pod-1. pod-1 is quarantined, and both audits of its pass return ``refusal``.
     ``run.events``: from the re-audit on, each slot reopen and each void the status hears of, in order (with no
     slot store here, the spies stand for a draw job's ledger). ``voids_listed``: an earlier forfeit of this
-    process has already listed the job's voids (`_void_forfeited`)."""
+    process has already listed the job's voids (`_void_forfeited`). ``q``: the job's share. ``settled``: pod-1's
+    pass was settled (inside the hold window) before the re-audit."""
     from reliquary.corpus.audit_policy import AuditParams
     from reliquary.validator.corpus_auditor import CorpusAuditor
 
@@ -658,7 +662,7 @@ def _sampled_reaudit(monkeypatch, refusal, *, voids_listed=False):
     remote = _AlwaysConnected(model, lie_pass=True, executor="pod-2")
     run.auditor = auditor = CorpusAuditor(
         job_id="j", records=run.records, model=model, tokenizer=_Tokenizer(), proof=PROOF, remote=remote,
-        miner_states=run.states, clock=_Clock(100_000.0), params=AuditParams(q=0.25),
+        miner_states=run.states, clock=_Clock(100_000.0), params=AuditParams(q=q),
         operator_of={"5Drift": "5Cold", "5Sib": "5Cold"}.get,
         on_voided=lambda sid, document: run.events.append(("voided", sid)))
     if voids_listed:
@@ -667,6 +671,8 @@ def _sampled_reaudit(monkeypatch, refusal, *, voids_listed=False):
     remote.executor = "pod-1"
     asyncio.run(auditor.audit_many([run.drift]))
     assert all(run.records.verdicts[s]["passed"] for s in (run.earlier, run.sibling, run.drift))
+    if settled:
+        run.records.settlement = {"settled": [run.drift]}
     run.before, run.writes = dict(run.states.states), run.states.writes
     escalate = auditor._escalate
 
@@ -822,6 +828,46 @@ def test_an_eval_auditor_reopens_each_drift_as_soon_as_its_void_is_written(monke
         assert asyncio.run(auditor.reaudit_executor("pod-1")) == [first, cheat, second]
         assert events == [("reopen", first), ("voided", first), ("voided", cheat), ("reopen", second),
                           ("voided", second), ("reopen", cheat)]
+
+
+def test_a_reaudit_charges_on_its_second_audit_run_alone(monkeypatch):
+    """§7.2: the second audit of a re-audited refusal, run on this GPU and alone, decides whether it is charged.
+    Here the first audit refuses 5Drift with a penalty and 5Cheat without; the second, the other way round:
+    5Drift is voided uncharged and 5Cheat is charged."""
+    from reliquary.validator.corpus_auditor import CorpusAuditor
+
+    model = _tiny(0)
+    drift, cheat = "a" * 64, "b" * 64
+    records = _VoidingRecords({drift: {**_record(model), "hotkey": "5Drift"},
+                               cheat: {**_record(model), "hotkey": "5Cheat"}})
+    states = _States()
+    remote = _AlwaysConnected(model, lie_pass=True)
+    auditor = CorpusAuditor(job_id="j", records=records, model=model, tokenizer=_Tokenizer(),
+                            proof=PROOF, remote=remote, miner_states=states, clock=_Clock(100_000.0))
+    asyncio.run(auditor.audit_many([drift, cheat]))
+    audits = []
+
+    def refuse(batch):
+        audits.append([r["hotkey"] for r in batch])
+        uncharged = "5Cheat" if len(audits) == 1 else "5Drift"
+        return [{**_DRAW_REFUSAL, **({"penalty": False} if r["hotkey"] == uncharged else {})} for r in batch]
+
+    monkeypatch.setattr(auditor, "_judge_many", refuse)
+    assert asyncio.run(remote.listeners[0]("pod-1")) == [drift, cheat]
+    assert audits == [["5Drift", "5Cheat"], ["5Drift"], ["5Cheat"]]
+    assert records.voided[drift]["penalty"] is False and "penalty" not in records.voided[cheat]
+    kept, charged = states.states["5Drift"], states.states["5Cheat"]
+    assert kept.confirmed_failures == [] and kept.suspect_until is None
+    assert charged.failure_ids == [cheat] and charged.suspect_until is not None
+
+
+@pytest.mark.parametrize("q, settled", [(1.0, False), (0.25, True)])
+def test_a_reaudited_drift_reopens_its_slot_where_no_forfeit_would(monkeypatch, q, settled):
+    """At q = 1 nothing is forfeited, and a pass already settled (inside the hold window) never is
+    (`_void_forfeited`): the re-audit reopens the drift's slot itself, before the status hears of its void."""
+    run = _sampled_reaudit(monkeypatch, {**_DRAW_REFUSAL, "penalty": False}, q=q, settled=settled)
+    assert run.voided == [run.drift] and run.escalated == []
+    assert run.events == [("reopen", [run.drift]), ("voided", run.drift)]
 
 
 _PASSING = {"passed": True, "worst_exp": 0, "worst_mant_mean": 0.0, "worst_mant_median": 0.0}
