@@ -41,17 +41,38 @@ What these envs need at run time:
 
 Mount a persistent Hugging Face cache so the corpora are fetched once.
 
+Build in a fresh clone of this repository, checked out at the Core `<commit>` whose validator image is the base,
+where `git status --porcelain --ignored` prints nothing. The build reads `docker/Dockerfile.order-control` and
+copies `tasksets/` from its context, the clone's working tree, not from `<commit>`: a changed, untracked or ignored
+file there (a `build/` or `*.egg-info` that an earlier install left in a taskset) would go into the image, and
+`.build-revision` (below) would not show it.
+
 ```bash
-# the base: the validator image the image workflow built from Core <commit>
+git clone https://github.com/reliquadotai/reliquary.git <new directory>
+cd <new directory>
+git checkout --detach <commit>
+git status --porcelain --ignored
+```
+
+Then, in that clone, `docker buildx imagetools inspect` prints the Digest of the base, the validator image the
+image workflow built from `<commit>`, and the push, which runs only after a build that succeeded, prints the digest
+of the image to check and to switch to:
+
+```bash
 docker buildx imagetools inspect \
-  "ghcr.io/reliquadotai/reliquary-validator:sha-$(git rev-parse <commit> | cut -c1-7)-logic"   # prints its Digest
+  "ghcr.io/reliquadotai/reliquary-validator:sha-$(git rev-parse <commit> | cut -c1-7)-logic"
 docker build -f docker/Dockerfile.order-control \
   --build-arg BASE_IMAGE=ghcr.io/reliquadotai/reliquary-validator@sha256:<that digest> \
   --build-context envs=<directory holding exactly the four reviewed wheels> \
-  -t <registry>/<repository>:<tag> .
-docker push <registry>/<repository>:<tag>   # prints the digest of the image to check and to switch to
-# the build needs network to github.com (the git+ installs); ENVS, TELECOM_ENVS, SBX are build args
+  -t <registry>/<repository>:<tag> . &&
+  docker push <registry>/<repository>:<tag>
 ```
+
+The build needs network to github.com (the `git+` installs); `ENVS`, `TELECOM_ENVS` and `SBX` are build args. Keep
+the build and the push joined by `&&`: run as two commands, a failed build leaves the tag on the image an earlier
+build gave it, and the push publishes that image, prints its digest and ends 0. Put no comment after a command in
+these blocks: zsh leaves `interactivecomments` off by default, so it passes `#` and the words after it to the
+command as arguments, and `docker push` and `imagetools inspect` each take exactly one name.
 
 The validator image workflow (`.github/workflows/docker-image.yml`) tags each build that includes Logic
 `sha-<the commit's first 7 characters>-logic` (`${GITHUB_SHA::7}`): `git rev-parse <commit> | cut -c1-7` prints
@@ -71,7 +92,7 @@ arguments is another image, whose packages may differ: the `pip install` steps r
 In the built image, `/opt/reliquary/.build-revision` is the Core commit that base was built from: the root
 `Dockerfile` writes its `RELIQUARY_BUILD_REVISION` there (the validator image workflow sets it to the commit;
 `unknown` when unset), and the order-control layers do not change it. It does not cover this image's own tasksets,
-copied from the build context's `tasksets/`.
+copied from the build context's `tasksets/`: the fresh clone above is what makes them those of `<commit>`.
 
 For signed episode orders (SWE, TMax, Terminal-Bench 2.1, DeepSWE, SWE-bench Pro) the image also carries
 reliquary-sandbox with its verifiers bridge at `SANDBOX_COMMIT`, `reliquary-swe` and `reliquary-terminal` at the
@@ -176,20 +197,70 @@ with `docker exec`. The one exception is in step 3, on a non-production host.
      suggestion, not a measured need. A scoring child killed for lack of memory reads
      `grader_error: BrokenProcessPool: ...` (after one retry in a fresh child), and a script killed for it ends
      the container with exit status 137. Rerun with more memory before concluding anything.
-   - **What this container lacks.** HLE-Diamond (`hle_diamond_text_det`) reads its gated dataset with the
-     `HF_TOKEN` of an account the dataset admits, and a LiveCodeBench or SciCode program runs in a grading
-     service, reached through a socket mount and its variable ("Code-execution grading" and "SciCode" below).
-     This container has neither. Grade their row on a non-production host instead, which holds none of the
-     admin's settings: start the grading service there from `$IMG` as in those sections (it holds no secret and
-     has no network), and give the one-shot container its socket and variable, a read-only `HF_TOKEN` of an
-     admitted account (not the admin's) and `$R2_ENV` with the read-only R2 token. Never start the rebuilt
-     image as the admin or the order control to grade them.
+   - **What this container lacks.** GPQA (`verifiers-gpqa-ab6f143e1-r0-n198`) and HLE-Diamond
+     (`hle_diamond_text_det`) read gated Hub datasets with the `HF_TOKEN` of an account each dataset admits.
+     GPQA's taskset (research-environments `f2e0d709`, `gpqa/taskset.py`) loads `Idavidrein/gpqa` and the image
+     holds no copy, so here its row reads `grader_error: DatasetNotFoundError: Dataset 'Idavidrein/gpqa' is a
+     gated dataset on the Hub. ...`. A LiveCodeBench or SciCode program runs in a grading service, reached
+     through a socket mount and its variable ("Code-execution grading" and "SciCode" below). This container has
+     neither, so these `grader_error`s never mean that the set does not grade: never withdraw a set for one.
+     Grade their row on a non-production host instead, which holds none of the admin's settings: start the
+     grading service there from `$IMG` as in those sections (it holds no secret and has no network), and give the
+     one-shot container its socket and variable, a read-only `HF_TOKEN` of an admitted account (not the admin's)
+     and `$R2_ENV` with the read-only R2 token. Never start the rebuilt image as the admin or the order control
+     to grade them.
 4. **A drifted set cannot be republished under its id.** Publication is create-only (`eval/storage.py`). Use a
    new set id and a new `eval_sets` row, and withdraw the old one.
 5. **Do not switch the admin while a single-turn evaluation is in flight.** An order already taken is not
    refused: its rows come back ungraded.
+
+   **Nor stop the admin while an export may be in flight**, for a switch, a rollback or any restart. Just before it
+   stops, no order of the platform's `any_dataset_orders` (Batch orders and the other any-model orders) may be
+   `exporting`, unless its `status_reason` is `export_waiting_for_settlement` (the admin answered
+   `job_not_drained`: nothing is uploaded), nor `draining` with `drained_seen_at` set (its job is final, and the
+   next cron steps move it to `exporting` and start its export). This read-only query, run in a checkout of
+   reliquary-platform, lists the orders that forbid the stop, and must list none (`IS NOT`, not `<>`, keeps an
+   `exporting` order whose `status_reason` is null):
+   ```bash
+   pnpm exec wrangler d1 execute reliquary-platform --remote --command "
+     SELECT id, status, status_reason, drained_seen_at FROM any_dataset_orders
+     WHERE (status = 'exporting' AND status_reason IS NOT 'export_waiting_for_settlement')
+        OR (status = 'draining' AND drained_seen_at IS NOT NULL)"
+   ```
+   An export runs in the admin, which uploads each shard to the platform before `report.json` and `manifest.json`,
+   and the platform keeps the first bytes of every delivery object: the same bytes again are accepted, others
+   refused with 409 `delivery_conflict`. The next admin starts an interrupted export again. A Batch order's export
+   (delivery v3) in `openai_jsonl` writes its stamp in every line (`created`), so an admin that takes a new stamp
+   uploads other bytes and gets 409 `delivery_conflict`. It answers the platform 500, and the platform retries
+   until the order has been `exporting` for `ORDER_EXPORT_TIMEOUT_SECONDS` (6 h by default), then fails it
+   (`export_timeout`). #579 keeps the first stamp beside the job's records, so that the next attempt uploads the
+   same bytes, but only between two admins that both carry it: a swap from an admin without it (which kept no
+   stamp) or back to one (which never reads the kept stamp) still ends in `export_timeout`. Nor does it cover
+   shard bytes that change for another reason: a void between the two attempts, or another output layout or
+   pyarrow version (Parquet shards) in the new image.
 6. **Switch to `$IMG` itself**, the digest every step above checked: never to a tag, nor to another build of the
-   same commit.
+   same commit. Switch only once you have seen every output below. A check that ends 0 has only run: the seal
+   check prints its comparisons and ends 0 whatever they find, and `grade` returns a failing row's detail instead
+   of raising, so a one-row grade script that prints it ends 0 too, as does the subshell around either.
+   - Step 1: the build passed `order-control-check` and printed `ORDER_CONTROL_EPISODES_OK`, `.build-revision`
+     is the Core commit you meant, and `pip check` is clean.
+   - Step 2, in the rebuilt image: a card for every set (no `"card": null`) and, on every sealed card,
+     `card_grader_sha256` equal to `grader_sha256_here`, `"grader_ok": true` and `"taskset_ok": true`.
+   - Step 3: one row of every single-turn set the platform offers grades (an empty detail or `format_failure`),
+     GPQA and HLE-Diamond with a read-only `HF_TOKEN`, LiveCodeBench and SciCode with their grading services,
+     these four on the non-production host.
+   - Step 5, just before the admin stops: no single-turn evaluation in flight, and the query lists no order.
+
+   Before the switch, write down the image the old container runs, by its registry digest, and keep that image on
+   the host and in the registry: a rollback starts it again, with the old container's settings.
+   ```bash
+   docker inspect --format '{{.Config.Image}} {{.Image}}' <old container>
+   docker image inspect --format '{{json .RepoDigests}}' <the image ID it printed>
+   ```
+   Then stop the old container, and only then start one from `$IMG` with its settings: the two never run at once
+   (two admins, or two order controls, on the production bucket and registry). A stopped container keeps its
+   name: rename it, which keeps its settings for a rollback, before giving the new one that name. A rollback is
+   the same switch, back to the digest written down, step 5 included.
 
 ## Run
 
