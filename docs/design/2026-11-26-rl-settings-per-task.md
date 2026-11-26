@@ -26,7 +26,7 @@ disagrees, the prompt digest or the length check fails and an honest miner is re
 
 ## The reads, sorted
 
-72 reads of the compiled profile outside `profiles.py` (`git grep ACTIVE_PROTOCOL_PROFILE\|PROFILES\[`), plus
+85 lines reading the compiled profile outside `profiles.py` (`git grep ACTIVE_PROTOCOL_PROFILE\|PROFILES\[`), plus
 36 calls of the per-env getters (`max_new_tokens_for_environment`, `thinking_for_environment`,
 `prompt_cooldown_windows_for_environment`, `episode_limits_for_environment`).
 
