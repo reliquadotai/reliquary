@@ -124,9 +124,12 @@ class CorpusMinerHalted(Exception):
     instead of the process looping on a job or route that will never
     answer."""
 
-    def __init__(self, message: str, *, counts: dict[str, int]) -> None:
+    def __init__(self, message: str, *, counts: dict[str, int], failed_call: bool = False) -> None:
         super().__init__(message)
         self.counts = dict(counts)
+        # One call failed again and again (``_retry``), against a refusal of the hotkey or the job's end: the
+        # validator may be restarting, so an agentic miner keeps the episodes it is running.
+        self.failed_call = failed_call
 
 
 def _error_detail(response):
@@ -378,7 +381,7 @@ def _retry(call, *, sleep, counts, max_consecutive_failures):
             if consecutive_permanent >= max_consecutive_failures:
                 raise CorpusMinerHalted(
                     f"{consecutive_permanent} consecutive permanent failures: {exc}",
-                    counts=counts,
+                    counts=counts, failed_call=True,
                 ) from exc
             delay = _TRANSIENT_BACKOFF_SECONDS[min(attempt, len(_TRANSIENT_BACKOFF_SECONDS) - 1)]
             sleep(delay)
