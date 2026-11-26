@@ -28,7 +28,6 @@ import logging
 import math
 import random
 import secrets
-import statistics
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
@@ -124,15 +123,9 @@ MIN_MEASURED_BUSY_SECONDS = 120.0
 # only after CLEAN_STREAK of them, so a card failing one call in two does not keep its work.
 LOST_RESULT_STRIKES = 2
 CLEAN_STREAK = 5
-# An audit lease lives twice the time its job's recent results took per token, for its tokens and those the
-# card already holds, plus LEASE_OVERHEAD_SECONDS, within [AUDIT_LEASE_FLOOR_SECONDS, the dispatcher's lease
-# seconds]; the dispatcher's lease seconds until LEASE_TIMES_NEEDED results of each of those jobs were timed.
-# Per job and per token: one model audits short completions and long agentic episodes from the same queue, and
-# a token of a long episode costs several times a token of a short completion.
-AUDIT_LEASE_FLOOR_SECONDS = 60.0
-LEASE_OVERHEAD_SECONDS = 30.0
-LEASE_TIMES_KEPT = 20
-LEASE_TIMES_NEEDED = 3
+# Every audit lease lives the dispatcher's lease seconds. A lease shortened from recent results (2026-11-11 to
+# 11-26) expired under honest cards: a card works its leases one after the other, and one model's batches take
+# 2 s or 65 s (short completions, long agentic episodes), so about 70 cards were set aside for lost results.
 QUARANTINE_REASONS_KEPT = 20
 HEARTBEAT_WRITE_SECONDS = 30.0
 EVAL_CONTROL_STATUS_KEY = "reliquary/eval/control/status.json"
@@ -307,11 +300,6 @@ class EvalExecutorDirectory:
                       and (d.get("status") == "quarantined" or d.get(WAS_QUARANTINED) is True))
 
 
-def _tokens(items) -> int:
-    """The tokens an audit of ``items`` scores."""
-    return sum(len(item["tokens"]) for item in items)
-
-
 def _placement(document: dict) -> tuple[str, str] | None:
     """Where an executor runs; None when it cannot be told apart from others."""
     provider, host = document.get("provider_id"), document.get("host")
@@ -344,7 +332,6 @@ class _Lease:
     batch: _Batch
     executor_id: str
     expires_at: float
-    granted_at: float = 0.0
 
 
 class PairedAuditDispatcher:
@@ -379,9 +366,6 @@ class PairedAuditDispatcher:
         self._strikes: collections.Counter = collections.Counter()
         # Per executor, results delivered in time since its last lost one.
         self._clean: collections.Counter = collections.Counter()
-        # Per (model, job), seconds per token its recent results took from grant to result.
-        self._lease_times: dict[tuple[ModelKey, str], collections.deque] = collections.defaultdict(
-            lambda: collections.deque(maxlen=LEASE_TIMES_KEPT))
         self._seen: dict[str, float] = {}
         self._listeners: list[Callable[[str], Awaitable[Any]]] = []
         self._background: set[asyncio.Task] = set()
@@ -539,8 +523,7 @@ class PairedAuditDispatcher:
                 continue
             now = self._clock()
             lease = _Lease(lease_id=secrets.token_hex(16), batch=batch, executor_id=executor_id,
-                           expires_at=now + self.lease_time([batch] + [h.batch for h in held]),
-                           granted_at=now)
+                           expires_at=now + self._lease_seconds)
             self._leases[lease.lease_id] = lease
             self._mark_busy(executor_id, batch.model)
             batch.leased.add(executor_id)
@@ -558,16 +541,6 @@ class PairedAuditDispatcher:
                           for i in batch.items],
             }
         return None
-
-    def lease_time(self, batches: Sequence[_Batch]) -> float:
-        """Seconds an audit lease lives: ``batches`` are its own and those its card already holds."""
-        expected = 0.0
-        for batch in batches:
-            times = self._lease_times.get((batch.model, batch.job_id))
-            if not times or len(times) < LEASE_TIMES_NEEDED:
-                return self._lease_seconds
-            expected += statistics.median(times) * max(1, _tokens(batch.items))
-        return min(self._lease_seconds, max(AUDIT_LEASE_FLOOR_SECONDS, 2.0 * expected + LEASE_OVERHEAD_SECONDS))
 
     def lease_of(self, lease_id: str) -> _Lease | None:
         return self._leases.get(lease_id)
@@ -587,9 +560,6 @@ class PairedAuditDispatcher:
             self._clean[executor_id] += 1
             if self._clean[executor_id] >= CLEAN_STREAK:
                 self._strikes[executor_id] = 0
-            if _tokens(batch.items):
-                self._lease_times[(batch.model, batch.job_id)].append(
-                    (self._clock() - lease.granted_at) / _tokens(batch.items))
         scores = result.scores
         if len(scores) != len(batch.items) or any(_misfit(s, item) for s, item in zip(scores, batch.items)):
             raise LeaseRefused(422, "result_does_not_fit_the_lease")
