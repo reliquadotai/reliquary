@@ -395,8 +395,8 @@ control:
    ```
    It must fail with no such object: `Error: No such object: <parked name>` before docker 29,
    `error: no such object: <parked name>` from 29. A container holding that name makes step 3's rename fail, and
-   only once step 2 has stopped the old container. If it prints an ID and `exited`, choose another name and check
-   again. If it prints anything else (`running`, say), stop here and find out why.
+   only once step 2 has stopped the old container. If it prints an ID and `exited` or `created`, choose another
+   name and check again. If it prints anything else (`running`, say), stop here and find out why.
 2. Set its restart policy to `no` while it still runs, then stop it (the admin a few seconds after step 5's
    queries listed nothing that forbids the stop):
    ```bash
@@ -423,8 +423,9 @@ control:
    docker rename <old container> <parked name>
    docker inspect --format '{{.Id}} {{.State.Status}}' <parked name>
    ```
-   It must print the ID step 1 wrote down and `exited`. If it prints anything else, start nothing: rename the
-   container back if the rename succeeded, `docker rename <parked name> <old container>`, and find out why. Then,
+   It must print the ID step 1 wrote down and `exited`, or `created` for a new container that never ran (below).
+   If it prints anything else, start nothing: rename the container back if the rename succeeded,
+   `docker rename <parked name> <old container>`, and find out why. Then,
    as after a failed step 2 (its last paragraph), fix the cause and run step 2 again, then this step, or call the
    switch off: `docker update --restart=<Name> <old container> && docker start <old container>`, with `<Name>` as
    below. Never leave the old container as it is: once step 2's update has run, its policy is `no`, so even
@@ -436,6 +437,12 @@ control:
    the old container written to a file: its `Env` holds the R2 write keys and, in the admin's,
    `RELIQUARY_ADMIN_SECRET`. The two never run at once (two admins, or two order controls, on the production
    bucket and registry).
+
+   A `docker run` that ends non-zero may still have created the new container, under the old name, and failed to
+   start it (an entrypoint the image lacks, say). That container never ran: `docker inspect` gives it the status
+   `created`, and while it holds the name a second `docker run` is refused (Conflict). Roll it back as below all
+   the same: it has no export to cut, so step 5's queries do not hold up its step 2, and step 3's check prints its
+   ID and `created`. If no container holds the old name, the rollback is its block alone.
 
 A rollback is the same switch, back, under a `<parked name>` of its own (the switch's holds the old container):
 steps 1 and 2 on the new container (with step 5's queries before and after the stop, for the admin), then its
