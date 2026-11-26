@@ -589,6 +589,39 @@ def test_a_submission_the_validator_never_answers_keeps_the_other_episodes(monke
     assert len(calls) == 2 and len(loop_runner.submitted) == 1
 
 
+@pytest.mark.parametrize("stop", ["job_retired", "hotkey_refused"])
+def test_a_retired_job_or_a_refused_hotkey_on_a_submission_cancels_the_episodes_under_way(monkeypatch, stop):
+    # `stop_on`'s other branch: what the validator answered for good (a retired job, this hotkey refused, never a
+    # call that kept failing) cancels the episodes under way too, which would only submit into the same refusal.
+    import reliquary.miner.agentic_miner as agentic_miner
+    from reliquary.miner.corpus_miner import CorpusJobRetired, CorpusMinerHalted
+
+    calls = []
+
+    def submit(client, body, counts, submit_by=None):
+        calls.append(body["prompt_index"])
+        if stop == "job_retired":
+            raise CorpusJobRetired("410 job_retired from /corpus/jobs/x/submit")
+        raise CorpusMinerHalted("the validator refused this hotkey: hotkey_not_registered", counts=counts)
+
+    class TwoRunner(LoopRunner):
+        runs = 0
+
+        async def run(self, index, on_session=None):
+            # The second episode has its session and is under way when the first one's submission is refused.
+            self.runs += 1
+            if self.runs > 1:
+                on_session(f"s{index}")
+                await asyncio.sleep(0.05)
+            return await super().run(index, on_session=on_session)
+
+    monkeypatch.setattr(agentic_miner, "_submit", submit)
+    loop_runner = TwoRunner()
+    counts = _mine_two(loop_runner)
+    assert counts["halted"] == 1 and counts["episode_cancelled"] == 1
+    assert len(calls) == 1 and loop_runner.submitted == []
+
+
 def test_a_bad_signature_halts_with_a_validator_hotkey_hint(caplog):
     caplog.set_level("INFO", logger="reliquary.miner.agentic_miner")
     counts, _ = _mine(LoopRunner(refuse=SessionRefused("bad_signature", status=403)))

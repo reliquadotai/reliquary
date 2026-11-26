@@ -64,7 +64,8 @@ best one in its own process (`corpus mine-agentic --job-id`) and starts the next
 order that pays less is not dropped for a better one that opens later: its leases are kept to the end.
 
 - **Draining** orders are never stopped: their running episodes are still paid, and the child exits by itself. A
-  **paused** order is waited out; only one paused for 30 minutes, or gone from the list for two reads, is stopped.
+  **restoring** one (the validator restarted) keeps its child too. A **paused** order is waited out; only one
+  paused for 30 minutes, or gone from the list for two reads, is stopped.
   A stop is a SIGTERM: the child starts nothing more, cancels its running episodes, releases their leases and
   reports their sandbox sessions, then exits (killed only after 2 minutes). A SIGTERM to the follower itself
   (pm2, systemd) stops every child that way first.
@@ -111,10 +112,25 @@ order that pays less is not dropped for a better one that opens later: its lease
 | `open` | Mine it. |
 | `paused` | Admission stopped for now. |
 | `draining` | Generation is over; its last submissions are audited and paid. Nothing new is accepted. |
+| `restoring` | The validator is wiring it: a new order, or one it serves again after a restart (minutes). Keep what runs on it; start nothing new. |
 
 `jobs` lists the ids open right now. `sandbox_hotkey` is there when the validator serves signed-sandbox sessions:
 the ss58 hotkey their requests are signed for. `/corpus/tasks` is the registry's history of every task ever declared, not a
 list of what to mine.
+
+Right after a validator restart, until it has read its order registry, the list itself answers 503 `orders_not_ready`
+with `Retry-After`: read it again then. `corpus mine` without `--job-id`, started in that window, exits 1 instead, for
+its supervisor to start it again. Give that supervisor a restart delay of a few seconds (systemd `RestartSec=5`, pm2
+`--restart-delay 5000`): such a run lasts about a second, and with their defaults systemd stops restarting it after 5
+starts in 10 s, pm2 after 16 runs shorter than a second in its first 16 s.
+
+A `restoring` order's own routes answer 503 `job_not_ready` until it is wired. The bounds: the list's 503 ends after
+three failed registry reads or 15 minutes. An order answers 404 again and leaves the list once a pass over the
+registry ends without wiring it for the third time, or a pass ends 15 minutes or more after the restart without wiring
+it (an order first seen in a registry read after the list's 503 has ended, such as a new order, counts those 15
+minutes from that read). The bounds are checked only when a registry read or a pass ends: an order is never given up
+while a pass may still wire it, and it stays at 503 for as long as the registry cannot be read again after a first
+good read, or a pass does not end.
 
 ## How orders pay: the price auction
 
