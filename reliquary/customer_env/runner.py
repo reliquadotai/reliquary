@@ -59,8 +59,8 @@ class WorkerProcess:
         try:
             proc = subprocess.Popen(self._argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                     stderr=subprocess.DEVNULL, bufsize=0)
-        except OSError as exc:
-            raise RewardInfrastructureError(f"start_failed: {exc}") from exc
+        except OSError as exc:  # ours: no docker, no runtime
+            raise RewardInfrastructureError(f"spawn_failed: {exc}") from exc
         lines: queue.Queue = queue.Queue()
 
         def pump() -> None:

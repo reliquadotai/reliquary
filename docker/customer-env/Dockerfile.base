@@ -1,0 +1,16 @@
+# syntax=docker/dockerfile:1.6
+# The base of every customer environment image: Python, verifiers at the pinned commit, and reliquary's
+# reward worker (installed without dependencies: the worker needs only the standard library and verifiers).
+# Built by us, pushed by digest; `reliquary.customer_env.image.BASE_IMAGE` names that digest.
+FROM python:3.12-slim@sha256:090ba77e2958f6af52a5341f788b50b032dd4ca28377d2893dcf1ecbdfdfe203
+RUN apt-get update -qq && apt-get install -y -qq git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+ARG VERIFIERS_COMMIT=b2e4e8157783b2c0dffc7821044c87f29f1c3ccf
+RUN pip install --no-cache-dir "verifiers @ git+https://github.com/PrimeIntellect-ai/verifiers.git@${VERIFIERS_COMMIT}"
+COPY reliquary/__init__.py /opt/reliquary/reliquary/__init__.py
+COPY reliquary/eval/__init__.py reliquary/eval/protocol.py reliquary/eval/verifiers_source.py \
+     reliquary/eval/sandboxed_runtime.py /opt/reliquary/reliquary/eval/
+COPY reliquary/customer_env/__init__.py reliquary/customer_env/worker.py /opt/reliquary/reliquary/customer_env/
+ENV PYTHONPATH=/opt/reliquary PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+# git is for the build only; a running worker has no network anyway.
+RUN apt-get purge -y -qq git && apt-get autoremove -y -qq

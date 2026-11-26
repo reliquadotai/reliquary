@@ -81,7 +81,7 @@ def test_a_taskset_that_cannot_load_is_a_start_failure_with_its_reason():
 
 def test_a_worker_that_does_not_exist_is_a_start_failure():
     rc = RewardClient(WorkerProcess(["/nonexistent/worker"]))
-    with pytest.raises(RewardInfrastructureError, match="start_failed"):
+    with pytest.raises(RewardInfrastructureError, match="spawn_failed"):
         rc.score([item("t1", "2")])
 
 
