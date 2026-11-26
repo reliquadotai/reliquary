@@ -299,12 +299,35 @@ def test_the_rounding_never_eats_into_the_reserve(sized, control):
     assert _declare(sized, "order-eval-p3").status_code == 201      # a new order still starts
 
 
-def test_an_order_sized_under_its_start_climbs_back_to_it_into_the_reserve(sized, control):
-    _with_cap(sized, "order-eval-p1", 0.005)
-    _with_cap(sized, "default", 0.94)
-    # The room is 0.06: 0.01 past the reserve, but the order may always go back to its own start.
-    assert _resize_asking(sized, control) == 1
+def test_a_new_order_keeps_its_start_during_its_first_period(sized, control):
+    _with_cap(sized, "order-eval-p1", sizing.START_CAP)
+    # Barely anything accrued yet: sized down to the floor, but no period of it settled.
+    first = {"model": f"{MODEL}@{REVISION}", "audit_executors": 1, "recent_paid": [], "open_value": 0.0001}
+    control["document"] = _rates_status(jobs={"order-eval-p1": {"sizing": first}})
+    assert asyncio.run(sized.app.state.resize_order_caps()) == 0
     assert _cap(sized) == sizing.START_CAP
+    # Once a period paid, it follows its pay down as any order.
+    control["document"] = _rates_status(jobs={"order-eval-p1": {"sizing": {**first, "recent_paid": [0.001]}}})
+    assert asyncio.run(sized.app.state.resize_order_caps()) == 1
+    assert _cap(sized) < sizing.START_CAP
+
+
+@pytest.mark.parametrize("orders", [2, 4])
+def test_active_orders_raised_together_still_leave_a_training_start(sized, control, orders):
+    from reliquary.admin.training import DEFAULT_TRAINING_CAP
+
+    ids = [f"order-eval-p{k}" for k in range(1, orders + 1)]
+    for job_id in ids[1:]:
+        assert _declare(sized, job_id).status_code == 201
+    for job_id in ids:
+        _with_cap(sized, job_id, 0.005)
+    _with_cap(sized, "default", 0.93)
+    facts = {"model": f"{MODEL}@{REVISION}", "audit_executors": 1, "recent_paid": [0.5], "open_value": 0.0}
+    control["document"] = _rates_status(jobs={job_id: {"sizing": facts} for job_id in ids})
+    for _ in range(3):
+        asyncio.run(sized.app.state.resize_order_caps())
+    declared = sum(float(e.params["cap"]) for e in sized.registry["entries"].values())
+    assert 1.0 - declared >= DEFAULT_TRAINING_CAP - 1e-9
 
 
 def test_a_raise_gaining_under_the_minimum_change_is_not_written(sized, control):
@@ -419,9 +442,8 @@ def test_the_reserve_holds_any_new_orders_start():
     from reliquary.admin.training import DEFAULT_TRAINING_CAP
 
     assert sizing.NEW_ORDER_RESERVE >= max(sizing.START_CAP, DEFAULT_TRAINING_CAP)
-    assert sizing.raise_room(0.06) == pytest.approx(sizing.START_CAP)
     assert sizing.raise_room(0.2) == pytest.approx(0.2 - sizing.NEW_ORDER_RESERVE)
-    assert sizing.raise_room(0.01) == 0.01
+    assert sizing.raise_room(0.06) == pytest.approx(0.06 - sizing.NEW_ORDER_RESERVE)    # no order dips into it
 
 
 def test_a_resize_never_passes_the_asked_cap(admin, pins, rates, control, monkeypatch):  # noqa: F811

@@ -38,9 +38,9 @@ NEW_ORDER_RESERVE = 0.05
 
 
 def raise_room(room: float) -> float:
-    """What a raise may take of the free ``room``: all but ``NEW_ORDER_RESERVE``, and in any case up to
-    ``START_CAP``: an order sized down early in its first period climbs back to its own start."""
-    return max(room - NEW_ORDER_RESERVE, min(START_CAP, room))
+    """What a raise may take of the free ``room``: all but ``NEW_ORDER_RESERVE``, for every order alike (a
+    per-order exception would let several orders empty the reserve between them)."""
+    return room - NEW_ORDER_RESERVE
 # Early in a period, its accrued value is projected over at least this share of the period: at most x4.
 MIN_ELAPSED_SHARE = 0.25
 

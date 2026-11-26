@@ -690,7 +690,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         try:
             await registry_store.release_task_cap(entry.task_id)
             logger.info("admin: released the cap of drained task %s", entry.task_id)
-        except Exception:  # noqa: BLE001 - the next create retries; the guard still counts it until then
+        except Exception:  # noqa: BLE001 - drained for good, never listed again: not retried before a restart
             logger.warning("admin: could not release the cap of drained task %s", entry.task_id, exc_info=True)
 
     def price_of(entry) -> dict | None:
@@ -1326,7 +1326,10 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         from reliquary.admin import cap_sizing as sizing
         from reliquary.shared.task_registry import RegistryError
 
-        # Listed first, as every resize always did: a drained retired task released here gives its room back,
+        entries, _ = await registry_store.read_registry(strict=False)
+        if not open_order(entries.get(task_id)):
+            return None
+        # Then listed, as every resize always did: a drained retired task released here gives its room back,
         # to this raise and to the next, even when this one is then held.
         limits = await draining_limits(float(sized))
         entries, _ = await registry_store.read_registry(strict=False)
@@ -1339,8 +1342,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         # Rounded down to the micro-share, never up into the reserve.
         cap = math.floor(min(float(sized), allowed) * 1e6 + 1e-6) / 1e6
         if cap <= current or cap - current < sizing.RESIZE_MIN_CHANGE * current:
-            logger.info("admin: cap of %s stays %s (sized %s): the %s room allows %.6f, %s kept for a new order",
-                        task_id, current, sized, bound, max(0.0, allowed), sizing.NEW_ORDER_RESERVE)
+            logger.info("admin: cap of %s stays %s (sized %s): %.6f %s room, %s kept for a new order, %.6f allowed",
+                        task_id, current, sized, room, bound, sizing.NEW_ORDER_RESERVE, max(0.0, allowed))
             return None
 
         def still_room(before: Mapping, found) -> None:
@@ -1384,6 +1387,10 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             if cap is None:
                 continue
             read_cap = float(entry.params["cap"])
+            if cap < read_cap and read_cap <= sizing.START_CAP and not facts.get("recent_paid"):
+                # A new order keeps its start until a period of it settles: sized down on its first minutes,
+                # the reserve could keep it from climbing back.
+                continue
             if cap > read_cap:
                 # Until 2026-11-25 a raise the registry refused kept the cap: an order asking 0.25 every
                 # 5 minutes stayed at 0.0323 for hours when it could have held 0.152 (0.1197 free).
