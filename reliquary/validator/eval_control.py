@@ -1669,12 +1669,32 @@ def eval_auditor(**kwargs):
                     held.add(sid)
             return held
 
-        def settle_capped(self, verdicts) -> set[str]:
+        def settle_capped(self, verdicts, period_of) -> set[str]:
             """The verdicts paid within what is left of their period's cap, if their period was settled without them
             (owner, 2026-11-26): parked records decided after they left the close (marked in their verdict, so a
-            restart keeps it). Any other late verdict is paid as before."""
-            return {sid for sid, verdict in verdicts.items()
-                    if sid in self._left_out_ids or (verdict or {}).get("left_out_of_close")}
+            restart keeps it), and, at q < 1, the verdicts their stake hold kept back (their operator's, in their
+            period, received up to them). Any other late verdict is paid as before."""
+            marked = {sid for sid, verdict in verdicts.items()
+                      if sid in self._left_out_ids or (verdict or {}).get("left_out_of_close")}
+            if self._params.q >= 1.0:
+                return marked
+            # The left-out records, from memory and from the marked verdicts of this call (a restart forgets the first).
+            until: dict[tuple[str, int], float] = {}
+            anchors = [(self._meta[sid][0], self._meta[sid][1]) for sid in self._left_out_ids if sid in self._meta]
+            anchors += [(verdicts[sid].get("hotkey"), verdicts[sid].get("received_at")) for sid in marked]
+            for hotkey, received_at in anchors:
+                if hotkey and received_at is not None:
+                    key = (self._operator(hotkey), period_of(received_at))
+                    until[key] = max(until.get(key, float("-inf")), float(received_at))
+            held = set()
+            for sid, verdict in verdicts.items():
+                hotkey, received_at = (verdict or {}).get("hotkey"), (verdict or {}).get("received_at")
+                if not hotkey or received_at is None:
+                    continue
+                bound = until.get((self._operator(hotkey), period_of(received_at)))
+                if bound is not None and float(received_at) <= bound:
+                    held.add(sid)
+            return marked | held
 
         async def _audit_outcomes(self, records, *, local: bool = False):
             # A parked record is neither the miner's fault nor a validator error (`_Parked`): it stays pending, tried
@@ -2511,7 +2531,7 @@ def wire_order_judge(w, *, records, job_store, remote, params, miner_states, bea
         max_price=cp.max_price(entry.params), max_input_price=cp.max_input_price(entry.params),
         # The stake guarantee past a parked record's give-up, and its late verdict paid within the cap.
         hold=lambda verdicts, period_of: w.auditor.settle_hold(verdicts, period_of),
-        capped=lambda verdicts: w.auditor.settle_capped(verdicts))
+        capped=lambda verdicts, period_of: w.auditor.settle_capped(verdicts, period_of))
     w.auditor = eval_auditor(
         job_id=job.job_id, records=records, tokenizer=w.tokenizer, proof=w.proof,
         params=params, miner_states=miner_states, beacon=beacon, round_at=round_at,

@@ -1507,13 +1507,29 @@ def test_past_the_give_up_the_parked_operators_forfeitable_verdicts_wait_for_its
         await settler.settle_once()
         assert {z, p} <= set(state["settled"])
         late = sum(doc["rewards_by_hotkey"].get(HK, 0.0) for doc in archives.docs.values()) - on_time
+        assert late == 0                                   # z: capped as p is (the period paid its cap), or forfeited
+        assert not any("5Hot2" in doc["rewards_by_hotkey"] for doc in archives.docs.values())  # p: within the cap
+        total = sum(v for doc in archives.docs.values() for v in doc["rewards_by_hotkey"].values())
+        assert total == pytest.approx(1.0)                 # the period never pays past its cap
         if parked_passes:
             assert records.verdicts[p].get("left_out_of_close") is True   # durable: capped after a restart too
-            assert late > 0                                # z, held back, is paid late as any late verdict
-            assert not any("5Hot2" in doc["rewards_by_hotkey"] for doc in archives.docs.values())  # p: the cap is paid
         else:
             assert z in records.voided and records.voided[z]["reason"] == "forfeited"
-            assert late == 0                               # forfeited by p's failure, never paid
+    _run(go)
+
+
+def test_after_a_restart_the_parked_records_mark_still_caps_it_and_what_it_held():
+    """A restart forgets which records left the close; the mark in the parked record's verdict still caps it, and the
+    verdicts of its operator in its period received up to it, settled with it."""
+    async def go():
+        clock, remote = _Clock(T0 + GIVE_UP + 600), _Remote()
+        auditor = _sampled_auditor(_Records({}), clock, remote)    # a fresh process
+        period = cp.period_of(T0)
+        released = {"p": {"hotkey": HK, "received_at": T0, "left_out_of_close": True},
+                    "z": {"hotkey": HK, "received_at": T0 - 30}, "w": {"hotkey": HK, "received_at": T0 + 30},
+                    "o": {"hotkey": "5Other", "received_at": T0 - 30}}
+        assert cp.period_of(T0 - 30) == period
+        assert auditor.settle_capped(released, cp.period_of) == {"p", "z"}
     _run(go)
 
 
@@ -1532,7 +1548,10 @@ def test_what_is_held_is_its_operators_verdicts_received_before_it_in_its_period
         verdicts = {"before": (HK, period, T0 - 30), "after": (HK, period, T0 + 30),
                     "later_period": (HK, period + 1, T0 + cp.PERIOD_SECONDS), "other": ("5Other", period, T0 - 30)}
         assert auditor.settle_hold(verdicts, cp.period_of) == {"before"}
-        assert auditor.settle_capped({p: {}, "before": {}, "marked": {"left_out_of_close": True}}) == {p, "marked"}
+        # Capped once released: the parked record, any verdict marked so, and what the hold kept (owner, 2026-11-26).
+        released = {p: {"hotkey": HK, "received_at": T0}, "marked": {"left_out_of_close": True},
+                    **{sid: {"hotkey": hotkey, "received_at": at} for sid, (hotkey, _, at) in verdicts.items()}}
+        assert auditor.settle_capped(released, cp.period_of) == {p, "marked", "before"}
         q_one = _order_auditor(_Records({"r": _record("r", 4, received_at=T0)}), clock, remote)
         clock.now = T0 + 20
         await q_one.judge_many(["r"])
@@ -1609,8 +1628,8 @@ def test_an_orders_settler_asks_its_auditor_what_to_hold_and_what_to_keep_within
                          miner_states=None, beacon=None, round_at=None)
         asked = []
         w.auditor.settle_hold = lambda verdicts, period_of: asked.append("hold") or {"z"}
-        w.auditor.settle_capped = lambda ids: asked.append("capped") or {"p"}
-        assert w.settler._hold({}, cp.period_of) == {"z"} and w.settler._capped(["p"]) == {"p"}
+        w.auditor.settle_capped = lambda verdicts, period_of: asked.append("capped") or {"p"}
+        assert w.settler._hold({}, cp.period_of) == {"z"} and w.settler._capped({"p": {}}, cp.period_of) == {"p"}
         assert asked == ["hold", "capped"]
     _run(go)
 
