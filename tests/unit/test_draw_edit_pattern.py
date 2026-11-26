@@ -68,6 +68,7 @@ def test_the_auditor_charges_frequent_refusals_once_per_submission():
     auditor = CorpusAuditor.__new__(CorpusAuditor)
     auditor._draw_job, auditor._job_id = object(), "order-gen-x"
     auditor._draw_counts, auditor._draw_totals, auditor._draw_counted = {}, [0, 0], set()
+    auditor._draw_refused, auditor._draw_recounted, auditor._draw_restoring = set(), {}, False
     ok = {"passed": True}
     drift = {"passed": False, "reason": "draw_mismatch", "penalty": False}
     for i in range(2000):

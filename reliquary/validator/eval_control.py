@@ -1858,9 +1858,18 @@ def eval_auditor(**kwargs):
                 await self._record_failure(submission_id)
             return stored, written
 
+        async def _reopen_reaudited(self, submission_ids, *, drift):
+            # Every one the re-audit voids, in its own ledger: the drifts once every void is written, or as soon as one
+            # raised, so neither their slow ledger writes hold back the next voids nor a void write that raises leaves
+            # them taken until the next start.
+            await super()._reopen_reaudited(submission_ids, drift=drift)
+            for submission_id in submission_ids:
+                await self._record_failure(submission_id)
+
         async def reaudit_executor(self, executor_id):
             # A pass whose re-audit was parked stays on its executor's list, tried again after its cool-down by
             # `_reaudit_late`: a parked re-audit never leaves a quarantined executor's passes standing in silence.
+            # Each failure's slot reopens in the ledger as the re-audit voids it (`_reopen_reaudited`), once.
             listed = list(self._remote_scored.get(executor_id, ()))
             now = self._clock()
             cooling = {sid for sid in listed
@@ -1878,8 +1887,6 @@ def eval_auditor(**kwargs):
                     known = self._remote_scored.setdefault(executor_id, [])
                     present = set(known)
                     known.extend(sid for sid in back if sid not in present)
-            for submission_id in failed:
-                await self._record_failure(submission_id)
             if parked:
                 logger.warning("eval job %s: %d pass(es) of quarantined executor %s parked in their re-audit, kept "
                                "on its list (e.g. %s)", self._job_id, len(parked), executor_id, min(parked)[:12])
@@ -1905,7 +1912,19 @@ def eval_auditor(**kwargs):
         async def restore_scored(self) -> int:
             """A judge process that restarted: which executor scored each pass a quarantine could still void
             (unsettled, or settled inside the hold, as ``reaudit_executor`` chooses), read back from the verdicts,
-            then the re-audit of those scored by an executor already quarantined."""
+            then the re-audit of those scored by an executor already quarantined.
+
+            On a forced-draw job, the draw counts first take every audit written before this process as the judging
+            passes and re-audits that wrote them counted it (`_count_restored`): every verdict, voided or not, scored
+            by any executor or audited here, and the void of each voided audited pass an executor scored. Each id is
+            counted as it is read, through the one guarded count (`_count_draw`), so an id a judging pass or an
+            earlier attempt counted is counted once. No pass is listed before every verdict is counted: a re-audit
+            (this one's, or one a judging pass starts, `_reaudit_late`) then counts its drifts as refusals of passes
+            already counted and judges them on whole counts, as in a process that never restarted, and until then no
+            refusal is charged for frequent refusals (`_draw_restoring`). Counted afresh instead, that re-audit
+            counted every pass it confirmed and none of the refusals written beside them, so the job's rate read as
+            no refusal at all and honest hotkeys were charged for frequent refusals (2,000 restored passes: a fresh
+            hotkey charged for 3 drifts in 50 audits). The settler waits for this (``scores_restored``)."""
             from reliquary.validator.corpus_auditor import RECONCILE_READS
 
             ids = list(await self._records.list_verdict_ids(self._job_id))
@@ -1914,26 +1933,48 @@ def eval_auditor(**kwargs):
             state, _ = await self._records.read_settlement(self._job_id)
             settled = set((state or {}).get("settled") or ())
             gate = asyncio.Semaphore(RECONCILE_READS)
+            draw = self._draw_job is not None
+            void_reader = getattr(self._records, "read_voided", None) if draw else None
 
             async def read(submission_id):
                 async with gate:
                     return submission_id, await self._records.read_verdict(self._job_id, submission_id)
 
+            async def read_void(submission_id):
+                async with gate:
+                    return submission_id, await void_reader(self._job_id, submission_id)
+
             now, restored = self._clock(), 0
-            listed: dict[str, set[str]] = {}
-            wanted = [sid for sid in ids if sid not in voided]
+            # Per executor, the passes to list once every verdict is read (and counted).
+            scored: dict[str, list[str]] = {}
+            # Voided verdicts too on a forced-draw job: a judging pass counted them; only an unvoided pass is listed.
+            wanted = ids if draw else [sid for sid in ids if sid not in voided]
             for start in range(0, len(wanted), RECONCILE_READS):
-                for sid, verdict in await asyncio.gather(*map(read, wanted[start:start + RECONCILE_READS])):
-                    if not verdict or not verdict.get("passed") or not verdict.get("audited"):
+                verdicts = await asyncio.gather(*map(read, wanted[start:start + RECONCILE_READS]))
+                voids = {}
+                if void_reader is not None:
+                    reaudited = [sid for sid, verdict in verdicts if sid in voided and verdict
+                                 and verdict.get("passed") and verdict.get("audited") and verdict.get("scored_by")]
+                    voids = dict(await asyncio.gather(*map(read_void, reaudited)))
+                for sid, verdict in verdicts:
+                    if draw and verdict:
+                        self._count_restored(sid, verdict, voids.get(sid))
+                    if sid in voided or not verdict or not verdict.get("passed") or not verdict.get("audited"):
                         continue
                     if sid in settled and now - float(verdict.get("audited_at") or 0.0) > self._params.hold_seconds:
                         continue
                     for executor_id in verdict.get("scored_by") or ():
-                        known = listed.setdefault(executor_id, set(self._remote_scored.get(executor_id, ())))
-                        if sid not in known:
-                            known.add(sid)
-                            self._remote_scored.setdefault(executor_id, []).append(sid)
-                            restored += 1
+                        scored.setdefault(executor_id, []).append(sid)
+            # Every audit written before this process is counted: the frequent-refusals rule reads whole counts.
+            self._draw_restoring = False
+            for executor_id, sids in scored.items():
+                known = self._remote_scored.setdefault(executor_id, [])
+                present = set(known)
+                for sid in sids:
+                    if sid not in present:
+                        present.add(sid)
+                        known.append(sid)
+                        restored += 1
             # Last: a quarantine heard while reading took only what was listed by then.
             quarantined = self._remote.quarantined()
             for executor_id in sorted(set(self._remote_scored) & quarantined):
@@ -1997,8 +2038,10 @@ def eval_auditor(**kwargs):
     auditor.retry_reopens = bool(retry_reopens)
     auditor._reopening = {}
     auditor._reopen_backlog = set()
-    # A judge process: who scored what survives its restart (`restore_scored`).
+    # A judge process: who scored what survives its restart (`restore_scored`), and on a forced-draw job the draw
+    # counts too, no refusal charged for frequent refusals until they are whole.
     auditor.restores_scored = bool(restores_scored)
+    auditor._draw_restoring = auditor.restores_scored and auditor._draw_job is not None
     auditor.scores_restored = asyncio.Event()
     auditor._late_reaudits = {}
     # Pending records parked (`_ParkState`), and passes parked in a re-audit, by submission id.
