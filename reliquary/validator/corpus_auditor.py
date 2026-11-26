@@ -168,8 +168,10 @@ FREQUENT_REFUSALS_P = 1e-4
 def frequent_refusals(refused: int, audited: int, others_refused: int, others_audited: int) -> bool:
     """Whether ``refused`` of ``audited`` is far above the others' rate: P(X >= refused) under Binomial(audited,
     p) below FREQUENT_REFUSALS_P, p the others' rate with one refusal and one pass added (no evidence yet: 1/2, so
-    nothing is charged before the others have been audited)."""
-    if refused < FREQUENT_REFUSALS_MIN or audited <= 0:
+    nothing is charged before the others have been audited). More refusals than audits is no count the auditor
+    keeps (each audit counts at most one refusal, `CorpusAuditor._count_draw`): nothing is charged on it, where the
+    binomial tail, empty, would charge whatever the others' rate."""
+    if refused < FREQUENT_REFUSALS_MIN or audited <= 0 or refused > audited:
         return False
     p = (others_refused + 1) / (others_audited + 2)
     if p >= 1.0:
@@ -279,12 +281,13 @@ class CorpusAuditor:
         self._next_due: dict[str, float] = {}
         # Write errors of the current judge_many, raised after its backward audit.
         self._deferred: list[BaseException] = []
-        # Forced-draw audits per hotkey [audited, refused], the job's totals, and the ids counted (`_count_refusal`);
-        # the ids a re-audit counted as refusals (`_recount_refusal`).
+        # Forced-draw audits per hotkey [audited, refused], the job's totals, the ids counted and those counted as
+        # refusals (`_count_draw`); the outcome each id a re-audit refused came back with (`_recount_refusal`).
         self._draw_counts: dict[str, list[int]] = {}
         self._draw_totals = [0, 0]
         self._draw_counted: set[str] = set()
-        self._draw_recounted: set[str] = set()
+        self._draw_refused: set[str] = set()
+        self._draw_recounted: dict[str, dict] = {}
         # Passes this process wrote, per hotkey (received_at, id), and whether the job's earlier ones
         # were read once: a forfeit then never lists the job again (`_void_forfeited`).
         self._paid: dict[str, list[tuple[float, str]]] = {}
@@ -1189,21 +1192,32 @@ class CorpusAuditor:
                     del solo_exc
         return judged
 
-    def _count_refusal(self, submission_id: str, hotkey: str, outcome: dict) -> dict:
-        """Count a forced-draw audit for its hotkey; an uncharged refusal is charged when its hotkey is refused far
-        more often than the job's other hotkeys (``frequent_refusals``): one edit at a time, repeated. Counted once
-        per submission, in this process (a restart starts the counts again)."""
-        if self._draw_job is None or submission_id in self._draw_counted:
-            return outcome
-        refused = not outcome["passed"] and outcome.get("reason") == "draw_mismatch"
-        if not (outcome["passed"] or refused):
-            return outcome
+    def _count_draw(self, submission_id: str, hotkey: str, refused: bool) -> bool:
+        """One forced-draw audit of ``hotkey``, a pass or a refusal, counted once per submission: whether this call
+        counted it. The only path that adds an audit to the counts. A judging pass (`_count_refusal`) and a re-audit
+        (`_recount_refusal`) each count an id here, checked as they add it: an id one of them counted is skipped by
+        the other."""
+        if submission_id in self._draw_counted:
+            return False
         self._draw_counted.add(submission_id)
+        if refused:
+            self._draw_refused.add(submission_id)
         counts = self._draw_counts.setdefault(hotkey, [0, 0])
         counts[0] += 1
         counts[1] += int(refused)
         self._draw_totals[0] += 1
         self._draw_totals[1] += int(refused)
+        return True
+
+    def _count_refusal(self, submission_id: str, hotkey: str, outcome: dict) -> dict:
+        """Count a forced-draw audit for its hotkey; an uncharged refusal is charged when its hotkey is refused far
+        more often than the job's other hotkeys (``frequent_refusals``): one edit at a time, repeated. Counted once
+        per submission (`_count_draw`), in this process (a restart starts the counts again)."""
+        if self._draw_job is None:
+            return outcome
+        refused = not outcome["passed"] and outcome.get("reason") == "draw_mismatch"
+        if not (outcome["passed"] or refused) or not self._count_draw(submission_id, hotkey, refused):
+            return outcome
         return self._charged_if_frequent(hotkey, outcome) if refused else outcome
 
     def _charged_if_frequent(self, hotkey: str, outcome: dict) -> dict:
@@ -1221,18 +1235,22 @@ class CorpusAuditor:
         """A forced-draw refusal that the re-audit of a quarantined executor's pass repeats (`reaudit_executor`),
         counted as a judging pass that refused it counts one (`_count_refusal`): the passing audit its judging pass
         counted becomes a refusal, and the same rule charges a drift when its hotkey is now refused far more often
-        than the job's other hotkeys (a penalised refusal comes back as it is). A pass this process never counted
-        (written before a restart) is counted in full. Once per submission, as there: a later re-audit of it gets
-        its outcome back as it is."""
-        if (self._draw_job is None or outcome.get("reason") != "draw_mismatch"
-                or submission_id in self._draw_recounted):
+        than the job's other hotkeys (a penalised refusal comes back as it is). An id already counted as a refusal
+        (its judging pass refused it, its verdict write failed, and a later pass wrote a pass) is not counted again;
+        an id this process never counted (written before a restart) is counted in full. Once per submission: a later
+        re-audit of it (the pair's other executor's, or a retry after `_escalate` or a void write raised) counts
+        nothing and gets back the outcome this one came back with, a frequent-refusals charge included, so a retry
+        still escalates it (`after_confirmed_failure` is idempotent)."""
+        if self._draw_job is None or outcome.get("reason") != "draw_mismatch":
             return outcome
-        self._draw_recounted.add(submission_id)
-        if submission_id not in self._draw_counted:
-            return self._count_refusal(submission_id, hotkey, outcome)
-        self._draw_counts.setdefault(hotkey, [0, 0])[1] += 1
-        self._draw_totals[1] += 1
-        return self._charged_if_frequent(hotkey, outcome)
+        if submission_id in self._draw_recounted:
+            return self._draw_recounted[submission_id]
+        if not self._count_draw(submission_id, hotkey, True) and submission_id not in self._draw_refused:
+            self._draw_refused.add(submission_id)
+            self._draw_counts.setdefault(hotkey, [0, 0])[1] += 1
+            self._draw_totals[1] += 1
+        outcome = self._draw_recounted[submission_id] = self._charged_if_frequent(hotkey, outcome)
+        return outcome
 
     def _received(self, submission_id: str, record: Mapping | None = None) -> float | None:
         meta = self._meta.get(submission_id)

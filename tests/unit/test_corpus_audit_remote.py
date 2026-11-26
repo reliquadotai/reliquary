@@ -972,14 +972,14 @@ def test_after_a_restart_the_passes_a_reaudit_confirms_are_counted_too(monkeypat
     assert "5X" not in states.states  # no charge: no failure, no suspicion
 
 
-def _frequent_drifts(monkeypatch, kind="base", *, q=1.0, settled=False, penalised=(), lying=True):
+def _frequent_drifts(monkeypatch, kind="base", *, q=1.0, settled=False, penalised=(), lying=True, reaudit=True):
     """A forced-draw job at share ``q`` whose other hotkeys passed 2,000 audits: three records of 5X, received 10 s
     apart, that this GPU refuses as drifts (with a penalty: the indices in ``penalised``). ``lying``: a judging pass
-    took pod-1's passing scores for them, and pod-1's quarantine re-audits them (``run.voided``); else that pass
-    refused them itself. The third refusal crosses the frequent-refusals line. ``kind``: "base", a CorpusAuditor whose
-    slot store the spies stand for, or "eval", an EvalAuditor and its ledger. ``settled``: the three were settled
-    (inside the hold window) before the re-audit. ``run.events``: from the re-audit on, each slot reopen and each void
-    the status hears of, in order."""
+    took pod-1's passing scores for them, and pod-1's quarantine re-audits them (``run.voided``; not run without
+    ``reaudit``); else that pass refused them itself. The third refusal crosses the frequent-refusals line. ``kind``:
+    "base", a CorpusAuditor whose slot store the spies stand for, or "eval", an EvalAuditor and its ledger.
+    ``settled``: the three were settled (inside the hold window) before the re-audit. ``run.events``: from the re-audit
+    on, each slot reopen and each void the status hears of, in order."""
     from reliquary.corpus.audit_policy import AuditParams
     from reliquary.validator import corpus_service, eval_control
     from reliquary.validator.corpus_auditor import CorpusAuditor
@@ -1034,7 +1034,8 @@ def _frequent_drifts(monkeypatch, kind="base", *, q=1.0, settled=False, penalise
         if settled:
             run.records.settlement = {"settled": list(run.ids)}
         run.events.clear()
-        run.voided = asyncio.run(run.auditor.reaudit_executor("pod-1"))
+        if reaudit:
+            run.voided = asyncio.run(run.auditor.reaudit_executor("pod-1"))
     return run
 
 
@@ -1079,6 +1080,161 @@ def test_a_forfeit_voids_first_and_the_reaudits_own_void_is_refused(monkeypatch)
     charged = run.states.states["5X"]
     assert charged.failure_ids == [run.ids[2]] and charged.forfeit_before == 99_020.0
     assert {sid for what, sids in run.events if what == "reopen" for sid in sids} == set(run.ids)
+
+
+def test_a_penalised_refusal_that_crosses_the_line_keeps_its_labels(monkeypatch):
+    """Two drifts of 5X, then a refusal with a penalty: the third refusal crosses the frequent-refusals line, but the
+    rule requalifies only a refusal without penalty (`_charged_if_frequent`). The penalised one is charged as it is,
+    with no ``charged_for``, by a judging pass and by a re-audit alike."""
+    judged = _frequent_drifts(monkeypatch, penalised=(2,), lying=False)
+    run = _frequent_drifts(monkeypatch, penalised=(2,))
+    for auditor in (judged.auditor, run.auditor):
+        assert auditor._draw_counts["5X"] == [3, 3]
+    verdict, void = judged.records.verdicts[judged.ids[2]], run.records.voided[run.ids[2]]
+    assert verdict["reason"] == void["reason"] == "draw_mismatch"
+    assert "charged_for" not in verdict
+    assert "charged_for" not in void and "penalty" not in void
+    assert judged.states.states["5X"].failure_ids == run.states.states["5X"].failure_ids == [run.ids[2]]
+
+
+def test_a_reaudit_run_again_after_its_escalation_raised_still_charges(monkeypatch):
+    """The re-audit counts 5X's three drifts and charges the third for frequent refusals; then its escalation raises
+    (a miners.json write failing after its retries), and nothing is voided. Run again (`_reaudit_late` lists the
+    passes again), it counts nothing twice and gets the charged outcome back (`_draw_recounted`): the third is
+    escalated and voided charged, not uncharged as a drift seen a second time."""
+    run = _frequent_drifts(monkeypatch, reaudit=False)
+    escalate, calls = run.auditor._escalate, []
+
+    async def flaky(failures, *args, **kwargs):
+        calls.append(sorted(failures))
+        if len(calls) == 1:
+            raise OSError("miners.json write failed after its retries")
+        return await escalate(failures, *args, **kwargs)
+
+    monkeypatch.setattr(run.auditor, "_escalate", flaky)
+    with pytest.raises(OSError):
+        asyncio.run(run.auditor.reaudit_executor("pod-1"))
+    assert run.records.voided == {} and run.states.states["5X"].failure_ids == []
+    run.auditor._remote_scored["pod-1"] = list(run.ids)
+    assert asyncio.run(run.auditor.reaudit_executor("pod-1")) == run.ids
+    assert calls == [["5X"], ["5X"]] and run.auditor._draw_counts["5X"] == [3, 3]
+    assert run.records.voided[run.ids[2]]["charged_for"] == "frequent_refusals"
+    assert run.states.states["5X"].failure_ids == [run.ids[2]]
+
+
+def test_a_refusal_its_judging_pass_counted_is_not_counted_again_by_its_reaudit(monkeypatch):
+    """A judging pass refuses 5X's three records as drifts and counts them; their verdict writes fail, so they stay
+    pending. A later pass takes pod-1's passing scores for them and writes passes, counting nothing again. pod-1's
+    re-audit refuses them as drifts: each is still one audit refused once, 3 in 3, not 6 refusals in 3 audits (on which
+    `frequent_refusals` charged whatever the job's rate: its binomial tail was empty). The job's other hotkeys are
+    refused half the time, so 3 in 3 is no charge."""
+    from reliquary.validator import eval_control
+    from reliquary.validator.corpus_auditor import frequent_refusals
+    from tests.unit.test_eval_draw import _job as draw_job
+
+    job = draw_job()
+    ids = [f"{i:064x}" for i in range(1, 4)]
+    phase = {"now": "refuse"}
+
+    class _Failing(_VoidingRecords):
+        async def write_verdict(self, job_id, sid, verdict):
+            if phase["now"] == "refuse":
+                raise OSError("store PUT failed after its retries")
+            return await super().write_verdict(job_id, sid, verdict)
+
+    records = _Failing({sid: {"hotkey": "5X", "token_count": 10, "prompt_index": job.prompt_start, "cursor": 0,
+                              "received_at": 99_000.0 + k} for k, sid in enumerate(ids)})
+    auditor = eval_control.eval_auditor(job_id=job.job_id, records=records, tokenizer=None, proof=PROOF,
+                                        vocab_size=10, job=job, job_store=object(), draw_job=job,
+                                        miner_states=_States(), clock=_Clock(100_000.0))
+    drift = {**_DRAW_REFUSAL, "penalty": False}
+    for i in range(2000):
+        auditor._count_refusal(f"h{i}", f"5Other{i % 50}", dict(drift) if i % 2 else {"passed": True})
+
+    async def audit(batch, *, local=False):
+        if phase["now"] == "pass" and not local:
+            return [{**_PASSING, "scored_by": ["pod-1"]} for _ in batch]
+        return [dict(drift) for _ in batch]
+
+    monkeypatch.setattr(auditor, "_audit_outcomes", audit)
+    with pytest.raises(OSError):
+        asyncio.run(auditor.audit_many(ids))
+    assert auditor._draw_counts["5X"] == [3, 3] and records.verdicts == {}
+    phase["now"] = "pass"
+    asyncio.run(auditor.audit_many(ids))
+    assert all(records.verdicts[sid]["passed"] for sid in ids) and auditor._draw_counts["5X"] == [3, 3]
+    assert asyncio.run(auditor.reaudit_executor("pod-1")) == ids
+    assert auditor._draw_counts["5X"] == [3, 3] and auditor._draw_totals == [2003, 1003]
+    assert all(records.voided[sid]["penalty"] is False for sid in ids)
+    # More refusals than audits is no count the auditor keeps: nothing is charged on it.
+    assert not frequent_refusals(4, 2, 0, 0) and not frequent_refusals(6, 3, 1000, 2000)
+
+
+def test_a_reaudit_counts_no_pass_it_confirms_twice(monkeypatch):
+    """Without a restart, every pass the re-audit confirms was counted by its judging pass, and stays counted once:
+    5X's three passes stay three audits. Counted again (`_draw_counted` not checked where the re-audit counts them),
+    they would dilute 5X's refusals: its three drifts judged next, 3 in 6 audits, are charged for frequent refusals,
+    and would not be as 3 in 9."""
+    world = _world([("5Other%d" % (i % 20), "drift" if i % 100 == 0 else "pass:pod-2", "pass") for i in range(400)]
+                   + [("5X", "pass:pod-1", "pass")] * 3 + [("5X", "drift", "drift")] * 3)
+    auditor = world.auditor()
+    asyncio.run(auditor.audit_many(world.ids[:403]))
+    counts = (dict(auditor._draw_counts), list(auditor._draw_totals))
+    assert auditor._draw_counts["5X"] == [3, 0] and auditor._draw_totals == [403, 4]
+    world.quarantined.add("pod-1")
+    assert asyncio.run(auditor.reaudit_executor("pod-1")) == []
+    assert (dict(auditor._draw_counts), list(auditor._draw_totals)) == counts
+    asyncio.run(auditor.audit_many(world.ids[403:]))
+    assert auditor._draw_counts["5X"] == [6, 3]
+    assert world.records.verdicts[world.ids[-1]]["charged_for"] == "frequent_refusals"
+
+
+_TAGGED = {"drift": {**_DRAW_REFUSAL, "penalty": False}, "penalised": dict(_DRAW_REFUSAL),
+           "other": {"passed": False, "reason": "bad_tokens"}}
+
+
+def _outcome(tag):
+    if tag.startswith("pass"):
+        executor = tag.partition(":")[2]
+        return {**_PASSING, **({"scored_by": [executor]} if executor not in ("", "local") else {})}
+    return dict(_TAGGED[tag])
+
+
+def _world(rows, *, q=1.0):
+    """A forced-draw job judged by a judge process (an EvalAuditor), one record per row: (hotkey, the outcome its
+    judging pass takes, the outcome this GPU's re-audit of its pass finds), received 1 s apart. An outcome:
+    "pass:<executor>" (scored by that executor; "pass:local", by none), "drift", "penalised", or "other" (a failure
+    of another kind, charged and never counted). ``world.auditor()``: a judge process over the job's records and
+    miners (``restores=True``: one that restarted); ``world.quarantined``: the executors quarantined."""
+    from reliquary.corpus.audit_policy import AuditParams
+    from reliquary.validator import eval_control
+    from tests.unit.test_eval_draw import _job as draw_job
+
+    job = draw_job()
+    world = SimpleNamespace(job=job, ids=[f"{k + 1:064x}" for k in range(len(rows))], states=_States(),
+                            quarantined=set())
+    world.records = _VoidingRecords({
+        sid: {"hotkey": hotkey, "token_count": 10, "prompt_index": job.prompt_start, "cursor": 0,
+              "received_at": 99_000.0 + k, "judged": judged, "reaudit": reaudit}
+        for k, (sid, (hotkey, judged, reaudit)) in enumerate(zip(world.ids, rows))})
+
+    async def audit(batch, *, local=False):
+        # A judging pass's audits take the row's judging outcome (its second audit of a failure too); this GPU's audit
+        # of a pass already written, the re-audit's, takes its re-audit outcome.
+        return [_outcome(r["reaudit"] if local and r["judged"].startswith("pass") else r["judged"]) for r in batch]
+
+    def auditor(*, restores=False):
+        remote = SimpleNamespace(connected=lambda: True, subscribe=lambda listener: None,
+                                 quarantined=lambda: set(world.quarantined))
+        made = eval_control.eval_auditor(job_id=job.job_id, records=world.records, tokenizer=None, proof=PROOF,
+                                         vocab_size=10, job=job, job_store=object(), draw_job=job, remote=remote,
+                                         miner_states=world.states, clock=_Clock(100_000.0), params=AuditParams(q=q),
+                                         restores_scored=restores)
+        made._audit_outcomes = audit
+        return made
+
+    world.auditor = auditor
+    return world
 
 
 def test_without_a_connected_executor_the_auditor_runs_locally():
