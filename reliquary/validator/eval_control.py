@@ -124,10 +124,11 @@ MIN_MEASURED_BUSY_SECONDS = 120.0
 # only after CLEAN_STREAK of them, so a card failing one call in two does not keep its work.
 LOST_RESULT_STRIKES = 2
 CLEAN_STREAK = 5
-# An audit lease lives twice the time the model's recent results took per token, for its tokens and those the
+# An audit lease lives twice the time its job's recent results took per token, for its tokens and those the
 # card already holds, plus LEASE_OVERHEAD_SECONDS, within [AUDIT_LEASE_FLOOR_SECONDS, the dispatcher's lease
-# seconds]; the dispatcher's lease seconds until LEASE_TIMES_NEEDED results were timed. Per token, not per
-# item: one model audits short completions and long agentic episodes from the same queue.
+# seconds]; the dispatcher's lease seconds until LEASE_TIMES_NEEDED results of each of those jobs were timed.
+# Per job and per token: one model audits short completions and long agentic episodes from the same queue, and
+# a token of a long episode costs several times a token of a short completion.
 AUDIT_LEASE_FLOOR_SECONDS = 60.0
 LEASE_OVERHEAD_SECONDS = 30.0
 LEASE_TIMES_KEPT = 20
@@ -378,8 +379,8 @@ class PairedAuditDispatcher:
         self._strikes: collections.Counter = collections.Counter()
         # Per executor, results delivered in time since its last lost one.
         self._clean: collections.Counter = collections.Counter()
-        # Per model, seconds per token its recent results took from grant to result.
-        self._lease_times: dict[ModelKey, collections.deque] = collections.defaultdict(
+        # Per (model, job), seconds per token its recent results took from grant to result.
+        self._lease_times: dict[tuple[ModelKey, str], collections.deque] = collections.defaultdict(
             lambda: collections.deque(maxlen=LEASE_TIMES_KEPT))
         self._seen: dict[str, float] = {}
         self._listeners: list[Callable[[str], Awaitable[Any]]] = []
@@ -538,8 +539,7 @@ class PairedAuditDispatcher:
                 continue
             now = self._clock()
             lease = _Lease(lease_id=secrets.token_hex(16), batch=batch, executor_id=executor_id,
-                           expires_at=now + self.lease_time(batch.model, _tokens(batch.items)
-                                                            + sum(_tokens(h.batch.items) for h in held)),
+                           expires_at=now + self.lease_time([batch] + [h.batch for h in held]),
                            granted_at=now)
             self._leases[lease.lease_id] = lease
             self._mark_busy(executor_id, batch.model)
@@ -559,14 +559,15 @@ class PairedAuditDispatcher:
             }
         return None
 
-    def lease_time(self, model: ModelKey, tokens: int) -> float:
-        """Seconds an audit lease of ``tokens`` tokens (its own and those its card already holds) lives."""
-        times = self._lease_times.get(model)
-        if not times or len(times) < LEASE_TIMES_NEEDED:
-            return self._lease_seconds
-        per_token = statistics.median(times)
-        return min(self._lease_seconds,
-                   max(AUDIT_LEASE_FLOOR_SECONDS, 2.0 * per_token * max(1, tokens) + LEASE_OVERHEAD_SECONDS))
+    def lease_time(self, batches: Sequence[_Batch]) -> float:
+        """Seconds an audit lease lives: ``batches`` are its own and those its card already holds."""
+        expected = 0.0
+        for batch in batches:
+            times = self._lease_times.get((batch.model, batch.job_id))
+            if not times or len(times) < LEASE_TIMES_NEEDED:
+                return self._lease_seconds
+            expected += statistics.median(times) * max(1, _tokens(batch.items))
+        return min(self._lease_seconds, max(AUDIT_LEASE_FLOOR_SECONDS, 2.0 * expected + LEASE_OVERHEAD_SECONDS))
 
     def lease_of(self, lease_id: str) -> _Lease | None:
         return self._leases.get(lease_id)
@@ -587,7 +588,7 @@ class PairedAuditDispatcher:
             if self._clean[executor_id] >= CLEAN_STREAK:
                 self._strikes[executor_id] = 0
             if _tokens(batch.items):
-                self._lease_times[batch.model].append(
+                self._lease_times[(batch.model, batch.job_id)].append(
                     (self._clock() - lease.granted_at) / _tokens(batch.items))
         scores = result.scores
         if len(scores) != len(batch.items) or any(_misfit(s, item) for s, item in zip(scores, batch.items)):
