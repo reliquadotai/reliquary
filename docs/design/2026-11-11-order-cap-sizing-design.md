@@ -78,18 +78,23 @@ cap       = min(cap_max, max(CAP_FLOOR, paid x HEADROOM, min(ahead, estimate x H
     periods (`recent_paid`) and the most an unsettled period has accrued at the ceiling (`open_value`).
   - The estimate is recomputed with the current rate and card count, so a card added mid-order raises the cap.
   - A change under 10 % of the current cap is not written.
-  - A raise goes as far as the free room allows with `NEW_ORDER_RESERVE` (0.05) kept free, room for any new
-    order's start: a corpus order's `START_CAP` or a training order's `DEFAULT_TRAINING_CAP`
-    (`admin.service.bounded_raise`, from reliquary#593).
+  - A raise goes as far as the free room allows with `NEW_ORDER_RESERVE` (0.05) kept free: room for one new
+    order's start, a corpus order's `START_CAP` or a training order's `DEFAULT_TRAINING_CAP`
+    (`admin.service.bounded_raise`, from reliquary#593). An order sized under its own start can always climb
+    back to it, into the reserve (`cap_sizing.raise_room`).
     - The free room keeps declared caps (retired ones included) within 1.0 and paying corpus caps within
       `RELIQUARY_ADMIN_POOL_MAX` (`admin.service.cap_room`). The cap is rounded down to the micro-share, never
       up into the reserve.
-    - It is written only if it raises the cap by 10 % or more, and its guard re-checks on the registry written
-      that the task is still active at the cap read and that the room is still there. A raise never lowers a
-      cap a concurrent write set, never revives a task being closed, and never raises a paused order or one at
-      cap 0.
-    - The room goes to whichever order asks first in a pass (task-id order). A raise the registry would have
-      taken whole can be held short by the reserve.
+    - Every raise first lists the retired orders, as every resize did: a drained one gives its room back even
+      while raises wait.
+    - It is written only if it raises the cap by 10 % or more. Only an open order is raised: never a paused one
+      or one at cap 0 (being closed).
+    - Every resize's guard re-checks on the registry written that the task is still active at the cap read
+      (`unchanged_guard`), a raise's also that it is still open and the room still there. A resize therefore
+      never undoes a concurrent write: an operator's PATCH, a close, a pause. A replay of the same write after
+      a lost response goes through.
+    - The room goes to whichever order asks first in a pass (task-id order), and a paused order keeps the cap
+      it had. A raise the registry would have taken whole can be held short by the reserve.
   - Before reliquary#593, a raise the registry refused kept the cap: on 2026-11-25 an order asking 0.25 every
     5 minutes stayed at 0.0323 for hours when it could have held 0.152 (0.1197 was free).
 - The settler pays a period with the cap it holds when it settles that period, so a cap lowered mid-period
