@@ -51,8 +51,8 @@ Each account has a private environment hub on the platform:
 * **Push**: a `verifiers` v1 package (a source archive with `pyproject.toml` and a lockfile), or an import from
   the Prime Environments Hub by `owner/name@version` (we fetch the wheel once and treat it like a push).
 * **Version** = sha256 of the archive. A version is immutable; an order pins it, with the image digest it built.
-* **Visibility**: private to the account by default; shared with an organisation's members. Public listing is
-  out of scope for now.
+* **Visibility**: private to the account (and its organisation's members). No sharing with other accounts and
+  no public listing for now.
 * **Uses**: one environment serves every product. Qualification (below) decides which uses it may have, as the
   catalog does for ours (`env_catalog.py`: `rl`, `batch`, `eval` rows).
 * **Secrets**: the customer may attach secrets (an API key for their judge or their tools). They are stored
@@ -115,14 +115,22 @@ Run once per version, in the customer's sandbox, before any order may use it:
    `verifiers_source.refusal` (prompt not text, conversation in the prompt).
 2. Build and start; the reward server must answer within its start budget.
 3. Freeze the prompts.
-4. Smoke run with a reference model on a sample of tasks.
-5. **Determinism**: grade the smoke completions twice, in two fresh sandboxes; any difference refuses the
+4. **Examples**: the push carries a few examples, `{problem_id, completion, expected_score}`, at least one
+   scoring high and one low. Each must score as expected. No model runs during qualification: it needs no GPU.
+5. **Determinism**: grade the examples twice, in two fresh sandboxes; any difference refuses the
    environment for RL (it may still serve evaluations and annotation, marked non-reproducible). An LLM judge
    is non-reproducible by construction.
 6. Measure scoring time and sandbox seconds per item: the order's price includes them.
 
-The result is a signed qualification record naming the version, the image digest, the prompt set's sha256 and the
-uses granted.
+The steps run cheapest first and stop at the first failure, with its reason. The result is a signed
+qualification record naming the version, the image digest, the prompt set's sha256 and the uses granted.
+
+### Who pays
+
+Qualification is CPU only (build, freeze, a few scorings). Each account gets a monthly allowance of
+qualification CPU time; beyond it, qualification is billed at cost, pass or fail. A failure caused by our
+infrastructure (builder, registry, fleet) is never counted. An account runs at most a few qualifications at once,
+and build and start have fixed time budgets, so pushes cannot be used to tie up the builder.
 
 ## Data-only graders (no code)
 
@@ -145,6 +153,5 @@ later choice: one path for everything, at the cost of a round trip per group.
 
 ## Open questions
 
-* Who pays the sandboxes of a failed qualification.
-* Whether a customer may grant an environment to another account (a vendor selling environments).
+* The allowance's size, once qualification costs are measured.
 * Latency of the reward server round trip on the RL critical path: to be measured on a group of 512.
