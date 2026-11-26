@@ -31,7 +31,10 @@ PROTOCOLS = (AUDIT_PROTOCOL, AUDIT_PROTOCOL_V2, AUDIT_PROTOCOL_V3, AUDIT_PROTOCO
 DRAW_PROTOCOLS = (AUDIT_PROTOCOL_V3, AUDIT_PROTOCOL_V4)
 ProtocolName = Literal["reliquary.corpus-audit/v1", "reliquary.corpus-audit/v2", "reliquary.corpus-audit/v3",
                        "reliquary.corpus-audit/v4"]
-MAX_ITEM_SPANS = 64
+# An agentic item's assistant spans, one per turn: as many as the longest trajectory admission takes (a signed
+# episode, ``protocol.submission.MAX_SIGNED_EPISODE_TURNS``; a test pins the bound to every turn cap). Below it, an
+# admitted trajectory fits no lease: every executor refuses it, loses the lease and is quarantined.
+MAX_ITEM_SPANS = 256
 # Bounds of one lease: what keeps a request and a response a few megabytes.
 MAX_LEASE_ITEMS = 64
 MAX_LEASE_TOKENS = 262_144

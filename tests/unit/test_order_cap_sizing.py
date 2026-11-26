@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import replace
 
 import pytest
 
@@ -220,6 +221,229 @@ def test_a_resize_the_pool_cannot_take_keeps_the_cap(admin, pins, rates, control
     assert asyncio.run(admin.app.state.resize_order_caps()) == 0
     assert admin.registry["entries"]["order-eval-p1"].params["cap"] == before
     monkeypatch.undo()
+
+
+def _with_cap(client, task_id, cap, **changes):
+    """``task_id`` at ``cap``; a corpus order's floor follows (its price stays pinned)."""
+    entry = client.registry["entries"][task_id]
+    pinned = {"floor": cap} if entry.params.get("floor") == entry.params.get("cap") else {}
+    client.registry["entries"][task_id] = replace(entry, params={**entry.params, "cap": cap, **pinned}, **changes)
+
+
+def _resize_asking(client, control, recent_paid=0.5):
+    facts = {"model": f"{MODEL}@{REVISION}", "audit_executors": 1, "recent_paid": [recent_paid],
+             "open_value": 0.0}
+    control["document"] = _rates_status(jobs={"order-eval-p1": {"sizing": facts}})
+    return asyncio.run(client.app.state.resize_order_caps())
+
+
+def _declare(client, job_id):
+    return client("POST", "/admin/v1/jobs", _order(job_id=job_id, cap=0.25, max_price_usd_per_mtoken=CEILING))
+
+
+def _cap(client, task_id="order-eval-p1"):
+    return client.registry["entries"][task_id].params["cap"]
+
+
+@pytest.fixture
+def sized(admin, pins, rates, control, monkeypatch):  # noqa: F811
+    """The admin with cap sizing on and order-eval-p1 declared."""
+    monkeypatch.setenv(sizing.SIZING_ENV, "on")
+    control["document"] = _rates_status()
+    assert _declare(admin, "order-eval-p1").status_code == 201
+    return admin
+
+
+def _stranded(client, default=0.3, retired=0.55):
+    """A retired RL task's stranded cap, as on 2026-11-25 (0.5958 then)."""
+    from tests.unit.test_jobs_cli import _rl_entry
+
+    _with_cap(client, "default", default)
+    client.registry["entries"]["order-train-x"] = replace(_rl_entry("order-train-x", retired), status="retired",
+                                                          retired_at=7)
+
+
+def test_a_raise_takes_the_free_room_with_a_new_orders_start_kept_free(sized, control):
+    # 2026-11-25: refused at 0.25 every 5 minutes, an order stayed at 0.0323 for hours when it could have held
+    # 0.152 (0.1197 free).
+    _stranded(sized)
+    assert _resize_asking(sized, control) == 1
+    assert _cap(sized) == pytest.approx(1.0 - 0.3 - 0.55 - sizing.NEW_ORDER_RESERVE, abs=1e-6)
+    assert _cap(sized) <= 1.0 - 0.3 - 0.55 - sizing.NEW_ORDER_RESERVE + 1e-9      # the registry's tolerance
+    assert sized.registry["entries"]["order-eval-p1"].params[sizing.CAP_MAX_PARAM] == 0.25
+    assert _cap(sized, "order-train-x") == 0.55                                      # a retired cap: untouched
+
+
+def test_a_raise_stays_within_the_admin_pool(sized, control):
+    assert _declare(sized, "order-eval-p2").status_code == 201
+    _with_cap(sized, "order-eval-p2", 0.2)
+    assert _resize_asking(sized, control) == 1
+    # The admin pool is 0.3 and the other order holds 0.2 of it.
+    assert _cap(sized) == pytest.approx(0.3 - 0.2 - sizing.NEW_ORDER_RESERVE, abs=1e-6)
+    assert _cap(sized, "order-eval-p2") == 0.2
+
+
+def test_a_raise_that_fits_still_keeps_a_new_orders_start_free(sized, control):
+    # The registry would take 0.25 (0.03 + 0.25 is within the 0.3 pool), which would leave no room for a start.
+    assert _declare(sized, "order-eval-p2").status_code == 201
+    _with_cap(sized, "order-eval-p2", 0.03)
+    assert _resize_asking(sized, control) == 1
+    assert _cap(sized) == pytest.approx(0.3 - 0.03 - sizing.NEW_ORDER_RESERVE, abs=1e-6) and _cap(sized) < 0.25
+
+
+def test_the_rounding_never_eats_into_the_reserve(sized, control):
+    assert _declare(sized, "order-eval-p2").status_code == 201
+    _with_cap(sized, "order-eval-p2", 0.0123454321)       # more decimals than a written cap keeps
+    assert _resize_asking(sized, control) == 1
+    assert 0.3 - _cap(sized) - _cap(sized, "order-eval-p2") >= sizing.NEW_ORDER_RESERVE
+    assert _declare(sized, "order-eval-p3").status_code == 201      # a new order still starts
+
+
+def test_a_new_order_keeps_its_start_during_its_first_period(sized, control):
+    _with_cap(sized, "order-eval-p1", sizing.START_CAP)
+    # Barely anything accrued yet: sized down to the floor, but no period of it settled.
+    first = {"model": f"{MODEL}@{REVISION}", "audit_executors": 1, "recent_paid": [], "open_value": 0.0001}
+    control["document"] = _rates_status(jobs={"order-eval-p1": {"sizing": first}})
+    assert asyncio.run(sized.app.state.resize_order_caps()) == 0
+    assert _cap(sized) == sizing.START_CAP
+    # Once a period paid, it follows its pay down as any order.
+    control["document"] = _rates_status(jobs={"order-eval-p1": {"sizing": {**first, "recent_paid": [0.001]}}})
+    assert asyncio.run(sized.app.state.resize_order_caps()) == 1
+    assert _cap(sized) < sizing.START_CAP
+
+
+@pytest.mark.parametrize("orders", [2, 4])
+def test_active_orders_raised_together_still_leave_a_training_start(sized, control, orders):
+    from reliquary.admin.training import DEFAULT_TRAINING_CAP
+
+    ids = [f"order-eval-p{k}" for k in range(1, orders + 1)]
+    for job_id in ids[1:]:
+        assert _declare(sized, job_id).status_code == 201
+    for job_id in ids:
+        _with_cap(sized, job_id, 0.005)
+    _with_cap(sized, "default", 0.93)
+    facts = {"model": f"{MODEL}@{REVISION}", "audit_executors": 1, "recent_paid": [0.5], "open_value": 0.0}
+    control["document"] = _rates_status(jobs={job_id: {"sizing": facts} for job_id in ids})
+    for _ in range(3):
+        asyncio.run(sized.app.state.resize_order_caps())
+    declared = sum(float(e.params["cap"]) for e in sized.registry["entries"].values())
+    assert 1.0 - declared >= DEFAULT_TRAINING_CAP - 1e-9
+
+
+def test_a_raise_gaining_under_the_minimum_change_is_not_written(sized, control):
+    _with_cap(sized, "order-eval-p1", 0.10)
+    _with_cap(sized, "default", 0.845)
+    # The room is 0.155, so 0.105 with the reserve kept free: under 10 % over 0.10.
+    assert _resize_asking(sized, control) == 0
+    assert _cap(sized) == 0.10
+
+
+def test_a_raise_never_lowers_a_cap(sized, control):
+    _with_cap(sized, "order-eval-p1", 0.10)
+    _with_cap(sized, "default", 0.875)
+    # The room is 0.125, so 0.075 with the reserve kept free: below the cap held.
+    assert _resize_asking(sized, control) == 0
+    assert _cap(sized) == 0.10
+
+
+def _racing(monkeypatch, before_write):
+    """``set_task_cap`` with ``before_write`` landing first, as a concurrent write would."""
+    from reliquary.infrastructure import task_registry_store as store
+
+    written = store.set_task_cap
+
+    async def racing(task_id, cap, **kwargs):
+        before_write()
+        return await written(task_id, cap, **kwargs)
+
+    monkeypatch.setattr(store, "set_task_cap", racing)
+
+
+@pytest.mark.parametrize("landed", [0.145, 0.001, 0.0])    # an operator's PATCH up or down, a close
+def test_a_raise_never_overwrites_a_concurrent_write(sized, control, monkeypatch, landed):
+    _stranded(sized)
+    _racing(monkeypatch, lambda: _with_cap(sized, "order-eval-p1", landed))
+    assert _resize_asking(sized, control) == 0
+    assert _cap(sized) == landed
+
+
+def test_a_raise_never_lifts_an_order_paused_in_its_window(sized, control, monkeypatch):
+    _stranded(sized)
+    entry = sized.registry["entries"]["order-eval-p1"]
+    _racing(monkeypatch, lambda: sized.registry["entries"].__setitem__(
+        "order-eval-p1", replace(entry, admission="paused")))
+    assert _resize_asking(sized, control) == 0
+    assert _cap(sized) == entry.params["cap"]
+
+
+def test_a_raise_is_rechecked_against_the_room_left_at_its_write(sized, control, monkeypatch):
+    assert _declare(sized, "order-eval-p2").status_code == 201
+    _with_cap(sized, "order-eval-p2", 0.01)
+    before = _cap(sized)
+    _racing(monkeypatch, lambda: _with_cap(sized, "order-eval-p2", 0.2))     # another order raised first
+    assert _resize_asking(sized, control) == 0
+    assert _cap(sized) == before
+
+
+def test_a_replayed_raise_is_not_a_refusal(sized, control, monkeypatch):
+    from reliquary.infrastructure import task_registry_store as store
+
+    written = store.set_task_cap
+
+    async def twice(task_id, cap, **kwargs):     # a lost response, the same write applied again
+        await written(task_id, cap, **kwargs)
+        return await written(task_id, cap, **kwargs)
+
+    _stranded(sized)
+    monkeypatch.setattr(store, "set_task_cap", twice)
+    assert _resize_asking(sized, control) == 1
+
+
+def test_a_lowering_never_undoes_a_concurrent_close(sized, control, monkeypatch):
+    _with_cap(sized, "order-eval-p1", 0.10)
+    _racing(monkeypatch, lambda: _with_cap(sized, "order-eval-p1", 0.0))
+    assert _resize_asking(sized, control, recent_paid=0.02) == 0       # sized 0.03: a lowering
+    assert _cap(sized) == 0.0
+
+
+def test_a_paused_or_closing_order_is_never_raised(sized, control):
+    entry = sized.registry["entries"]["order-eval-p1"]
+    sized.registry["entries"]["order-eval-p1"] = replace(entry, admission="paused")
+    assert _resize_asking(sized, control) == 0
+    sized.registry["entries"]["order-eval-p1"] = entry
+    _with_cap(sized, "order-eval-p1", 0.0)
+    assert _resize_asking(sized, control) == 0
+    assert _cap(sized) == 0.0
+
+
+@pytest.mark.parametrize("drained", [True, False])
+def test_a_retired_order_holds_its_room_until_drained_even_while_raises_wait(sized, control, monkeypatch,
+                                                                            drained):
+    from reliquary.validator import corpus_job_status
+
+    assert _declare(sized, "order-eval-p2").status_code == 201
+    _with_cap(sized, "order-eval-p2", 0.25, status="retired", retired_at=7)
+
+    async def counts(records, job_id, **kwargs):
+        return {"drained": drained}
+
+    monkeypatch.setattr(corpus_job_status, "stored_job_counts", counts)
+    # The pool is full but for the retired order: the raise lists it first, as every resize always did.
+    if drained:
+        assert _resize_asking(sized, control) == 1
+        assert _cap(sized, "order-eval-p2") == 0.0 and _cap(sized) == 0.25
+    else:
+        # Still settling, it keeps its room: the order gets no more than its own start.
+        _resize_asking(sized, control)
+        assert _cap(sized, "order-eval-p2") == 0.25 and _cap(sized) <= sizing.START_CAP
+
+
+def test_the_reserve_holds_any_new_orders_start():
+    from reliquary.admin.training import DEFAULT_TRAINING_CAP
+
+    assert sizing.NEW_ORDER_RESERVE >= max(sizing.START_CAP, DEFAULT_TRAINING_CAP)
+    assert sizing.raise_room(0.2) == pytest.approx(0.2 - sizing.NEW_ORDER_RESERVE)
+    assert sizing.raise_room(0.06) == pytest.approx(0.06 - sizing.NEW_ORDER_RESERVE)    # no order dips into it
 
 
 def test_a_resize_never_passes_the_asked_cap(admin, pins, rates, control, monkeypatch):  # noqa: F811
