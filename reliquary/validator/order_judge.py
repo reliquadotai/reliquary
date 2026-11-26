@@ -136,15 +136,20 @@ class DispatchServer:
         self._wiring = wiring
         self._connections: set[_Connection] = set()
         self._server: asyncio.AbstractServer | None = None
+        self._events: set[asyncio.Task] = set()
 
     async def start(self) -> None:
         Path(self.path).unlink(missing_ok=True)
         self._dispatcher.subscribe(self._quarantined)
+        self._dispatcher.subscribe_unparked(self._unparked)
         self._server = await asyncio.start_unix_server(self._serve, path=self.path)
         os.chmod(self.path, 0o600)
 
     async def close(self) -> None:
         self._dispatcher.unsubscribe(self._quarantined)
+        self._dispatcher.unsubscribe_unparked(self._unparked)
+        for task in list(self._events):
+            task.cancel()
         if self._server is not None:
             self._server.close()
             self._server = None
@@ -159,6 +164,21 @@ class DispatchServer:
             except (ConnectionError, RuntimeError):
                 logger.warning("order judge: quarantine of %s not delivered; its reconnect replays it",
                                executor_id)
+
+    def _unparked(self, job_id: str, batch_id: int) -> None:
+        """A batch parked on its losses got a scored answer: its records, in the judge, are tried again at once."""
+        frame = encode_frame({"event": "unparked", "job": job_id, "batch": batch_id})
+        for connection in list(self._connections):
+            task = asyncio.ensure_future(self._send_event(connection, frame))
+            self._events.add(task)
+            task.add_done_callback(self._events.discard)
+
+    @staticmethod
+    async def _send_event(connection: "_Connection", frame: bytes) -> None:
+        try:
+            await connection.send(frame)
+        except (ConnectionError, RuntimeError):
+            logger.warning("order judge: an unpark was not delivered; its records are tried after their cool-down")
 
     async def _serve(self, reader, writer) -> None:
         connection = _Connection(writer)
@@ -186,7 +206,7 @@ class DispatchServer:
 
     async def _score(self, connection: _Connection, request_id: int, job_id: str, items: list) -> None:
         from reliquary.corpus.eval_draw import has_draw
-        from reliquary.validator.eval_control import BatchParked
+        from reliquary.validator.eval_control import BatchParked, ItemsUnreadable
 
         reply: dict[str, Any] = {"id": request_id}
         batches: list = []
@@ -199,8 +219,13 @@ class DispatchServer:
                 (job.checkpoint_repo, job.checkpoint_revision), w.proof, items, job_id,
                 job.judge if has_draw(job) else None, batches=batches)
             reply["scores"] = scores_to_wire(scored)
+        except ItemsUnreadable as exc:
+            reply.update(error="unreadable", reasons=[[k, why] for k, why in sorted(exc.reasons.items())])
         except BatchParked as exc:
-            reply.update(error="parked", message=str(exc))
+            scored = sorted(exc.scored.items())
+            reply.update(error="parked", message=str(exc), items=exc.indexes, batches=exc.batch_ids,
+                         scored=[[k, row] for k, row in zip((k for k, _ in scored),
+                                                            scores_to_wire([row for _, row in scored]))])
         except asyncio.CancelledError:
             if asyncio.current_task().cancelling():
                 # The judge is gone: no card scores this request's other batches for nobody.
@@ -281,11 +306,17 @@ class DispatchClient:
 
     @staticmethod
     def _result(reply: Mapping) -> list:
-        from reliquary.validator.eval_control import BatchParked
+        from reliquary.validator.eval_control import BatchParked, ItemsUnreadable
 
         error = reply.get("error")
+        if error == "unreadable":
+            raise ItemsUnreadable({int(k): str(why) for k, why in reply.get("reasons") or ()})
         if error == "parked":
-            raise BatchParked(reply.get("message", "parked"))
+            scored = reply.get("scored") or ()
+            rows = scores_from_wire([row for _, row in scored])
+            raise BatchParked(reply.get("message", "parked"), indexes=reply.get("items"),
+                              batch_ids=reply.get("batches") or (),
+                              scored=dict(zip((int(k) for k, _ in scored), rows)))
         if error == "value":
             raise ValueError(reply.get("message", "refused"))
         if error is not None:
@@ -305,6 +336,14 @@ class DispatchClient:
             await listener(executor_id)
         except Exception:
             logger.exception("re-audit after quarantining %s failed", executor_id)
+
+    def _unparked(self, job_id: str, batch_id) -> None:
+        view = self._views.get(job_id)
+        for listener in list(view.unpark_listeners if view is not None else ()):
+            try:
+                listener(batch_id)
+            except Exception:
+                logger.exception("order judge: unpark of batch %s failed", batch_id)
 
     def _quarantine(self, executor_id: str) -> None:
         if executor_id in self.quarantined:
@@ -334,6 +373,8 @@ class DispatchClient:
                                     self._quarantine(executor_id)
                             elif message["event"] == "quarantined":
                                 self._quarantine(message["executor"])
+                            elif message["event"] == "unparked":
+                                self._unparked(str(message["job"]), message["batch"])
                             continue
                         future = self._pending.get(message.get("id"))
                         if future is not None and not future.done():
@@ -360,6 +401,7 @@ class RemotePoolView:
         self._client = client
         self._job_id = job_id
         self.listeners: list = []
+        self.unpark_listeners: list = []
 
     def connected(self) -> bool:
         return self._client.connected()
@@ -367,12 +409,17 @@ class RemotePoolView:
     def subscribe(self, listener) -> None:
         self.listeners.append(listener)
 
+    def subscribe_unparked(self, listener) -> None:
+        """``listener(batch_id)``: a batch of this order parked on its losses got a scored answer."""
+        self.unpark_listeners.append(listener)
+
     def quarantined(self) -> set[str]:
         """Every executor the front has told this process is quarantined."""
         return set(self._client.quarantined)
 
     def close(self) -> None:
         self.listeners.clear()
+        self.unpark_listeners.clear()
         self._client.forget(self._job_id)
 
     async def score(self, items) -> list:

@@ -202,15 +202,25 @@ def test_a_window_settled_job_is_not_settled_by_period():
     assert archives.docs == {}
 
 
-def test_late_verdicts_of_a_paid_period_are_paid_against_its_whole_count():
+def test_late_verdicts_of_a_paid_period_are_paid_within_what_is_left_of_its_cap():
+    """Owner, 2026-11-26: a late verdict (a parked record decided after its period closed, or the verdicts its stake
+    guarantee held) never makes a period pay past its cap: its share of the whole count, within the cap left."""
     records, archives = Records(), Archives()
     records.verdicts = {"a": verdict("a", "a", 30, at(2))}
     asyncio.run(settler(records, archives, at(9)).settle_once())
     records.verdicts["b"] = verdict("b", "b", 10, at(2))
     asyncio.run(settler(records, archives, at(9, 3000)).settle_once())
-    # Same settling period, its own entry: the first payees' archive is untouched.
+    # The first payees' archive is untouched, and the period paid its whole cap: nothing is left for b.
     assert archives.docs[(2, 10)]["rewards_by_hotkey"] == {"a": pytest.approx(0.1)}
-    assert archives.docs[(2, 11)]["rewards_by_hotkey"] == {"b": pytest.approx(0.1 * 10 / 40)}
+    assert set(archives.docs) == {(2, 10)} and "b" in records.state["settled"]
+    # A cap raised since leaves room: c's share of the period's paid count (0.2 x 10/40), within the 0.1 left.
+    records.verdicts["c"] = verdict("c", "c", 10, at(2))
+    asyncio.run(settler(records, archives, at(9, 3500), cap=0.2).settle_once())
+    assert archives.docs[(2, 11)]["rewards_by_hotkey"] == {"c": pytest.approx(0.2 * 10 / 40)}
+    records.verdicts["d"] = verdict("d", "d", 400, at(2))
+    asyncio.run(settler(records, archives, at(9, 3800), cap=0.2).settle_once())
+    # Its share (0.2 x 400/440) is past the cap left (0.2 - 0.1 - 0.05): it gets what is left, never more.
+    assert archives.docs[(2, 12)]["rewards_by_hotkey"] == {"d": pytest.approx(0.2 - 0.1 - 0.05)}
 
 
 def test_an_old_verdict_without_arrival_is_dated_by_its_audit():
