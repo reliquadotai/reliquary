@@ -10,7 +10,8 @@ from dataclasses import dataclass
 
 PREFIX = "customer:"
 _NAME = r"[a-z0-9][a-z0-9-]{0,62}"
-_ACCOUNT = r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}"
+# The platform user id: [A-Za-z0-9-]{1,128}.
+_ACCOUNT = r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}"
 _ENV_ID_RE = re.compile(rf"\A{PREFIX}(?P<account>{_ACCOUNT})/(?P<name>{_NAME})@(?P<sha256>[0-9a-f]{{64}})\Z")
 NAME_RE = re.compile(rf"\A{_NAME}\Z")
 ACCOUNT_RE = re.compile(rf"\A{_ACCOUNT}\Z")

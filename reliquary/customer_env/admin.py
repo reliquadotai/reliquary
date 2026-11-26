@@ -24,7 +24,7 @@ MAX_IN_FLIGHT_PER_ACCOUNT = 3
 
 class SubmitVersion(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    account: str = Field(min_length=1, max_length=64)
+    account: str = Field(min_length=1, max_length=128)
     name: str = Field(min_length=1, max_length=63)
     object_key: str = Field(min_length=1, max_length=512, pattern=r"^customer-envs/[A-Za-z0-9._/-]+$")
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -32,8 +32,8 @@ class SubmitVersion(BaseModel):
 
 class OrderSets(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    env_id: str = Field(min_length=1, max_length=256)
-    account: str = Field(min_length=1, max_length=64)
+    env_id: str = Field(min_length=1, max_length=300)
+    account: str = Field(min_length=1, max_length=128)
     model: str = Field(min_length=1, max_length=256)
     revision: str = Field(pattern=r"^[0-9a-f]{40}$")
     purpose: Literal["batch", "eval"] = "eval"
