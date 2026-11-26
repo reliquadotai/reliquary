@@ -224,7 +224,7 @@ class _Graders:
     def __init__(self, open_environment: Callable[[str, str], Any],
                  scorer_for: Callable[[Any, Any], Callable[[dict, str], float]],
                  open_taskset: Callable[[str, dict], Any] | None = None,
-                 thinking: bool = False) -> None:
+                 thinking: bool = False, customer_scorer=None) -> None:
         self._thinking = thinking
         self._open = open_environment
         self._scorer_for = scorer_for
@@ -234,10 +234,13 @@ class _Graders:
         # What scored each taskset's rows here: (id, args) -> installed versions.
         self.taskset_versions: dict[str, dict] = {}
         self._child = None
+        self._customer = customer_scorer
 
     def close(self) -> None:
         if self._child is not None:
             self._child.close()
+        if self._customer is not None:
+            self._customer.close()
 
     @staticmethod
     def spec(source: str):
@@ -280,8 +283,11 @@ class _Graders:
 
     def _grade_reference(self, grading: dict, completion: str) -> tuple[float | None, str, bool]:
         """A customer's row: its reference, graded by a grader of ``orders.graders``."""
+        from reliquary.customer_env import is_customer_env
         from reliquary.orders.graders import REFERENCE_GRADERS, grade_reference
 
+        if is_customer_env(grading.get("grader")):
+            return self._grade_customer(grading, completion)
         grader = REFERENCE_GRADERS.get(grading.get("grader"))
         if grader is None:
             return None, f"grader_unknown: {grading.get('grader')!r}", False
@@ -291,6 +297,24 @@ class _Graders:
             value = grade_reference(grader.name, grading["reference"], answer)
         except Exception as exc:
             return None, f"grader_error: {type(exc).__name__}: {exc}"[:500], failed_format
+        return value, "format_failure" if failed_format else "", failed_format
+
+    def _grade_customer(self, grading: dict, completion: str) -> tuple[float | None, str, bool]:
+        """A customer env's row, scored by its version's image on the reward host: never here."""
+        answer = answer_text("text", completion, thinking=self._thinking)
+        failed_format = format_failed("text", answer)
+        if self._customer is None:
+            from reliquary.customer_env.scoring import from_environment
+
+            self._customer = from_environment()
+        if self._customer is None:
+            return None, "customer_env_unavailable: no reward host configured", failed_format
+        try:
+            value, detail = self._customer.score(grading["grader"], grading["reference"], answer)
+        except ValueError as exc:
+            return None, f"grader_error: {exc}"[:500], failed_format
+        if value is None:
+            return None, detail, failed_format
         return value, "format_failure" if failed_format else "", failed_format
 
     def _grade_verifiers(self, grading: dict, completion: str,

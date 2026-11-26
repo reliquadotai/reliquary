@@ -190,8 +190,22 @@ REFERENCE_GRADERS: dict[str, ReferenceGrader] = {g.name: g for g in (
 )}
 
 
+def is_known_grader(grader: object) -> bool:
+    """A grader of this table, or a customer env version (scored on its reward host)."""
+    from reliquary.customer_env import is_customer_env
+
+    return grader in REFERENCE_GRADERS or is_customer_env(grader)
+
+
 def check_reference(grader: str, reference) -> str:
     """The line's reference for ``grader``, or ValueError."""
+    from reliquary.customer_env import is_customer_env
+
+    if is_customer_env(grader):
+        from reliquary.customer_env.scoring import check_reference as check_customer
+
+        check_customer(grader, reference)
+        return reference
     if grader not in REFERENCE_GRADERS:
         raise ValueError(f"grader_unknown: {grader!r}; graders: {sorted(REFERENCE_GRADERS)}")
     if not isinstance(reference, str) or not reference.strip() or len(reference) > MAX_REFERENCE_CHARS:
@@ -206,4 +220,5 @@ def grade_reference(grader: str, reference: str, answer: str) -> float:
     return float(REFERENCE_GRADERS[grader].score(reference, answer))
 
 
-__all__ = ["MAX_ANSWER_CHARS", "MAX_REFERENCE_CHARS", "REFERENCE_GRADERS", "ReferenceGrader", "check_reference", "grade_reference"]
+__all__ = ["MAX_ANSWER_CHARS", "MAX_REFERENCE_CHARS", "REFERENCE_GRADERS", "ReferenceGrader", "check_reference",
+           "grade_reference", "is_known_grader"]
