@@ -1140,8 +1140,9 @@ def eval_auditor(**kwargs):
             return stored, written
 
         async def _reopen_reaudited(self, submission_ids, *, drift):
-            # Every one the re-audit voids, in its own ledger: a drift's as soon as its void is written, so a later
-            # void write that raises does not leave it taken until the next start.
+            # Every one the re-audit voids, in its own ledger: the drifts once every void is written, or as soon as one
+            # raised, so neither their slow ledger writes hold back the next voids nor a void write that raises leaves
+            # them taken until the next start.
             await super()._reopen_reaudited(submission_ids, drift=drift)
             for submission_id in submission_ids:
                 await self._record_failure(submission_id)

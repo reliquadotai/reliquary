@@ -786,11 +786,13 @@ def test_an_eval_auditor_reopens_a_reaudited_drift_in_its_ledger_once(monkeypatc
 
 
 @pytest.mark.parametrize("fails", [True, False])
-def test_an_eval_auditor_reopens_each_drift_as_soon_as_its_void_is_written(monkeypatch, fails):
-    """Each drift's slot reopens in the eval auditor's ledger as soon as its void is written, before the status
-    hears of it; a charged refusal's once every void is written, as before. ``fails``: the last void write raises
-    (a store PUT failing after its retries), which stops the re-audit (the quarantine's listener only logs it):
-    the drift voided before it does not wait for the next start's reconcile."""
+def test_an_eval_auditor_reopens_the_drifts_once_every_void_is_written(monkeypatch, fails):
+    """Every void is written first: a drift's ledger write (a record read, a ledger read and rebuild, a CAS, up to 4
+    tries) no longer holds back the next voids while the settler may pay those passes. The drifts' slots then reopen
+    in the eval auditor's ledger, each before the status hears of its void; a charged refusal's is reported at once
+    and reopens after, as before. ``fails``: the last void write raises (a store PUT failing after its retries),
+    which stops the re-audit (the quarantine's listener only logs it): the drift voided before it still reopens, and
+    does not wait for the next start's reconcile."""
     from reliquary.validator import corpus_service, eval_control
     from tests.unit.test_eval_draw import _job as draw_job
 
@@ -802,6 +804,7 @@ def test_an_eval_auditor_reopens_each_drift_as_soon_as_its_void_is_written(monke
         async def write_voided(self, job_id, sid, document):
             if fails and sid == second:
                 raise OSError("store PUT failed after its retries")
+            events.append(("void", sid))
             return await super().write_voided(job_id, sid, document)
 
     records = _FailingRecords({sid: {"hotkey": hotkey, "token_count": 10, "prompt_index": job.prompt_start,
@@ -825,12 +828,13 @@ def test_an_eval_auditor_reopens_each_drift_as_soon_as_its_void_is_written(monke
     if fails:
         with pytest.raises(OSError):
             asyncio.run(auditor.reaudit_executor("pod-1"))
-        assert events == [("reopen", first), ("voided", first), ("voided", cheat)]
+        assert events == [("void", first), ("void", cheat), ("voided", cheat), ("reopen", first), ("voided", first)]
         assert set(records.voided) == {first, cheat}
     else:
         assert asyncio.run(auditor.reaudit_executor("pod-1")) == [first, cheat, second]
-        assert events == [("reopen", first), ("voided", first), ("voided", cheat), ("reopen", second),
-                          ("voided", second), ("reopen", cheat)]
+        assert events == [("void", first), ("void", cheat), ("voided", cheat), ("void", second),
+                          ("reopen", first), ("reopen", second), ("voided", first), ("voided", second),
+                          ("reopen", cheat)]
 
 
 def test_a_reaudit_charges_on_its_second_audit_run_alone(monkeypatch):
@@ -1044,17 +1048,17 @@ def _frequent_drifts(monkeypatch, kind="base", *, q=1.0, settled=False, penalise
 
 @pytest.mark.parametrize("kind, q, settled", [("base", 1.0, False), ("base", 0.25, True),
                                               ("eval", 1.0, False), ("eval", 0.25, True)])
-def test_a_drift_charged_for_frequent_refusals_reopens_its_slot_as_its_void_lands(monkeypatch, kind, q, settled):
-    """A drift the re-audit charges for frequent refusals is a refused sample like the others: its slot reopens as
-    soon as its void is written, before the status hears of it, as a judging pass reopens every refused sample's
-    (`_write`), charged or not. At q = 1, or settled inside the hold window, no forfeit reopens it; the base auditor
-    used to leave it to the next start's reconcile, the eval auditor to reopen it after every void. Each slot reopens
-    once: the eval auditor does not reopen the charged one again after the loop."""
+def test_a_drift_charged_for_frequent_refusals_reopens_its_slot_with_the_others(monkeypatch, kind, q, settled):
+    """A drift the re-audit charges for frequent refusals is a refused sample like the others: its slot reopens with
+    theirs once every void is written, before the status hears of its void, as a judging pass reopens every refused
+    sample's (`_write`), charged or not. At q = 1, or settled inside the hold window, no forfeit reopens it; the base
+    auditor used to leave it to the next start's reconcile, the eval auditor to reopen it after every void. Each slot
+    reopens once: the eval auditor does not reopen the charged one again after the loop."""
     run = _frequent_drifts(monkeypatch, kind, q=q, settled=settled)
     assert run.voided == run.ids
     assert run.records.voided[run.ids[2]]["charged_for"] == "frequent_refusals"
     assert run.states.states["5X"].failure_ids == [run.ids[2]]
-    assert run.events == [event for sid in run.ids for event in (("reopen", [sid]), ("voided", sid))]
+    assert run.events == [("reopen", [sid]) for sid in run.ids] + [("voided", sid) for sid in run.ids]
 
 
 def test_a_reaudit_counts_a_penalised_refusal_with_its_hotkeys_drifts(monkeypatch):
