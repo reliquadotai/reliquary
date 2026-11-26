@@ -61,6 +61,39 @@ Each account has a private environment hub on the platform:
 A qualified version becomes a catalog entry owned by the account: `customer:<account>/<name>@<sha256[:12]>`. Only
 that account's orders may name it.
 
+## The package
+
+A source archive (`.tar.gz`, at most 50 MB packed, 200 MB unpacked; regular files and directories only, no
+absolute path, no `..`, no link, no device) holding:
+
+* `pyproject.toml`, with `[tool.reliquary]`: `taskset` (the verifiers v1 taskset id it registers), optional
+  `args` (the taskset's config fields) and `kind` (`single_turn`, the default, or `agentic`);
+* `requirements.lock`: every dependency pinned with `--hash=sha256:` (pip `--require-hashes` format);
+* `examples.jsonl`: 2 to 64 lines `{"key", "answer", "expected_score"}`, at least one at or above 0.5 and one below;
+* the package's sources.
+
+The version is the archive's sha256. The environment id is `customer:<account>/<name>@<sha256>`; `<account>` is
+the platform account id, `<name>` matches `[a-z0-9][a-z0-9-]{0,62}`.
+
+## Admin API (platform to subnet admin)
+
+The platform stores the archive in its bucket under `customer-envs/<account>/<name>/<sha256>.tar.gz` and calls:
+
+* `POST /admin/v1/customer-envs` `{account, name, object_key, sha256}`: starts (or returns, idempotent on
+  `sha256`) the qualification. Answers `{env_id, status}`.
+* `GET /admin/v1/customer-envs?account=<id>`: that account's versions.
+* `GET /admin/v1/customer-envs/<env_id>`: one version: `{env_id, account, name, sha256, kind, status, reason,
+  uses, image_digest, prompt_set, examples, cost, created_at, qualified_at}`.
+  `status`: `queued` | `building` | `qualifying` | `qualified` | `refused` | `disabled`; `reason` says why a
+  refusal (`package_invalid`, `build_failed`, `start_failed`, `freeze_failed`, `examples_failed`,
+  `nondeterministic` (then `uses` still holds `eval`), `infrastructure` (retried, never billed)).
+  `uses` ⊆ `rl`, `batch`, `eval`. `prompt_set`: `{count, sha256}`. `cost`: `{qualification_cpu_seconds,
+  scoring_cpu_ms_per_item}`.
+* `DELETE /admin/v1/customer-envs/<env_id>`: disables it; running orders keep their pinned version.
+
+An order names `env: "customer:<account>/<name>@<sha256>"`; the admin refuses it unless the order's account is
+`<account>` and the version's `uses` has the order's product.
+
 ## Build
 
 * The archive is built into an OCI image by a builder that holds no secret and has egress only to package
