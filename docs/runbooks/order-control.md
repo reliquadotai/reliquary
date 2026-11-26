@@ -238,7 +238,10 @@ with `docker exec`. The one exception is in step 3, on a non-production host.
    `grader_sha256_here` as the card and the same installed triple as the card. A single-turn set offered whose card
    fails either comparison goes through step 4 before the switch: a new set id, or its withdrawal. One the list
    lacks has no line: step 3, whose `load_sets` refuses a card sealed under another fingerprint, is its only check.
-   The lines of other sets do not count.
+   The lines of other sets do not count. The admin refuses a new order on any card sealed under another
+   fingerprint, an agentic one included (#547), and this check lists single-turn sets only: a sealed card of an
+   agentic set the platform offers must also pass `validate_set(card, current_grader=True)` (`eval/protocol.py`) in
+   the rebuilt image, or go through step 4.
 3. **One-row grade** (the sufficient check). This step is not shipped as a script: write one that calls the
    grader's own entry points one by one, in this order:
    1. `reliquary.eval.grading.load_sets`;
@@ -287,11 +290,15 @@ with `docker exec`. The one exception is in step 3, on a non-production host.
    at all. Grade it with a program, in a fenced code block, that passes that row's tests: the row grades only if
    its score is 1.0.
 4. **A drifted set cannot be republished under its id.** Publication is create-only (`eval/storage.py`). Use a
-   new set id and a new `eval_sets` row, and withdraw the old one. Name the new set after the old id and the first
-   8 hex digits of the fingerprint it is sealed with, `<old id>-g<8 hex>` (`verifiers-math500-r0-n500-gc0b08e92`),
-   and build it with the image that will grade it: once the admin runs that image, in the admin's own container, as
-   SciCode's first position (SciCode, below). Before a switch, a card sealed with the rebuilt image's fingerprint is
-   one the running admin refuses: withdraw the set before the switch and seal it again after. Give `build-set` the
+   new set id and a new `eval_sets` row, and withdraw the old one. Withdraw it first, as soon as the admin refuses
+   it: the catalog must never offer a set the admin refuses at job creation, or a customer gets a quote and then a
+   refused order. A withdrawn set is refused to new quotes and to orders placed from earlier quotes
+   (`set_withdrawn`), never to an order already taken: the platform still reads its row. Name the new set after the
+   old id and the first 8 hex digits of the fingerprint it is sealed with, `<old id>-g<8 hex>`
+   (`verifiers-math500-r0-n500-gc0b08e92`), and build it with the image that will grade it: once the admin runs that
+   image, in the admin's own container, as SciCode's first position (SciCode, below). Before a switch, a card sealed
+   with the rebuilt image's fingerprint is one the running admin refuses: withdraw the set before the switch and
+   seal it again after. Give `build-set` the
    old card's selection (`--start`, `--count`, `--sample`, `--seed`) and `--taskset-args`, `--count-tokens` with its
    tokenizer when the card holds `prompt_tokens`, and `--protocol` with its reviewed `data`, `licenses` and
    `disjointness` when its protocol holds them. Before publishing, compare the new set with the old one: the same
@@ -301,10 +308,8 @@ with `docker exec`. The one exception is in step 3, on a non-production host.
    sample, not the old one sealed again, and its scores do not compare with the old set's. Then `publish-set`, the
    platform copy (SciCode, below), with the card's `prompt_tokens` added to the public `set.json` when it has them
    (the platform sizes a job's `max_prompt_tokens` from them), and the new `eval_sets` row (platform
-   `docs/EVALUATIONS_API.md`): the old row's name, description and token figures, the new `prompts_sha256`. Then
-   withdraw the old row, and put the new id in `scripts/seal_check_admin.py`'s `SETS`. A withdrawn set is refused to
-   new quotes and to orders placed from earlier quotes (`set_withdrawn`), never to an order already taken: the
-   platform still reads its row.
+   `docs/EVALUATIONS_API.md`): the old row's name, description and token figures, the new `prompts_sha256`. Then put
+   the new id in `scripts/seal_check_admin.py`'s `SETS`.
 5. **Do not switch the admin while a single-turn evaluation is in flight.** An order already taken is not
    refused: its rows come back ungraded.
 
