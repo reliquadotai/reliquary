@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import contextvars
 import functools
 import hmac
 import json
@@ -48,6 +49,7 @@ from reliquary.validator.corpus_audit_protocol import (
     DRAW_PROTOCOLS,
     ITEM_ERROR,
     ITEM_OK,
+    AuditLease,
     AuditResult,
     HeartbeatRequest,
     draw_protocol,
@@ -64,6 +66,7 @@ from reliquary.validator.corpus_audit_remote import (
     scores_agree,
     token_sha256,
 )
+from reliquary.validator.corpus_periods import PERIOD_SECONDS
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +132,30 @@ CLEAN_STREAK = 5
 # measured on faster cards were too short for the 9B cards, every card was set aside about 98 s after loading,
 # and its late results were never timed, so the next card died the same way).
 LATE_ANSWER_SECONDS = 900.0
+# A batch no card can answer (2026-11-24: agentic trajectories of 95 and 70 turns, past the 64 spans an audit item
+# carries; every executor refused the lease, every 9B card was set aside after two lost leases and destroyed, and the
+# model's audits stopped for a day):
+# - each item is checked against the executors' `AuditLease` when its call is made; a record with an item they would
+#   refuse is parked alone, before any lease (`ItemsUnreadable`), and the rest of its call goes on;
+# - a batch whose leases are lost (expired unanswered, or answered with a result that does not fit) is parked only on
+#   evidence against the batch: witnessed losses on UNANSWERED_PROVIDERS_PARK distinct providers (one more per extra
+#   scorer it needs). A loss is witnessed when its card delivered a measured result, for an undecided batch, on another
+#   lease after this one was granted: that card works, the batch does not. An unwitnessed loss (a dead or slow card)
+#   is no evidence. Every loss strikes its card, witnessed or not, as #493 does; once the batch is parked its witnessed
+#   losses are taken back. Losses of a card quarantined since no longer count, and a provider's losses count towards
+#   at most PARKS_PER_EXECUTOR parks per PARK_WINDOW_SECONDS: past that they only strike.
+UNANSWERED_PROVIDERS_PARK = 2
+PARKS_PER_EXECUTOR = 2
+PARK_WINDOW_SECONDS = 3600.0
+# A card that lost a batch's lease while it scored other work (a witnessed loss), or answered it with an executor
+# error or a result that does not fit, is not leased that batch again for BENCH_SECONDS, doubling at each repeat up to
+# MAX_BENCH_SECONDS: it cannot hold one batch for ever by answering errors and claiming it again, and a batch it cannot
+# answer does not cost it a strike at each of its claims. A card that answers nothing is not benched: it is set aside
+# after its second lost lease, as before.
+BENCH_SECONDS = 300.0
+MAX_BENCH_SECONDS = 3600.0
+# A call of at most this many tokens is checked on the loop (one full lease: about 8 ms); a bigger one in a thread.
+INLINE_CHECK_TOKENS = 262_144
 # An audit lease lives twice the time the model's recent results took per token (or the card's own pace when it
 # is slower), for its tokens and those the card already holds, plus LEASE_OVERHEAD_SECONDS, within
 # [AUDIT_LEASE_FLOOR_SECONDS, the dispatcher's lease seconds]; the dispatcher's lease seconds until
@@ -139,6 +166,23 @@ LEASE_OVERHEAD_SECONDS = 30.0
 LEASE_TIMES_KEPT = 20
 LEASE_TIMES_NEEDED = 3
 LEASE_TIMES_MAX_AGE_SECONDS = 3600.0
+# A parked record (neither a verdict nor a validator error: an item no executor can read, or a batch parked) is tried
+# again after PARK_RETRY_SECONDS, doubling up to MAX_PARK_RETRY_SECONDS, or at once when its batch gets a measured
+# answer; each retry audits it alone, in the background, so no judge pass waits on it. It holds its period's close two
+# periods after its receipt at most, as a record whose arrival cannot be read (corpus_auditor.
+# UNKNOWN_ARRIVAL_GIVE_UP_SECONDS); one parked with other records' items, until its first retry alone had
+# SOLO_RETRY_SECONDS to decide it too, so no honest batch-mate leaves first. Then its period closes without it and it no
+# longer holds its operator's unaudited passes as a sibling. At q < 1 its operator's verdicts of its period received up
+# to its receipt still wait for its decision (`settle_hold`, the stake guarantee); its own verdict, decided after its
+# period was settled without it, is paid within what is left of the period's cap (`settle_capped`).
+PARK_RETRY_SECONDS = 1800.0
+MAX_PARK_RETRY_SECONDS = 4 * 3600.0
+PARKED_CLOSE_GIVE_UP_SECONDS = 2.0 * PERIOD_SECONDS
+SOLO_RETRY_SECONDS = 600.0
+PARK_UNREADABLE = "unreadable"
+PARK_LOST = "parked"
+# Records without a submission id in them (tests' fakes) are told apart by identity, the last KNOWN_RECORDS read.
+KNOWN_RECORDS = 8192
 HEARTBEAT_WRITE_SECONDS = 30.0
 EVAL_CONTROL_STATUS_KEY = "reliquary/eval/control/status.json"
 # The miners document every order shares: a hotkey's probation progress carries
@@ -233,7 +277,26 @@ class ExecutorSizing:
 
 
 class BatchParked(Exception):
-    """No two scorers of a batch agree (or two agreeing pairs conflict)."""
+    """A batch of the call was parked: no two of its scorers agree (or two agreeing pairs conflict), or the evidence
+    says no card can answer it. ``indexes``: the items of the call it held (None: all of them); ``batch_ids``: the
+    batches parked; ``scored``: rows of the call's other batches decided before it, by item index. Its other batches
+    still undecided are cancelled."""
+
+    def __init__(self, message: str = "", *, indexes=None, batch_ids=(), scored=None) -> None:
+        super().__init__(message)
+        self.indexes = None if indexes is None else sorted(indexes)
+        self.batch_ids = list(batch_ids)
+        self.scored = dict(scored or {})
+
+
+class ItemsUnreadable(Exception):
+    """Items of a call an executor would refuse as it parses their lease (``AuditLease``), by index, with why. No batch
+    of the call was made."""
+
+    def __init__(self, reasons: dict[int, str]) -> None:
+        super().__init__("; ".join(f"item {k}: {why}" for k, why in sorted(reasons.items()))[:500])
+        self.reasons = dict(reasons)
+
 
 Score = tuple[str, tuple[ChunkResult, ...]]
 ModelKey = tuple[str, str]
@@ -332,6 +395,62 @@ def _scored(result: AuditResult, items: Sequence[dict]) -> bool:
             and not any(s.status == ITEM_ERROR for s in scores))
 
 
+def _measured(result: AuditResult, items: Sequence[dict]) -> bool:
+    """Whether ``result`` fits ``items``, errs on none, and measured at least one (ok, with its chunks or its draw's
+    diagnostics): what witnesses that its card scores. An answer of statuses with no measure (proof_undecodable)
+    costs no GPU; one undecodable proof beside measured items is the miner's, not the card's."""
+    return _scored(result, items) and any(s.status == ITEM_OK and (s.chunks or s.draw is not None)
+                                          for s in result.scores)
+
+
+def _wire_item(item: dict) -> dict:
+    """One item of a lease as an executor receives it (``AuditItem``)."""
+    return {"tokens": list(item["tokens"]), "prompt_len": int(item["prompt_len"]),
+            "proofs": list(item.get("proofs") or ()),
+            **({"spans": [list(s) for s in item["spans"]]} if item.get("spans") is not None else {}),
+            **({"draw": item["draw"]} if item.get("draw") is not None else {})}
+
+
+# A well-formed lease id, to check a lease before any executor gets it.
+_PROBE_LEASE_ID = "0" * 32
+
+
+def _lease_body(protocol: str, model: ModelKey, proof, lease_id: str, expires_at: float,
+                items: Sequence[dict]) -> dict:
+    """The lease an executor receives (``AuditLease`` on its side)."""
+    return {"protocol": protocol, "lease_id": lease_id, "model_id": model[0], "model_revision": model[1],
+            "chunk_tokens": proof.chunk_tokens, "topk": proof.topk, "expires_at": expires_at,
+            "items": [_wire_item(i) for i in items]}
+
+
+def _unreadable_items(model: ModelKey, proof, items: Sequence[dict]) -> dict[int, str]:
+    """Each item an executor would refuse as it parses its lease, with why: checked alone in a lease of its protocol.
+    The why names the fields and the rule, never their values (miner tokens)."""
+    from pydantic import ValidationError
+
+    unreadable = {}
+    for k, item in enumerate(items):
+        protocol = AUDIT_PROTOCOL if item.get("draw") is None else draw_protocol(item["draw"])
+        try:
+            AuditLease.model_validate(_lease_body(protocol, model, proof, _PROBE_LEASE_ID, 0.0, [item]))
+        except ValidationError as exc:
+            unreadable[k] = "; ".join(f"{'.'.join(str(part) for part in error['loc'][2:]) or 'item'}: "
+                                      f"{error['msg']}" for error in exc.errors(include_input=False))[:300]
+        except Exception as exc:  # noqa: BLE001 - whatever the executor would choke on is a refusal too
+            unreadable[k] = f"{type(exc).__name__}: {exc}"[:300]
+    return unreadable
+
+
+@dataclass
+class _Loss:
+    """One executor's lost leases of a batch: its provider, whether one of them was witnessed (and when, last), and the
+    leases that struck it."""
+    provider: str
+    witnessed: bool = False
+    witnessed_at: float = float("-inf")
+    leases: list = field(default_factory=list)
+
+
 @dataclass
 class _Batch:
     id: int
@@ -348,6 +467,12 @@ class _Batch:
     protocol: str = AUDIT_PROTOCOL
     judge: Any = None
     reuse_auditors_only: bool = False
+    # Its lost leases per executor (`_Loss`); who may not lease it before when, and how often each was benched.
+    losses: dict[str, _Loss] = field(default_factory=dict)
+    benched: dict[str, float] = field(default_factory=dict)
+    benches: collections.Counter = field(default_factory=collections.Counter)
+    # Parked on its losses: a measured answer to one of its leases, late or not, says a card can answer it.
+    parked: bool = False
 
 
 @dataclass
@@ -405,8 +530,14 @@ class PairedAuditDispatcher:
         # fast ones, and not at the pace of its last cheap batch.
         self._pace: dict[str, collections.deque] = collections.defaultdict(
             lambda: collections.deque(maxlen=LEASE_TIMES_KEPT))
+        # Per executor, when it last delivered a measured result in time for an undecided batch (`_measured`): a lease
+        # of it lost after that was granted is witnessed. Per provider, when its losses counted towards a park.
+        self._witness: dict[str, float] = {}
+        self._parks_by: dict[str, collections.deque] = collections.defaultdict(collections.deque)
         self._seen: dict[str, float] = {}
         self._listeners: list[Callable[[str], Awaitable[Any]]] = []
+        # Told (job id, batch id) when a batch parked on its losses gets a measured answer: its records are tried again.
+        self._unpark_listeners: list[Callable[[str, int], Any]] = []
         self._background: set[asyncio.Task] = set()
         self._unwritten: dict[str, str] = {}
         self._documents: dict[str, dict] = {}
@@ -441,6 +572,13 @@ class PairedAuditDispatcher:
     def unsubscribe(self, listener) -> None:
         self._listeners = [other for other in self._listeners if other != listener]
 
+    def subscribe_unparked(self, listener: Callable[[str, int], Any]) -> None:
+        """``listener(job_id, batch_id)``: a batch parked on its losses got a measured answer, late or not."""
+        self._unpark_listeners.append(listener)
+
+    def unsubscribe_unparked(self, listener) -> None:
+        self._unpark_listeners = [other for other in self._unpark_listeners if other != listener]
+
     def forget_job(self, job_id: str) -> None:
         """A job unwired: its waiting batches and flags go with it."""
         for queue in self._queues.values():
@@ -458,12 +596,29 @@ class PairedAuditDispatcher:
         """``(status, chunks, scored_by[, diagnostics])`` per item; ``scored_by`` is the
         tuple of executors whose agreement decided it. Drawn items (``draw``) go in v3
         batches, a trajectory alone, decided by ``judge`` (the job's ``DrawJudge``).
-        ``batches`` collects this call's batches, for a caller that may have to cancel them."""
+        ``batches`` collects this call's batches, for a caller that may have to cancel them.
+
+        Raises ``ItemsUnreadable`` for items an executor would refuse (no batch is made), and ``BatchParked`` as soon
+        as one of the call's batches is parked, with the rows of those decided before it; the others are cancelled,
+        so no card scores them for nobody."""
         loop = asyncio.get_running_loop()
         units = []
         drawn = [k for k, item in enumerate(items) if item.get("draw") is not None]
         if any(item.get("spans") is not None and item.get("draw") is None for item in items):
             raise RuntimeError("trajectory audit is not available on remote executors")
+        # Checked as each executor parses its lease (about 7 ms for 262,144 tokens): off the loop past one lease.
+        unreadable = (_unreadable_items(model, proof, items) if _tokens(items) <= INLINE_CHECK_TOKENS
+                      else await asyncio.to_thread(_unreadable_items, model, proof, items))
+        if unreadable:
+            self.stats["unreadable_items"] += len(unreadable)
+            first = min(unreadable)
+            logger.error("eval audit of job %s: %d of %d item(s) no executor can read (item %d: %s); their "
+                         "records are parked before any lease", job_id, len(unreadable), len(items), first,
+                         unreadable[first])
+            self.parked[job_id] += 1
+            self.stats["parked"] += 1
+            self._flag(job_id, f"{len(unreadable)} item(s) no executor can read ({unreadable[first]})")
+            raise ItemsUnreadable(unreadable)
         plain = [k for k, item in enumerate(items) if item.get("draw") is None]
         groups = [(AUDIT_PROTOCOL, [[plain[k] for k in unit] for unit in _lease_units([items[k] for k in plain])])]
         # Greedy draws (top_k 1) go in v4 leases: an executor that predates v4 never scores them.
@@ -485,10 +640,41 @@ class PairedAuditDispatcher:
                 if batches is not None:
                     batches.append(batch)
         scored: list = [None] * len(items)
-        for indexes, batch in units:
-            scores, scored_by = await batch.future
-            for k, (status, chunks, *extra) in zip(indexes, scores):
-                scored[k] = (status, chunks, scored_by, *extra)
+        waiting = {batch.future: (indexes, batch) for indexes, batch in units}
+        try:
+            while waiting:
+                # The first batch parked ends the call at once, whichever batch it is.
+                done, _ = await asyncio.wait(list(waiting), return_when=asyncio.FIRST_EXCEPTION)
+                failed, cancelled = [], False
+                for future in done:
+                    indexes, batch = waiting.pop(future)
+                    if future.cancelled():
+                        cancelled = True
+                    elif future.exception() is not None:
+                        failed.append((indexes, batch, future.exception()))
+                    else:
+                        scores, scored_by = future.result()
+                        for k, (status, chunks, *extra) in zip(indexes, scores):
+                            scored[k] = (status, chunks, scored_by, *extra)
+                if not (failed or cancelled):
+                    continue
+                for future in waiting:
+                    future.cancel()
+                if cancelled:
+                    # Its order unwired (`forget_job`), as an awaited batch raised before.
+                    raise asyncio.CancelledError(f"a batch of job {job_id} was cancelled")
+                others = [exc for _, _, exc in failed if not isinstance(exc, BatchParked)]
+                if others:
+                    raise others[0]
+                raise BatchParked("; ".join(dict.fromkeys(str(exc) for _, _, exc in failed)),
+                                  indexes=[k for indexes, _, _ in failed for k in indexes],
+                                  batch_ids=[batch.id for _, batch, _ in failed],
+                                  scored={k: row for k, row in enumerate(scored) if row is not None})
+        except asyncio.CancelledError:
+            # This call was given up (its caller cancelled): no card scores what is left of it.
+            for future in waiting:
+                future.cancel()
+            raise
         return scored
 
     @property
@@ -526,6 +712,9 @@ class PairedAuditDispatcher:
 
     def _eligible(self, batch: _Batch, executor_id: str, place: tuple[str, str]) -> bool:
         if batch.future.done() or executor_id in batch.scores or executor_id in batch.leased:
+            return False
+        if batch.benched.get(executor_id, float("-inf")) > self._clock():
+            # It lost this batch or answered it with an error lately (`_bench`).
             return False
         if len(batch.scores) + len(batch.leased) >= batch.needed:
             return False
@@ -569,17 +758,8 @@ class PairedAuditDispatcher:
             batch.leased.add(executor_id)
             batch.places[executor_id] = place
             self.stats["leased"] += 1
-            return {
-                "protocol": batch.protocol, "lease_id": lease.lease_id,
-                "model_id": batch.model[0], "model_revision": batch.model[1],
-                "chunk_tokens": batch.proof.chunk_tokens, "topk": batch.proof.topk,
-                "expires_at": lease.expires_at,
-                "items": [{"tokens": list(i["tokens"]), "prompt_len": int(i["prompt_len"]),
-                           "proofs": list(i.get("proofs") or ()),
-                           **({"spans": [list(s) for s in i["spans"]]} if i.get("spans") is not None else {}),
-                           **({"draw": i["draw"]} if i.get("draw") is not None else {})}
-                          for i in batch.items],
-            }
+            return _lease_body(batch.protocol, batch.model, batch.proof, lease.lease_id, lease.expires_at,
+                               batch.items)
         return None
 
     def lease_time(self, model: ModelKey, tokens: int, executor_id: str | None = None) -> float:
@@ -609,20 +789,129 @@ class PairedAuditDispatcher:
         """A result after its lease expired: refused (the batch is scored again), but its card is slow, not
         lost. A scored one times the model's and the card's next leases, so they fit it, and takes back the
         strike that lease's expiry gave, unless the lease was already the longest one: a card too slow for
-        that stays a lost result."""
-        if lease.batch.reuse_auditors_only or not _scored(result, lease.batch.items):
+        that stays a lost result. A measured one also says the batch can be answered: its card's loss is no
+        evidence against it any more, a batch parked on its losses is unparked (`_unpark`), and the card's bench
+        on it is lifted (unless its lease was the longest)."""
+        batch = lease.batch
+        if batch.reuse_auditors_only:
+            return
+        if not _scored(result, batch.items):
+            # An error or a misfit, late: benched from the batch, as before the sweep.
+            self._bench(batch, lease.executor_id)
             return
         self.stats["answered_late"] += 1
         logger.warning("eval audit executor %s answered lease %s of batch %s late, %.0f s after its grant: "
-                       "timed, %s", lease.executor_id, lease.lease_id[:8], lease.batch.id,
+                       "timed, %s", lease.executor_id, lease.lease_id[:8], batch.id,
                        self._clock() - lease.granted_at,
                        "still a lost result (its lease was the longest)" if lease.full_length
                        else "not a lost result")
         self._time(lease)
-        if lease.struck and not lease.full_length:
+        measured = _measured(result, batch.items)
+        if measured:
+            if batch.losses.pop(lease.executor_id, None) is not None:
+                self.stats["losses_taken_back"] += 1
+            self._unpark(batch)
+        if lease.full_length:
+            return
+        if measured:
+            batch.benched.pop(lease.executor_id, None)
+        if lease.struck:
             lease.struck = False
             self._strikes[lease.executor_id] = max(0, self._strikes[lease.executor_id] - 1)
             self.stats["strikes_taken_back"] += 1
+
+    def _unpark(self, batch: _Batch) -> None:
+        """A batch parked on its losses got a measured answer: a card can answer it. Its job's auditor is told
+        (``subscribe_unparked``) and tries its records again at once."""
+        if not batch.parked:
+            return
+        batch.parked = False
+        self.stats["unparked"] += 1
+        logger.warning("eval audit batch %s of job %s, parked as lost, got a measured answer: unpark sent to its "
+                       "auditor", batch.id, batch.job_id)
+        for listener in list(self._unpark_listeners):
+            try:
+                listener(batch.job_id, batch.id)
+            except Exception:
+                logger.exception("eval audit: unpark of batch %s not delivered", batch.id)
+
+    def _bench(self, batch: _Batch, executor_id: str) -> None:
+        """``executor_id`` leases ``batch`` again only after BENCH_SECONDS, doubled at each repeat."""
+        seconds = min(MAX_BENCH_SECONDS, BENCH_SECONDS * 2 ** batch.benches[executor_id])
+        batch.benches[executor_id] += 1
+        batch.benched[executor_id] = self._clock() + seconds
+        self.stats["benched"] += 1
+
+    def _counted(self, provider: str, now: float) -> bool:
+        """Whether ``provider``'s losses still count towards a park (PARKS_PER_EXECUTOR per PARK_WINDOW_SECONDS)."""
+        parks = self._parks_by.get(provider)
+        while parks and now - parks[0] > PARK_WINDOW_SECONDS:
+            parks.popleft()
+        return not parks or len(parks) < PARKS_PER_EXECUTOR
+
+    async def _lost(self, lease: _Lease, *, why: str = "expired unanswered", bench: bool = False,
+                    evidence: bool = True) -> None:
+        """A lost result: a lease that expired unanswered, or answered with something else than its scores. Its card is
+        struck, as #493 sets aside a card that loses results. A witnessed loss, or an answer that is no score
+        (``bench``), also benches it from the batch (`_bench`). A witnessed loss counts against the batch (unless
+        ``evidence`` is off), which is parked once the evidence says no card can answer it
+        (UNANSWERED_PROVIDERS_PARK): its witnessed losses then strike nobody."""
+        batch, executor_id = lease.batch, lease.executor_id
+        now = self._clock()
+        witnessed = self._witness.get(executor_id, float("-inf")) > lease.granted_at
+        if witnessed or bench:
+            self._bench(batch, executor_id)
+        self._clean[executor_id] = 0
+        loss, park = None, None
+        if not batch.future.done() and evidence:
+            place = batch.places.get(executor_id)
+            loss = batch.losses.setdefault(executor_id, _Loss(provider=place[0] if place else executor_id))
+            if witnessed:
+                loss.witnessed, loss.witnessed_at = True, now
+            # Only fresh witnessed losses are evidence (within PARK_WINDOW_SECONDS); not those of a card quarantined or
+            # released since, nor past its provider's cap.
+            losers = sorted((e, other) for e, other in batch.losses.items()
+                            if other.witnessed and now - other.witnessed_at <= PARK_WINDOW_SECONDS
+                            and e not in self.quarantined and e not in self._releasing
+                            and self._counted(other.provider, now))
+            providers = {other.provider for _, other in losers}
+            if len(providers) >= UNANSWERED_PROVIDERS_PARK + max(0, batch.needed - 1):
+                park = (losers, providers)
+            if witnessed:
+                self.stats["witnessed_losses"] += 1
+        spared = park is not None and any(e == executor_id for e, _ in park[0])
+        if not spared:
+            self._strikes[executor_id] += 1
+            lease.struck = True
+            if loss is not None:
+                loss.leases.append(lease)
+        logger.warning("eval audit lease %s of batch %s (job %s, %d items, %d tokens) %s on executor %s, %.0f s "
+                       "after its grant%s: strike %d of %d", lease.lease_id[:8], batch.id, batch.job_id,
+                       len(batch.items), _tokens(batch.items), why, executor_id,
+                       min(now, lease.expires_at) - lease.granted_at,
+                       " (witnessed: it scored another lease since)" if witnessed else "",
+                       self._strikes[executor_id], self._strikes_limit)
+        if park is not None:
+            self._park_lost(batch, *park, now)
+        if self._strikes[executor_id] >= self._strikes_limit:
+            await self.quarantine(executor_id, f"{self._strikes_limit} results lost (leases expired or "
+                                               "answers that do not fit)")
+
+    def _park_lost(self, batch: _Batch, losers: list, providers: set, now: float) -> None:
+        """Park a batch no card can answer: its witnessed losers' strikes for it are taken back (they work, the batch
+        does not), each provider's park is counted, and the reason names them."""
+        for provider in providers:
+            self._parks_by[provider].append(now)
+        for executor_id, loss in losers:
+            for lease in loss.leases:
+                if lease.struck:
+                    lease.struck = False
+                    self._strikes[executor_id] = max(0, self._strikes[executor_id] - 1)
+                    self.stats["strikes_taken_back_parked"] += 1
+        batch.parked = True
+        self.stats["unanswered_parked"] += 1
+        self._park(batch, "its leases were lost by working cards on {} providers: {}".format(
+            len(providers), ", ".join(f"{e} ({loss.provider})" for e, loss in losers)))
 
     def lease_of(self, lease_id: str) -> _Lease | None:
         return self._leases.get(lease_id)
@@ -642,10 +931,21 @@ class PairedAuditDispatcher:
         batch.leased.discard(executor_id)
         self._mark_busy(executor_id, batch.model)
         if lease.expires_at <= self._clock():
-            self._answered_late(lease, result)
+            # Expired, not swept yet: struck as the sweep would strike it, so no strike depends on the 2 s between an
+            # expiry and its sweep. A scored answer is slow, not lost (what the sweep's strike and its take-back add up
+            # to); one to the longest lease stays struck, but an answered lease is no evidence against its batch.
+            if not batch.reuse_auditors_only:
+                if not _scored(result, batch.items):
+                    await self._lost(lease, why="expired, then answered with no score", bench=True)
+                elif lease.full_length:
+                    await self._lost(lease, evidence=False)
+                self._answered_late(lease, result)
             raise LeaseRefused(410, "lease_expired")
         scores = result.scores
         if len(scores) != len(batch.items) or any(_misfit(s, item) for s, item in zip(scores, batch.items)):
+            # Not an answer to its lease: a lost result, as an expiry is (struck, benched, counted against the batch).
+            if not batch.reuse_auditors_only:
+                await self._lost(lease, why="answered with a result that does not fit", bench=True)
             raise LeaseRefused(422, "result_does_not_fit_the_lease")
         errored = any(s.status == ITEM_ERROR for s in scores)
         if not batch.reuse_auditors_only and not errored:
@@ -654,13 +954,26 @@ class PairedAuditDispatcher:
             self._clean[executor_id] += 1
             if self._clean[executor_id] >= CLEAN_STREAK:
                 self._strikes[executor_id] = 0
-                # Those strikes are gone: a late answer to one of their leases has none to take back.
+                # Those strikes are gone: neither a late answer to one of their leases nor a park of their batch has
+                # one to take back.
                 for expired in self._expired.values():
                     if expired.executor_id == executor_id:
                         expired.struck = False
+                for queue in self._queues.values():
+                    for queued in queue:
+                        for struck in getattr(queued.losses.get(executor_id), "leases", ()):
+                            struck.struck = False
             self._time(lease)
+            if _measured(result, batch.items):
+                # A witness only for work that counts: an answer to a batch decided or cancelled proves nothing.
+                if not batch.future.done():
+                    self._witness[executor_id] = self._clock()
+                self._unpark(batch)
         if errored or batch.future.done():
             # The executor's own fault, or no longer needed: nobody is judged on it.
+            if errored and not batch.future.done() and not batch.reuse_auditors_only:
+                # Not leased to it again at once: one card cannot hold a batch by answering errors (`_bench`).
+                self._bench(batch, executor_id)
             self.stats["executor_errors" if not batch.future.done() else "late"] += 1
             return "requeued" if not batch.future.done() else "unneeded"
         batch.scores[executor_id] = converted_scores(scores)
@@ -712,18 +1025,22 @@ class PairedAuditDispatcher:
             self.stats["disagreements"] += 1
             batch.needed = len(ids) + 1
             return
-        self._park(batch, "no agreeing pair" if not pairs else "conflicting agreeing pairs")
+        self._park(batch, f"{'no agreeing pair' if not pairs else 'conflicting agreeing pairs'} among {ids}")
 
     def _park(self, batch: _Batch, why: str) -> None:
+        if batch.future.done():
+            return
         self.stats["parked"] += 1
         self.parked[batch.job_id] += 1
-        reason = (f"batch {batch.id}: {why} among {sorted(batch.scores)}; its records stay "
-                  "pending")
+        reason = f"batch {batch.id} ({len(batch.items)} items): {why}; its records are parked and tried again"
         logger.error("eval audit of job %s parked: %s", batch.job_id, reason)
-        self.attention[batch.job_id].append(reason)
-        del self.attention[batch.job_id][:-10]
-        if not batch.future.done():
-            batch.future.set_exception(BatchParked(reason))
+        self._flag(batch.job_id, reason)
+        batch.future.set_exception(BatchParked(reason))
+
+    def _flag(self, job_id: str, reason: str) -> None:
+        """Why ``job_id`` needs attention, for the status (the last 10 reasons)."""
+        self.attention[job_id].append(reason)
+        del self.attention[job_id][:-10]
 
     def live_executors(self, model: ModelKey) -> list[dict]:
         now = self._clock()
@@ -857,9 +1174,15 @@ class PairedAuditDispatcher:
         jobs = {job_id: {"needs_attention": True, "parked_batches": self.parked[job_id],
                          "reasons": list(reasons)}
                 for job_id, reasons in self.attention.items() if reasons}
+        now = self._clock()
+        for provider in list(self._parks_by):
+            self._counted(provider, now)  # drops the parks past the window
+        parks = {p: len(times) for p, times in self._parks_by.items() if times}
         return {"schema": "reliquary/eval-control-status/v1", "updated_at": self._clock(),
                 "models": models, "jobs": jobs,
-                "quarantined": sorted(self.quarantined), "stats": dict(self.stats)}
+                "quarantined": sorted(self.quarantined), "stats": dict(self.stats),
+                # Per provider, the parks its cards' losses counted towards over PARK_WINDOW_SECONDS.
+                "parks_by_provider": parks}
 
     async def load_quarantined(self) -> list[str]:
         """Quarantines the registry holds that this process has not heard of (it forgets its own at a restart): each
@@ -887,6 +1210,8 @@ class PairedAuditDispatcher:
                 if not batch.future.done() and executor_id in batch.scores:
                     # Its score no longer counts towards an agreement.
                     del batch.scores[executor_id]
+                # Nor its losses as evidence that no card can answer a batch.
+                batch.losses.pop(executor_id, None)
         if not recorded:
             self._unwritten[executor_id] = reason
             await self._write_quarantines()
@@ -928,18 +1253,9 @@ class PairedAuditDispatcher:
                     logger.info("eval audit lease %s of reuse batch %s expired on executor %s (no strike)",
                                 lease_id[:8], lease.batch.id, lease.executor_id)
                     continue
-                self._strikes[lease.executor_id] += 1
-                self._clean[lease.executor_id] = 0
-                lease.struck = True
+                # Remembered for a late answer (`_answered_late`).
                 self._expired[lease_id] = lease
-                logger.warning("eval audit lease %s of batch %s (job %s, %d items, %d tokens) expired "
-                               "unanswered on executor %s, %.0f s after its grant: strike %d of %d", lease_id[:8],
-                               lease.batch.id, lease.batch.job_id, len(lease.batch.items),
-                               _tokens(lease.batch.items), lease.executor_id, lease.expires_at - lease.granted_at,
-                               self._strikes[lease.executor_id], self._strikes_limit)
-                if self._strikes[lease.executor_id] >= self._strikes_limit:
-                    await self.quarantine(lease.executor_id,
-                                          f"{self._strikes_limit} results lost (leases expired)")
+                await self._lost(lease)
         for lease_id, lease in list(self._expired.items()):
             if now - lease.expires_at > LATE_ANSWER_SECONDS:
                 del self._expired[lease_id]
@@ -1006,6 +1322,7 @@ class PoolView:
         self._job_id = job_id
         self._judge = judge
         self._listeners: list = []
+        self._unpark_listeners: list = []
 
     def connected(self) -> bool:
         # Always remote: there is no local GPU to fall back on.
@@ -1015,11 +1332,25 @@ class PoolView:
         self._listeners.append(listener)
         self._dispatcher.subscribe(listener)
 
+    def subscribe_unparked(self, listener) -> None:
+        """``listener(batch_id)``: a batch of this job parked on its losses got a measured answer."""
+        job_id = self._job_id
+
+        def mine(batch_job: str, batch_id: int) -> None:
+            if batch_job == job_id:
+                listener(batch_id)
+
+        self._unpark_listeners.append(mine)
+        self._dispatcher.subscribe_unparked(mine)
+
     def close(self) -> None:
         """The job is gone: no re-audit of it ever starts, its batches leave."""
         for listener in self._listeners:
             self._dispatcher.unsubscribe(listener)
         self._listeners.clear()
+        for listener in self._unpark_listeners:
+            self._dispatcher.unsubscribe_unparked(listener)
+        self._unpark_listeners.clear()
         self._dispatcher.forget_job(self._job_id)
 
     async def score(self, items: Sequence[dict]):
@@ -1048,44 +1379,336 @@ def eval_auditor(**kwargs):
         stake_at_receipt = True
 
         async def _forward(self, records, *, local: bool = False):
+            sids = [self._sid_of(record) for record in records]
+            now = self._clock()
+            # A parked record cooling down is not scored, whoever asks (a pass that met it in an audit-ahead flight).
+            cooling = {i: _Parked(state.why) for i, sid in enumerate(sids)
+                       if (state := self._park_state.get(sid) or self._reaudit_parked.get(sid)) is not None
+                       and now < state.retry_at}
+            again = [i for i, sid in enumerate(sids) if i not in cooling and sid is not None
+                     and (sid in self._park_state or sid in self._reaudit_parked)]
+            if _REAUDIT_PARKED.get() is None:
+                # A pending record parked before is tried again alone, in the background: one record no executor can
+                # score then parks nobody else's, and a retry no card answers holds no pass. Its outcome is taken by its
+                # next pass (`_ahead`).
+                for i in again:
+                    if sids[i] not in self._retries:
+                        self._retries[sids[i]] = asyncio.ensure_future(self._retry_alone(records[i], sids[i]))
+                    cooling[i] = _Parked(f"tried again alone: {self._park_state[sids[i]].why}"
+                                         if sids[i] in self._park_state else "tried again alone")
+                again = []
+            rest = [i for i in range(len(records)) if i not in cooling and i not in again]
+            # A re-audit tries each pass parked before in a call of its own, and waits for it.
+            parts = [[i] for i in again] + ([rest] if rest else [])
+            if len(parts) == 1 and not cooling:
+                return await self._forward_part(records, sids)
+            done = await asyncio.gather(*(self._forward_part([records[i] for i in part], [sids[i] for i in part])
+                                          for part in parts), return_exceptions=True)
+            outcomes: list = [cooling.get(i) for i in range(len(records))]
+            for part, out in zip(parts, done):
+                if isinstance(out, (ValueError, RuntimeError)):
+                    out = [str(out)] * len(part)
+                elif isinstance(out, BaseException):
+                    raise out
+                for i, outcome in zip(part, out):
+                    outcomes[i] = outcome
+            return outcomes
+
+        async def _forward_part(self, records, sids):
+            """The outcomes of ``records``: a verdict each, or ``_Parked`` for a record an executor cannot read or
+            whose batch was parked (recorded at once: an unpark may come while the rest is scored again), or a
+            validator error's message for a record left unscored when a relaunch failed."""
             results, items = await asyncio.to_thread(self._prepare, records)
             if self._draw_job is None:
                 # A draw job's trajectories go v3; proven ones have no executor here.
                 self._refuse_trajectories(items)
-            scores = await self._remote.score(self._wire_items(records, items))
+            rows: dict[int, tuple] = {}
+            parked: dict[int, str] = {}
+            failure = None
+            todo = list(range(len(items)))
+            while todo:
+                try:
+                    scores = await self._remote.score(self._wire_items(records, [items[k] for k in todo]))
+                except ItemsUnreadable as exc:
+                    hit = [(j, f"an item no executor can read: {why}", PARK_UNREADABLE, ())
+                           for j, why in exc.reasons.items()]
+                except BatchParked as exc:
+                    for j, row in exc.scored.items():
+                        rows[todo[j]] = row
+                    hit = [(j, str(exc), PARK_LOST, tuple(exc.batch_ids))
+                           for j in (range(len(todo)) if exc.indexes is None else exc.indexes)]
+                except (ValueError, RuntimeError) as exc:
+                    if not parked:
+                        raise
+                    # A relaunch failed (its order unwired meanwhile): what was parked stays parked.
+                    failure = str(exc)
+                    break
+                else:
+                    rows.update(zip(todo, scores))
+                    hit = []
+                left = [k for k in todo if k not in rows]
+                if left and not hit and len(left) == len(todo):
+                    # Parked, naming none of the call's items: every record still to score was in it.
+                    hit = [(j, "parked", PARK_LOST, ()) for j in range(len(todo))]
+                # A park that held one record's items alone names its culprit.
+                hit_records = {items[todo[j]][0] for j, *_ in hit}
+                for j, why, kind, batch_ids in hit:
+                    i = items[todo[j]][0]
+                    if i not in parked:
+                        parked[i] = why
+                        self._record_park(sids[i], why, kind, batch_ids, alone=len(hit_records) == 1)
+                todo = [k for k in left if items[k][0] not in parked]
+            for i, why in parked.items():
+                results[i] = _Parked(why)
+            unscored = {item[0] for k, item in enumerate(items) if k not in rows and item[0] not in parked}
+            for i in unscored:
+                results[i] = failure
+            kept = [item for k, item in enumerate(items) if item[0] not in parked and item[0] not in unscored]
+            kept_rows = [rows[k] for k, item in enumerate(items) if item[0] not in parked and item[0] not in unscored]
             scored_by = {}
-            for (i, *_), (_, _, executors, *_) in zip(items, scores):
+            for (i, *_), (_, _, executors, *_) in zip(kept, kept_rows):
                 scored_by.setdefault(i, set()).update(executors or ())
-            judged = self._verdicts(records, results, items,
-                                    [(status, chunks, *extra) for status, chunks, _, *extra in scores])
+            judged = self._verdicts(records, results, kept,
+                                    [(status, chunks, *extra) for status, chunks, _, *extra in kept_rows])
             for i, executors in scored_by.items():
                 judged[i] = {**judged[i], "scored_by": sorted(executors)}
+            for i, sid in enumerate(sids):
+                if sid is not None and isinstance(judged[i], dict):
+                    # Decided: no longer parked.
+                    self._reaudit_parked.pop(sid, None)
+                    self._unpark_record(sid)
+            if parked:
+                first = next(iter(parked))
+                state = self._park_state.get(sids[first]) or self._reaudit_parked.get(sids[first])
+                logger.warning("eval job %s: %d record(s) parked%s (%s), e.g. %s; tried again in %.0f s at most",
+                               self._job_id, len(parked), " in a re-audit" if _REAUDIT_PARKED.get() is not None
+                               else "", parked[first][:200], ", ".join((sids[i] or "?")[:12] for i in list(parked)[:3]),
+                               (state.retry_at - self._clock()) if state is not None else PARK_RETRY_SECONDS)
             return judged
 
+        def _record_park(self, sid, why, kind, batch_ids, *, alone=False) -> None:
+            """Park ``sid`` now (a re-audit keeps its own): its batch's unpark may come before the call ends."""
+            if sid is None:
+                return
+            reaudit = _REAUDIT_PARKED.get()
+            if reaudit is not None:
+                reaudit.add(sid)
+                self._park_again(self._reaudit_parked, sid, why, kind, batch_ids, alone)
+            elif sid not in self._judged:
+                self._park_again(self._park_state, sid, why, kind, batch_ids, alone)
+                self.parked_ids.add(sid)
+
+        def _park_again(self, states, sid, why, kind, batch_ids, alone=False) -> None:
+            """Park ``sid`` (or again): tried after PARK_RETRY_SECONDS, doubling up to MAX_PARK_RETRY_SECONDS, or at
+            once if its batch was unparked already."""
+            now = self._clock()
+            state = states.get(sid)
+            if state is None:
+                state = states[sid] = _ParkState(since=now, backoff=PARK_RETRY_SECONDS)
+            else:
+                state.backoff = min(MAX_PARK_RETRY_SECONDS, 2 * state.backoff)
+                state.tries += 1
+            state.retry_at = now + state.backoff
+            state.why, state.kind, state.batches = why, kind, set(batch_ids)
+            state.alone = state.alone or alone or kind == PARK_UNREADABLE
+            for gone in [b for b, at in self._unparked_batches.items() if now - at > LATE_ANSWER_SECONDS]:
+                del self._unparked_batches[gone]
+            if any(b in self._unparked_batches for b in state.batches):
+                # Its batch got a measured answer before this park was recorded: as `_batch_unparked` would.
+                state.retry_at, state.backoff = now, PARK_RETRY_SECONDS / 2
+                state.tries, state.alone, state.since = 0, False, now
+
+        async def _retry_alone(self, record, sid) -> None:
+            """A parked record tried again alone, in the background. Decided: its outcome waits for its pass in
+            `_ahead`, and the pass is due now. Parked again: its cool-down doubled (`_park_again`)."""
+            state = self._park_state.get(sid)
+            if state is not None:
+                # Not tried again while this retry is out.
+                state.retry_at = self._clock() + max(state.backoff, PARK_RETRY_SECONDS)
+            try:
+                outcome, = await self._forward_part([record], [sid])
+            except (ValueError, RuntimeError):
+                logger.warning("eval job %s: retry of parked %s failed on the validator; tried again later",
+                               self._job_id, sid[:12], exc_info=True)
+                return
+            finally:
+                self._retries.pop(sid, None)
+            if isinstance(outcome, dict) and sid not in self._judged:
+                self._ahead[sid] = outcome
+                self._schedule(sid, self._clock())
+
+        def _unpark_record(self, sid) -> None:
+            if self._park_state.pop(sid, None) is not None:
+                self.parked_ids.discard(sid)
+                logger.info("eval job %s: parked %s decided", self._job_id, sid[:12])
+                self._wake_held(sid)
+
+        def _note_held(self, submission_id: str, parked) -> None:
+            for sid in parked:
+                self._held_by.setdefault(sid, set()).add(submission_id)
+
+        def _wake_held(self, sid) -> None:
+            """A parked record decided or unparked: the passes it held as a sibling are judged again now."""
+            now = self._clock()
+            for other in self._held_by.pop(sid, ()):
+                if other in self._judged:
+                    continue
+                if other in self._next_due and self._next_due[other] > now:
+                    self._next_due[other] = now
+                if other in self._due and self._due[other] > now:
+                    self._schedule(other, now)
+
+        def _batch_unparked(self, batch_id) -> None:
+            """A batch parked on its losses got a measured answer: its records are tried again at once."""
+            now = self._clock()
+            self._unparked_batches[batch_id] = now
+            moved = 0
+            for states in (self._park_state, self._reaudit_parked):
+                for sid, state in states.items():
+                    if batch_id not in state.batches:
+                        continue
+                    moved += 1
+                    # A card answered its batch: the park is no evidence against it any more. It holds the close again
+                    # until its retry decides it or parks it alone again (SOLO_RETRY_SECONDS at most).
+                    state.retry_at, state.backoff = now, PARK_RETRY_SECONDS / 2
+                    state.tries, state.alone, state.since, state.left_out = 0, False, now, False
+                    if states is self._park_state:
+                        if sid in self._next_due:
+                            self._next_due[sid] = now
+                        if sid in self._due:
+                            self._schedule(sid, now)
+                        self._wake_held(sid)
+            if moved:
+                logger.info("eval job %s: batch %s unparked; %d parked record(s) tried again now", self._job_id,
+                            batch_id, moved)
+
+        def _sid_of(self, record) -> str | None:
+            """A record's submission id: written in it by the intake; else as its pass or its read named it."""
+            sid = record.get("submission_id") if isinstance(record, dict) else None
+            if isinstance(sid, str) and sid:
+                return sid
+            known = self._ids_by_object.get(id(record))
+            return known[0] if known is not None and known[1] is record else None
+
+        def _know(self, ids, records) -> None:
+            for sid, record in zip(ids, records):
+                if isinstance(record, dict) and not record.get("submission_id"):
+                    self._ids_by_object[id(record)] = (sid, record)
+                    self._ids_by_object.move_to_end(id(record))
+            while len(self._ids_by_object) > KNOWN_RECORDS:
+                self._ids_by_object.popitem(last=False)
+
+        async def _read_all(self, submission_ids):
+            records = await super()._read_all(submission_ids)
+            self._know(list(records), list(records.values()))
+            return records
+
+        def _mark_judged(self, submission_id: str) -> None:
+            super()._mark_judged(submission_id)
+            self._unpark_record(submission_id)
+
+        def _is_parked(self, submission_id: str) -> bool:
+            return submission_id in self._park_state
+
+        def _give_up_at(self, submission_id: str) -> float | None:
+            """When a parked record lets go of its period's close: PARKED_CLOSE_GIVE_UP_SECONDS after its receipt
+            (durable: a restart does not start it again). One parked with other records' items, never alone, waits too
+            until its first retry alone had SOLO_RETRY_SECONDS: no honest batch-mate leaves before it is decided."""
+            meta, state = self._meta.get(submission_id), self._park_state.get(submission_id)
+            if meta is None or state is None:
+                return None
+            give_up = meta[1] + PARKED_CLOSE_GIVE_UP_SECONDS
+            if state.alone or state.tries >= 1:
+                return give_up
+            return max(give_up, state.since + PARK_RETRY_SECONDS + SOLO_RETRY_SECONDS)
+
+        def _parked_wait(self, submission_id: str, now: float) -> float | None:
+            state = self._park_state.get(submission_id)
+            if state is None or now >= state.retry_at:
+                return None
+            give_up = self._give_up_at(submission_id)
+            return state.retry_at if give_up is None or give_up <= now else min(state.retry_at, give_up)
+
+        def _left_out_of_close(self, submission_id: str, now: float) -> bool:
+            # One record no executor can score must not freeze the order's pay: it lets go of the close at its give-up.
+            state = self._park_state.get(submission_id)
+            give_up = self._give_up_at(submission_id)
+            if give_up is None or now <= give_up:
+                return False
+            if not state.left_out:
+                state.left_out = True
+                self._left_out_ids.add(submission_id)
+                logger.error("eval job %s: parked %s, received %.0f s ago, no longer holds its period's close nor "
+                             "its operator's unaudited passes; it is still tried again%s", self._job_id,
+                             submission_id[:12], now - self._meta[submission_id][1],
+                             ", and its operator's verdicts it could forfeit wait for its decision"
+                             if self._params.q < 1.0 else "")
+            return True
+
+        def settle_hold(self, verdicts, period_of) -> set[str]:
+            """The stake guarantee past a give-up (owner, 2026-11-26): while a parked record left out of the close is
+            undecided, the verdicts of its operator received in its period up to its own receipt (what its failure can
+            forfeit: `forfeits` voids up to the failure's receipt) are not settled, so that forfeit can still void them
+            (`_void_forfeited` skips what is settled). Every other verdict is settled. ``verdicts``: id -> (hotkey, work
+            period, received_at). At q = 1 a failure forfeits nothing: nothing is held."""
+            if self._params.q >= 1.0:
+                return set()
+            now = self._clock()
+            until: dict[tuple[str, int], float] = {}
+            for sid in list(self._park_state):
+                if sid in self._meta and sid not in self._judged and self._left_out_of_close(sid, now):
+                    hotkey, received_at, _ = self._meta[sid]
+                    key = (self._operator(hotkey), period_of(received_at))
+                    until[key] = max(until.get(key, float("-inf")), received_at)
+            if not until:
+                return set()
+            held = set()
+            for sid, (hotkey, period, received_at) in verdicts.items():
+                bound = until.get((self._operator(hotkey), period)) if hotkey else None
+                if bound is not None and (received_at is None or float(received_at) <= bound):
+                    held.add(sid)
+            return held
+
+        def settle_capped(self, verdicts, period_of) -> set[str]:
+            """The verdicts paid within what is left of their period's cap, if their period was settled without them
+            (owner, 2026-11-26): parked records decided after they left the close (marked in their verdict, so a
+            restart keeps it), and, at q < 1, the verdicts their stake hold kept back (their operator's, in their
+            period, received up to them). Any other late verdict is paid as before."""
+            marked = {sid for sid, verdict in verdicts.items()
+                      if sid in self._left_out_ids or (verdict or {}).get("left_out_of_close")}
+            if self._params.q >= 1.0:
+                return marked
+            # The left-out records, from memory and from the marked verdicts of this call (a restart forgets the first).
+            until: dict[tuple[str, int], float] = {}
+            anchors = [(self._meta[sid][0], self._meta[sid][1]) for sid in self._left_out_ids if sid in self._meta]
+            anchors += [(verdicts[sid].get("hotkey"), verdicts[sid].get("received_at")) for sid in marked]
+            for hotkey, received_at in anchors:
+                if hotkey and received_at is not None:
+                    key = (self._operator(hotkey), period_of(received_at))
+                    until[key] = max(until.get(key, float("-inf")), float(received_at))
+            held = set()
+            for sid, verdict in verdicts.items():
+                hotkey, received_at = (verdict or {}).get("hotkey"), (verdict or {}).get("received_at")
+                if not hotkey or received_at is None:
+                    continue
+                bound = until.get((self._operator(hotkey), period_of(received_at)))
+                if bound is not None and float(received_at) <= bound:
+                    held.add(sid)
+            return marked | held
+
         async def _audit_outcomes(self, records, *, local: bool = False):
-            # A parked batch is neither the miner's fault nor a validator
-            # error: its records stay pending, untried, and its job is flagged.
+            # A parked record is neither the miner's fault nor a validator error (`_Parked`): it stays pending, tried
+            # again after a cool-down, and its job is flagged.
             try:
                 return await self._forward(records, local=local)
-            except BatchParked as exc:
-                for record in records:
-                    for sid, known in zip(self._current_ids, self._current_records):
-                        if known is record:
-                            self.parked_ids.add(sid)
-                return [_Parked(str(exc)) for _ in records]
             except (ValueError, RuntimeError) as exc:
                 return [str(exc) for _ in records]
 
         async def _audit_records(self, ids, records, draws, *, deferred=None):
-            self._current_ids, self._current_records = list(ids), list(records)
-            before = set(self.parked_ids)
+            self._know(ids, records)
             try:
                 return await super()._audit_records(ids, records, draws, deferred=deferred)
             finally:
-                # Parked records were counted as validator errors above: undone.
-                parked_now = len(self.parked_ids - before)
-                self._validator_errors = max(0, self._validator_errors - parked_now)
-                self._current_ids, self._current_records = [], []
                 self._reaudit_quarantined()
 
         def _reaudit_quarantined(self) -> None:
@@ -1114,12 +1737,15 @@ def eval_auditor(**kwargs):
                         known.extend(sid for sid in listed if sid not in present)
                         await asyncio.sleep(delay)
                         delay = min(MAX_REOPEN_RETRY_SECONDS, 2 * delay)
+                        continue
+                    left = self._remote_scored.get(executor_id) or []
+                    if left and all(sid in self._reaudit_parked for sid in left):
+                        # Only parked passes are left, listed again: tried once the first cool-down ends (an unpark
+                        # moves it to now; looked at again within a minute).
+                        wake = min(self._reaudit_parked[sid].retry_at for sid in left)
+                        await asyncio.sleep(min(60.0, max(1.0, wake - self._clock())))
             finally:
                 self._late_reaudits.pop(executor_id, None)
-
-        async def judge_many(self, submission_ids):
-            # A parked record is not tried again until an operator acts.
-            await super().judge_many([s for s in submission_ids if s not in self.parked_ids])
 
         # -- an eval job stays completable: a failure reopens its slot ------
         # (a generation order's never does: today's corpus semantics)
@@ -1224,15 +1850,41 @@ def eval_auditor(**kwargs):
                 self._reopening.pop(_REOPEN_BACKLOG, None)
 
         async def _write(self, submission_id, verdict):
+            if submission_id in self._left_out_ids:
+                # Durable: its late pay stays within the cap after a restart too (`settle_capped`).
+                verdict = {**verdict, "left_out_of_close": True}
             stored, written = await super()._write(submission_id, verdict)
             if not (stored or verdict).get("passed"):
                 await self._record_failure(submission_id)
             return stored, written
 
         async def reaudit_executor(self, executor_id):
-            failed = await super().reaudit_executor(executor_id)
+            # A pass whose re-audit was parked stays on its executor's list, tried again after its cool-down by
+            # `_reaudit_late`: a parked re-audit never leaves a quarantined executor's passes standing in silence.
+            listed = list(self._remote_scored.get(executor_id, ()))
+            now = self._clock()
+            cooling = {sid for sid in listed
+                       if sid in self._reaudit_parked and now < self._reaudit_parked[sid].retry_at}
+            if cooling:
+                self._remote_scored[executor_id] = [sid for sid in listed if sid not in cooling]
+            parked: set[str] = set()
+            token = _REAUDIT_PARKED.set(parked)
+            try:
+                failed = await super().reaudit_executor(executor_id)
+            finally:
+                _REAUDIT_PARKED.reset(token)
+                back = [sid for sid in listed if sid in cooling or sid in parked]
+                if back:
+                    known = self._remote_scored.setdefault(executor_id, [])
+                    present = set(known)
+                    known.extend(sid for sid in back if sid not in present)
             for submission_id in failed:
                 await self._record_failure(submission_id)
+            if parked:
+                logger.warning("eval job %s: %d pass(es) of quarantined executor %s parked in their re-audit, kept "
+                               "on its list (e.g. %s)", self._job_id, len(parked), executor_id, min(parked)[:12])
+            if back and executor_id not in self._late_reaudits:
+                self._late_reaudits[executor_id] = asyncio.ensure_future(self._reaudit_late(executor_id))
             return failed
 
         async def reconcile_failures(self) -> int:
@@ -1323,7 +1975,7 @@ def eval_auditor(**kwargs):
                 if restore is not None:
                     restore.cancel()
                     await asyncio.gather(restore, return_exceptions=True)
-                late = list(self._late_reaudits.values())
+                late = list(self._late_reaudits.values()) + list(self._retries.values())
                 for task in late:
                     task.cancel()
                 await asyncio.gather(*late, return_exceptions=True)
@@ -1349,8 +2001,20 @@ def eval_auditor(**kwargs):
     auditor.restores_scored = bool(restores_scored)
     auditor.scores_restored = asyncio.Event()
     auditor._late_reaudits = {}
+    # Pending records parked (`_ParkState`), and passes parked in a re-audit, by submission id.
     auditor.parked_ids = set()
-    auditor._current_ids, auditor._current_records = [], []
+    auditor._park_state = {}
+    auditor._reaudit_parked = {}
+    # Parked records once left out of their close (their late verdict is paid within the cap), and batches unparked
+    # lately (a park recorded after its batch's unpark is tried at once).
+    auditor._left_out_ids = set()
+    auditor._unparked_batches = {}
+    # Retries of parked records running alone, and the passes each parked record holds as a sibling.
+    auditor._retries = {}
+    auditor._held_by = {}
+    auditor._ids_by_object = collections.OrderedDict()
+    if callable(getattr(auditor._remote, "subscribe_unparked", None)):
+        auditor._remote.subscribe_unparked(auditor._batch_unparked)
     auditor.job, auditor.job_store = job, job_store
     return auditor
 
@@ -1364,7 +2028,30 @@ def _reopen_retried() -> tuple:
 
 
 class _Parked(str):
-    """An outcome that is neither a verdict nor a validator error."""
+    """An outcome that is neither a verdict nor a validator error: the record stays pending, parked, and counts
+    nowhere towards the auditor's halt (``undecided``, read by ``CorpusAuditor``)."""
+
+    undecided = True
+
+
+@dataclass
+class _ParkState:
+    """A parked record: since when, why and how (PARK_UNREADABLE / PARK_LOST), the batches parked with it, when it is
+    tried again, its current cool-down, how often it was parked again, whether a park held its items alone (no other
+    record's: it is the culprit), and whether its give-up was logged."""
+    since: float
+    backoff: float
+    retry_at: float = 0.0
+    why: str = ""
+    kind: str = ""
+    batches: set = field(default_factory=set)
+    tries: int = 0
+    alone: bool = False
+    left_out: bool = False
+
+
+# Set while `reaudit_executor` runs: the passes its audits park, which it keeps on its executor's list.
+_REAUDIT_PARKED: contextvars.ContextVar[set | None] = contextvars.ContextVar("reaudit_parked", default=None)
 
 
 def build_eval_executor_router(*, dispatcher: PairedAuditDispatcher,
@@ -1841,7 +2528,10 @@ def wire_order_judge(w, *, records, job_store, remote, params, miner_states, bea
         archives=R2PeriodArchives(guard=settle_archives),
         oldest_pending=oldest_of(*pending), ready=grader.ready if grader is not None else None,
         on_settled=on_settled, full_list_every_seconds=SETTLE_FULL_LIST_SECONDS, executor=settle_executor,
-        max_price=cp.max_price(entry.params), max_input_price=cp.max_input_price(entry.params))
+        max_price=cp.max_price(entry.params), max_input_price=cp.max_input_price(entry.params),
+        # The stake guarantee past a parked record's give-up, and its late verdict paid within the cap.
+        hold=lambda verdicts, period_of: w.auditor.settle_hold(verdicts, period_of),
+        capped=lambda verdicts, period_of: w.auditor.settle_capped(verdicts, period_of))
     w.auditor = eval_auditor(
         job_id=job.job_id, records=records, tokenizer=w.tokenizer, proof=w.proof,
         params=params, miner_states=miner_states, beacon=beacon, round_at=round_at,
@@ -2665,6 +3355,7 @@ run_order_control = run_eval_control
 __all__ = [
     "ORDER_SANDBOX_KEY_SETTINGS",
     "BatchParked",
+    "ItemsUnreadable",
     "OrderArchives",
     "build_order_control",
     "wire_order_judge",

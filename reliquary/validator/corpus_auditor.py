@@ -503,7 +503,9 @@ class CorpusAuditor:
           less the slack;
         - found by a listing and never readable: it holds every period open for
           ``UNKNOWN_ARRIVAL_GIVE_UP_SECONDS``, then is logged and left out, so one
-          corrupt record cannot freeze a task's pay for ever.
+          corrupt record cannot freeze a task's pay for ever;
+        - an order's record parked past its give-up (`_left_out_of_close`): left out
+          the same way, for the same reason.
 
         Raises ``LookupError`` before the seed, or while the feed's coverage is
         unreadable: until then an unknown backlog may hold anything."""
@@ -515,7 +517,7 @@ class CorpusAuditor:
         oldest = None if covered == math.inf else covered - self._accept_slack
         now = self._clock()
         for sid in dict.fromkeys((*self._meta, *self._unreadable, *self._queued)):
-            if sid in self._judged:
+            if sid in self._judged or self._left_out_of_close(sid, now):
                 continue
             if sid in self._meta:
                 at = self._meta[sid][1]
@@ -533,6 +535,26 @@ class CorpusAuditor:
                 at = -math.inf
             oldest = at if oldest is None else min(oldest, at)
         return oldest
+
+    # -- an order's parked records (`eval_control`): none here ---------------
+
+    def _is_parked(self, submission_id: str) -> bool:
+        """Whether a pending record is parked: an audit no executor could return. Never sent ahead."""
+        return False
+
+    def _parked_wait(self, submission_id: str, now: float) -> float | None:
+        """While a parked record is not due to be tried again, the next instant it changes: tried again, or let go of
+        its period's close (None: due, or not parked). Until then no pass audits it, and as a sibling it holds its
+        operator's unaudited passes received within their hold of it, as an undecided record does."""
+        return None
+
+    def _left_out_of_close(self, submission_id: str, now: float) -> bool:
+        """Whether an undecided record no longer holds its period's close, nor its operator's unaudited passes as a
+        sibling (a parked record past its give-up)."""
+        return False
+
+    def _note_held(self, submission_id: str, parked) -> None:
+        """``submission_id`` waits for these parked siblings: judged again once one is decided (none here)."""
 
     def audits_pending(self) -> int | None:
         """Pending records that may still need a GPU audit: every one not decided yet, and every one waiting out
@@ -972,7 +994,9 @@ class CorpusAuditor:
         - left unaudited and undrawn: it lies inside each one's hold, so none is paid before it is decided and,
           drawn or slow, audited (the sibling guards);
         - an audited pass: the period settles only once nothing received in it is undecided, so not before
-          its verdict, which a failure writes after the forfeit.
+          its verdict, which a failure writes after the forfeit. An order's parked record left out of the close
+          (`_left_out_of_close`) keeps that guarantee for its operator: the settler holds the operator's verdicts of
+          its period until it is decided (`EvalAuditor.settle_hold`).
 
         One period: its records are paid at one rate (a capped period scales them all alike). Cheating on it
         then costs at least q · (that count) of its pay: at least its pay from 1/q on.
@@ -1460,7 +1484,8 @@ class CorpusAuditor:
             for submission_id in sids:
                 if (submission_id in self._judged or submission_id in self._ahead
                         or submission_id in self._ahead_flight or submission_id not in self._meta
-                        or submission_id in getattr(self, "_in_pass", ())):
+                        or submission_id in getattr(self, "_in_pass", ()) or self._is_parked(submission_id)):
+                    # A parked record is tried again by its pass alone, after its cool-down (`_parked_wait`).
                     continue
                 hotkey, received_at, _ = self._meta[submission_id]
                 if q < 1.0:
@@ -1559,6 +1584,10 @@ class CorpusAuditor:
         for submission_id, outcome in zip(ids, outcomes):
             if isinstance(outcome, dict):
                 self._validator_errors = 0
+            elif getattr(outcome, "undecided", False):
+                # An order's parked record (`eval_control._Parked`): neither the miner's fault nor ours. Pending, it
+                # counts nowhere towards a halt; whoever parked it logged it.
+                continue
             else:
                 # Ours, not the miner's: leave it pending for the next rescan.
                 self._validator_errors += 1
@@ -2007,6 +2036,12 @@ class CorpusAuditor:
         for submission_id in submission_ids:
             # This pass's word on when to judge it again replaces an earlier one.
             self._next_due.pop(submission_id, None)
+        # A parked record cooling down is not tried in this pass, nor in its backward audit: judged again once due.
+        cooling = {sid: at for sid in submission_ids if (at := self._parked_wait(sid, now)) is not None}
+        if cooling:
+            self._next_due.update(cooling)
+            self._choices["parked_cooling"] += len(cooling)
+            submission_ids = [sid for sid in submission_ids if sid not in cooling]
         read: dict[str, dict] = {}
         read.update(await self._read_all(
             [sid for sid in submission_ids if sid not in self._meta]))
@@ -2020,6 +2055,8 @@ class CorpusAuditor:
         await self._learn_shortest(known, states, now)
 
         audit_ids, draws, unaudited, voided = [], {}, [], []
+        # Per operator, (receipt, when it next changes, id) of its parked siblings cooling down (`_parked_wait`).
+        parked_siblings: dict[str, list[tuple[float, float, str]]] = {}
         # Per operator (`_operator`: the hotkey alone unless its coldkey is known), arrival times of records whose
         # draw round is not out yet. Every guard below that keeps a record unpaid until the records that could
         # catch it are decided spans its operator, as its stake does (`_stake_of`).
@@ -2066,12 +2103,13 @@ class CorpusAuditor:
             # A sibling known undrawn decides "wait" or "pass_unaudited" here:
             # its hotkey's state and recent count are X's, its draw is fixed.
             # Siblings are the operator's records, whichever of its hotkeys.
+            # A parked record past its give-up is no sibling any more (`_left_out_of_close`).
             candidates = {}
             for operator in {self._operator(self._meta[sid][0]) for sid, _ in unaudited}:
                 candidates[operator] = sorted(
                     (self._meta[sid][1], sid) for member in self._members.get(operator, ())
                     for sid in self._unjudged.get(member, ())
-                    if sid not in in_pass and sid not in self._undrawn)
+                    if sid not in in_pass and sid not in self._undrawn and not self._left_out_of_close(sid, now))
             # The oldest payable records first, while their siblings fit the
             # pass; the others wait for the next passes (nothing is paid early).
             hold_end: dict[str, float] = {}
@@ -2116,6 +2154,12 @@ class CorpusAuditor:
             reused: list[tuple[str, dict | None]] = []
             for operator, sids in siblings.items():
                 for sid in sids:
+                    at = self._parked_wait(sid, now)
+                    if at is not None:
+                        # Parked, cooling down: undecided until it is tried again (or let go of the close).
+                        self._choices["sibling_parked"] += 1
+                        parked_siblings.setdefault(operator, []).append((self._meta[sid][1], at, sid))
+                        continue
                     with self._timed("decide"):
                         choice, draw = await self._decide(sid, now, states[self._meta[sid][0]])
                     self._choices["sibling_" + choice] += 1
@@ -2196,6 +2240,14 @@ class CorpusAuditor:
                     for t in undecided.get(operator, ())):
                 self._next_due[submission_id] = self._retry_at(hotkey, now)
                 continue
+            parked_until = [(at, sid) for t, at, sid in parked_siblings.get(operator, ())
+                            if t <= received_at + self._params.hold_seconds]
+            if parked_until:
+                # A parked sibling could still catch it: judged again when that sibling is tried or let go, or as soon
+                # as it is decided (`_note_held`).
+                self._next_due[submission_id] = max(now, min(at for at, _ in parked_until))
+                self._note_held(submission_id, [sid for _, sid in parked_until])
+                continue
             paid = {"passed": True, "audited": False, "reason": None, **_WORST_ZERO}
             if forfeits(states[hotkey], received_at):
                 paid = dict(_FORFEITED)
@@ -2218,8 +2270,9 @@ class CorpusAuditor:
                     results, failed = await self._audit_records(
                         [sid for sid, _ in pairs], [r for _, r in pairs], draws,
                         deferred=self._deferred)
-                errored |= {self._operator(r["hotkey"]) for (_, r), result in zip(pairs, results)
-                            if result is None}
+                # A parked record past its give-up holds nobody's pass, even when it parks again here.
+                errored |= {self._operator(r["hotkey"]) for (sid, r), result in zip(pairs, results)
+                            if result is None and not self._left_out_of_close(sid, now)}
         finally:
             landed = await alongside
         failed_operators = {self._operator(hotkey) for hotkey in failed}
