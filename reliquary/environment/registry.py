@@ -280,7 +280,8 @@ class EnvironmentSpec:
             factory = _import_attribute(self.factory_path)
             if not callable(factory):
                 raise TypeError(f"environment factory {self.factory_path!r} is not callable")
-            environment = factory()
+            # A customer env's factory takes its version id: one factory serves every version.
+            environment = factory(self.name) if self.contract_version == _CUSTOMER_CONTRACT else factory()
         expected_protocol = (
             EpisodeEnvironment
             if self.interaction_mode == "episode"
@@ -1029,8 +1030,23 @@ def register_catalogue_spec(spec: EnvironmentSpec) -> None:
         _CATALOGUE_SPECS[spec.name] = spec
 
 
+_CUSTOMER_CONTRACT = "reliquary/customer-env/v1"
+
+
 def find_environment_spec(name: str) -> EnvironmentSpec | None:
-    return ENVIRONMENT_SPECS.get(name) or _CATALOGUE_SPECS.get(name)
+    spec = ENVIRONMENT_SPECS.get(name) or _CATALOGUE_SPECS.get(name)
+    if spec is None and isinstance(name, str) and name.startswith("customer:"):
+        # A customer env version is known by its id alone; its rows and scores come from the bucket and the
+        # reward host (``customer_env.rl``), so naming one well-formed is enough to describe it.
+        from reliquary.customer_env.rl import customer_spec
+
+        try:
+            spec = customer_spec(name)
+        except ValueError:
+            return None
+        with _CATALOGUE_LOCK:
+            spec = _CATALOGUE_SPECS.setdefault(name, spec)
+    return spec
 
 
 def catalogue_environment_names() -> frozenset[str]:

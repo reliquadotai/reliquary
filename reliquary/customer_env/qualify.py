@@ -130,6 +130,9 @@ class Qualifier:
         rows_sha = hashlib.sha256(body).hexdigest()
         self._store.create_bytes(subnet_key(env, "prompts.jsonl"), body)
         uses = list(USES) if deterministic else ["eval"]
+        if any(r.get("system") for r in rows) and "rl" in uses:
+            # An RL problem is one user turn: a system prompt would be silently dropped.
+            uses.remove("rl")
         final = self._registry.update(
             record.env_id, status="qualified", reason=None if deterministic else "nondeterministic",
             detail=None if deterministic else "two fresh sandboxes scored the examples differently",
