@@ -70,7 +70,10 @@ class WorkerProcess:
 
         threading.Thread(target=pump, daemon=True).start()
         self._proc, self._lines = proc, lines
-        hello = self._exchange({"op": "hello"}, self._start_timeout)
+        try:
+            hello = self._exchange({"op": "hello"}, self._start_timeout)
+        except RewardInfrastructureError as exc:
+            raise RewardInfrastructureError(f"start_failed: {exc}") from exc
         if not hello.get("ok"):
             self.kill()
             raise RewardInfrastructureError(f"start_failed: {hello.get('error')}")

@@ -98,14 +98,19 @@ class Qualifier:
             freeze_s = self._clock() - started
             if not rows:
                 raise _Refused("freeze_failed", f"no task can be served: {refused[:5]}")
-            by_key = {r["key"]: r for r in rows}
+            # An example names its task by key, or by the task's own name (verifiers keys are content hashes).
+            names = {r["name"]: r for r in rows if r.get("name")}
+            by_key = {**({} if len(names) != len({r.get("name") for r in rows}) else names),
+                      **{r["key"]: r for r in rows}}
             missing = sorted({e.key for e in package.examples} - set(by_key))
             if missing:
                 raise _Refused("examples_failed", f"examples name tasks the taskset does not serve: {missing[:10]}")
-            items = [{"key": e.key, "prompt_sha256": by_key[e.key]["prompt_sha256"], "answer": e.answer}
+            items = [{"key": by_key[e.key]["key"], "prompt_sha256": by_key[e.key]["prompt_sha256"], "answer": e.answer}
                      for e in package.examples]
-            started = self._clock()
             scored = self._score(first, items)
+            # Timed on the warm worker: the first pass pays the worker's own start (imports, the taskset).
+            started = self._clock()
+            warm = self._score(first, items)
             score_s = self._clock() - started
         finally:
             first.close()
@@ -124,7 +129,7 @@ class Qualifier:
             again = self._score(second, items)
         finally:
             second.close()
-        deterministic = [r.score for r in again] == [r.score for r in scored]
+        deterministic = [r.score for r in again] == [r.score for r in scored] == [r.score for r in warm]
 
         body = rows_body(rows)
         rows_sha = hashlib.sha256(body).hexdigest()
@@ -137,7 +142,7 @@ class Qualifier:
             record.env_id, status="qualified", reason=None if deterministic else "nondeterministic",
             detail=None if deterministic else "two fresh sandboxes scored the examples differently",
             uses=uses, examples=report, prompt_set={"count": len(rows), "sha256": rows_sha, "refused": len(refused)},
-            cost={"qualification_seconds": round(freeze_s + 2 * score_s, 3),
+            cost={"qualification_seconds": round(freeze_s + 3 * score_s, 3),
                   "scoring_ms_per_item": round(1000 * score_s / max(1, len(items)), 3)})
         self._store.create_bytes(subnet_key(env, "record.json"),
                                  json.dumps(final.public(), sort_keys=True).encode())

@@ -3,8 +3,8 @@
 It speaks JSON lines on stdin/stdout (the container has no network) and holds the customer's taskset:
 
 * ``{"op": "hello"}`` -> ``{"ok": true, "provenance": {...}}``
-* ``{"op": "freeze", "offset": 0, "limit": 1000}`` -> ``{"ok": true, "total", "rows": [{key, system, prompt,
-  prompt_sha256}], "refused": [{key, reason}]}``
+* ``{"op": "freeze", "offset": 0, "limit": 1000}`` -> ``{"ok": true, "total", "rows": [{key, name, system, prompt,
+  prompt_sha256}], "refused": [{key, reason}]}`` (``name``: the task's own name, for the customer's examples)
 * ``{"op": "score", "items": [{key, prompt_sha256, answer}]}`` -> ``{"ok": true, "results": [{"score": x} |
   {"error": "source_drift" | "timeout" | "grader_error: ..."}]}``
 
@@ -58,8 +58,9 @@ class VerifiersBackend:
 
     def freeze(self, task) -> dict:
         frozen = self._vs.freeze(task)
-        return {"key": frozen.key, "system": frozen.system, "prompt": frozen.prompt,
-                "prompt_sha256": self._vs.prompt_digest(frozen.system, frozen.prompt)}
+        name = getattr(task.data, "name", None)
+        return {"key": frozen.key, "name": str(name) if name is not None else None, "system": frozen.system,
+                "prompt": frozen.prompt, "prompt_sha256": self._vs.prompt_digest(frozen.system, frozen.prompt)}
 
     def score(self, key: str, prompt_sha256: str, answer: str) -> float:
         return self._scorer.score(self._taskset, self._args, key, prompt_sha256, answer)

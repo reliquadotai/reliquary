@@ -7,10 +7,16 @@ RUN apt-get update -qq && apt-get install -y -qq git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 ARG VERIFIERS_COMMIT=b2e4e8157783b2c0dffc7821044c87f29f1c3ccf
 RUN pip install --no-cache-dir "verifiers @ git+https://github.com/PrimeIntellect-ai/verifiers.git@${VERIFIERS_COMMIT}"
-COPY reliquary/__init__.py /opt/reliquary/reliquary/__init__.py
+# The build backends a customer package may name: it installs with --no-build-isolation (nothing unpinned is
+# fetched for its build). Another backend goes in the package's own hash-pinned lock.
+RUN pip install --no-cache-dir setuptools==80.9.0 wheel==0.45.1 hatchling==1.27.0
+# In site-packages, not on PYTHONPATH: the worker runs under `python -I`, which ignores PYTHONPATH and the
+# working directory, so nothing the customer ships can shadow a module of ours.
+ARG SITE=/usr/local/lib/python3.12/site-packages
+COPY reliquary/__init__.py ${SITE}/reliquary/__init__.py
 COPY reliquary/eval/__init__.py reliquary/eval/protocol.py reliquary/eval/verifiers_source.py \
-     reliquary/eval/sandboxed_runtime.py /opt/reliquary/reliquary/eval/
-COPY reliquary/customer_env/__init__.py reliquary/customer_env/worker.py /opt/reliquary/reliquary/customer_env/
-ENV PYTHONPATH=/opt/reliquary PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+     reliquary/eval/sandboxed_runtime.py ${SITE}/reliquary/eval/
+COPY reliquary/customer_env/__init__.py reliquary/customer_env/worker.py ${SITE}/reliquary/customer_env/
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 # git is for the build only; a running worker has no network anyway.
 RUN apt-get purge -y -qq git && apt-get autoremove -y -qq
