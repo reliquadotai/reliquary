@@ -1,6 +1,8 @@
 # RL environment settings carried by the task, not the compiled profile
 
-Status: mapping and plan; nothing changed.
+Status: implemented for customer envs (c84e82fb), GPU smoke passed. What was built is narrower than the plan
+below: the existing carried-contract mechanism already makes every controller and trainer read follow the task,
+so only the miner needed the settings on its leases.
 
 ## Why
 
@@ -61,3 +63,29 @@ Only groups A and B change.
 
 Estimate: 3-4 days of code and tests, plus the smoke. Risk: a group A read left on the compiled profile; the
 miner/validator agreement test of step 6 is the guard.
+
+## What was built
+
+* A training order naming a customer env (`max_new_tokens`, `thinking`, its `account`) becomes an entry that carries
+  the profile's contract with the env added (`admin/training.customer_contract_entry`). The contract keeps the
+  template's profile id; its digest differs. Profile envs keep their settings (an override is refused).
+* Controller and trainer already run a carried contract (`validator/rl_supervisor.child_profile`, the trainer's
+  adoption); the local supervisor (`rl_orders/supervisor.py`) now writes it too, and `rl_orders` reads the entry's
+  own profile (`profiles.entry_profile`).
+* A lease on a customer env carries `env_settings` (`validator/rl_leases.Lease.to_public`); the miner renders and
+  caps by them (`miner/rl_async.HeldLease`). Leases on profile envs are unchanged.
+* A miner opts in with `--rl-customer-envs` (a bare `--ask-alpha-per-mtoken` prices them) and reads the rows from
+  the task's controller (`GET /rl/customer-envs`, `/rl/customer-envs/rows`, hash-checked).
+
+## GPU smoke (2026-11-26, 1x H100, Qwen3.5-4B, `scripts/smoke_customer_env_rl_gpu.py`)
+
+The contract process, a controller under it (rows route, lease), a miner on the compiled profile (vLLM 0.30), and
+a validator under the contract (`GroupGrader`, rewards through the toy env's verifiers worker):
+
+* lease settings `max_new_tokens=256, thinking=false` from the contract; the miner used them;
+* 16 rollouts, no rejection, no truncation, miner and validator prompt tokens identical, rewards from the
+  customer's worker (all 1.0 on "3 + 3");
+* negative control: the compiled profile's defaults for that env (thinking on, 32768) render another prompt
+  (24 tokens, not 26): without the lease's settings the audit would refuse honest work.
+
+Not covered: a trainer step on the group (env-agnostic) and the draw audit (env-agnostic).

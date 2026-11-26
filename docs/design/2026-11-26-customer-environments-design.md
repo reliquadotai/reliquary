@@ -1,7 +1,7 @@
 # Customer environments: a private hub, run in the order's own sandboxes
 
 Status: steps 1, 2 and 4 implemented (`reliquary/orders/graders.py`, `reliquary/customer_env/`), not deployed.
-Step 3 (platform) on its own branch. RL training orders on a customer env and step 5 (agentic) are open: see
+Step 3 (platform) on its own branch. RL on customer envs done (GPU smoke). Step 5 (agentic) is open: see
 "Implementation status".
 
 ## Why
@@ -219,8 +219,7 @@ later choice: one path for everything, at the cost of a round trip per group.
 | eval grading of customer rows on the reward host | `eval/grading.py`, `customer_env/scoring.py` | done |
 | customer env as a registry environment (frozen rows, remote rewards) | `customer_env/rl.py`, `environment/registry.py` | done |
 | packing tool, Prime Hub import (`prime env pull`) | `customer_env/pack.py` | done |
-| RL training orders naming a customer env | `admin/training.py`, `protocol/profiles.py` | **open**: a training order's envs must be in a static profile; a customer env needs a per-order profile entry (max tokens, cooldown) |
-| miners reading a customer env's rows | `RELIQUARY_CUSTOMER_ENV_ROWS_DIR` | **open**: the controller must mirror `prompts.jsonl` to its miners |
+| RL training orders naming a customer env (carried contract, lease settings, miner opt-in, rows from the controller) | see `2026-11-26-rl-settings-per-task.md` | done; GPU smoke passed |
 | batch `filter`/`annotate` with a customer env | orders delivery | **open** |
 | agentic customer images on the gateways | reliquary-sandbox | **open** (refused today as `agentic_not_supported`) |
 
