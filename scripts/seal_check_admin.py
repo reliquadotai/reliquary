@@ -39,40 +39,47 @@ files: no write, no network call of its own beyond the store's read, no subproce
 ``grader_ok`` compares the card's sealed ``protocol.source.grader_sha256`` with ``grader_sha256()`` here (checked
 first at grading, ``eval/protocol.py`` ``validate_set``); ``taskset_ok`` compares the card's pinned package version,
 verifiers version and artifact hash with what is installed. A card with ``"sealed": false`` has no protocol: neither
-comparison applies to it, and only grading one row tells whether that set grades. This is the field-level check;
-the sufficient check scores one row of ``grading.jsonl`` through the grader's own entry points.
+comparison applies to it, both read ``null``, and only grading one row tells whether that set grades. This is the
+field-level check; the sufficient check scores one row of ``grading.jsonl`` through the grader's own entry points.
+
+``SETS`` is the single-turn catalog as of the commit the script is read from. Set ids given as arguments replace it
+(``python - <set id>... < "$SEAL"``): a set published since, or a set that commit does not list.
 """
-import asyncio, json
+import asyncio, json, sys
 from importlib.metadata import version
 from reliquary.eval.protocol import grader_sha256
 from reliquary.eval.storage import SubnetEvalStore, subnet_key
 from reliquary.eval.verifiers_source import installed_artifacts
 
-SETS = """verifiers-aime24-r0-n30 verifiers-aime25-r0-n30 verifiers-aime26-r0-n30 verifiers-apex_shortlist-r0-n48
-verifiers-gpqa-ab6f143e1-r0-n198 verifiers-graphwalks-single-turn-a896ff7f1-r0-n650-k650-s7 verifiers-ifbench-r0-n300
-verifiers-livecodebench-r0-n454-k300-s7 verifiers-math500-r0-n500 verifiers-mmlu-pro-r0-n12032-k500-s7
-verifiers-openai-mrcr-single-turn-r0-n500-k500-s7 verifiers-scicode-steps-a024c0a1e-r0-n64""".split()
+# AIME 2024, Apex Shortlist and MATH-500 under new ids sealed with grader c0b08e92, their earlier cards having
+# drifted (runbook, step 4); GraphWalks and OpenAI MRCR withdrawn from the catalog.
+SETS = """verifiers-aime24-r0-n30-gc0b08e92 verifiers-aime25-r0-n30 verifiers-aime26-r0-n30
+verifiers-apex_shortlist-r0-n48-gc0b08e92 verifiers-gpqa-ab6f143e1-r0-n198 verifiers-ifbench-r0-n300
+verifiers-livecodebench-r0-n454-k300-s7 verifiers-math500-r0-n500-gc0b08e92 verifiers-mmlu-pro-r0-n12032-k500-s7
+verifiers-scicode-steps-a024c0a1e-r0-n64""".split()
 
 
-async def main():
+async def main(set_ids):
     store, here = SubnetEvalStore(), grader_sha256()
     print(json.dumps({"grader_sha256_here": here, "verifiers_here": version("verifiers")}))
-    for set_id in SETS:
+    for set_id in set_ids:
         body = await store.get_bytes(subnet_key(set_id, "set.json"))
         if body is None:
             print(json.dumps({"set": set_id, "card": None}))
             continue
         card = json.loads(body)
         taskset = card.get("taskset") or {}
-        sealed = ((card.get("protocol") or {}).get("source") or {}).get("grader_sha256")
+        sealed = card.get("protocol") is not None
+        card_grader = ((card.get("protocol") or {}).get("source") or {}).get("grader_sha256")
         want = [taskset.get("package_version"), taskset.get("verifiers_version"), taskset.get("artifact_sha256")]
         try:
             installed = [version(taskset["package"]), version("verifiers"), installed_artifacts(taskset["package"])]
         except Exception as exc:
             installed = f"{type(exc).__name__}: {exc}"
-        print(json.dumps({"set": set_id, "sealed": card.get("protocol") is not None, "package": taskset.get("package"),
-                          "card_grader_sha256": sealed, "grader_ok": sealed == here,
-                          "card_taskset": want, "installed": installed, "taskset_ok": installed == want}))
+        print(json.dumps({"set": set_id, "sealed": sealed, "package": taskset.get("package"),
+                          "card_grader_sha256": card_grader, "grader_ok": card_grader == here if sealed else None,
+                          "card_taskset": want, "installed": installed,
+                          "taskset_ok": installed == want if sealed else None}))
 
 
-asyncio.run(main())
+asyncio.run(main(sys.argv[1:] or SETS))

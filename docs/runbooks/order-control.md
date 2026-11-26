@@ -203,8 +203,9 @@ with `docker exec`. The one exception is in step 3, on a non-production host.
    hand in its place, and the two keys must be those of an R2 token that can only read that bucket, never the
    admin's.
 
-   It prints one line per set of its own list, `SETS`, fixed at `<commit>`: the script takes no argument and reads
-   nothing from the platform. So its lines can include sets the platform has withdrawn, and miss sets it offers.
+   It prints one line per set of its own list, `SETS`, fixed at `<commit>`, or of the set ids given as its
+   arguments (`python - <set id>... < "$SEAL"`, in both runs), and reads nothing from the platform. So its lines can
+   include sets the platform has withdrawn, and miss sets it offers.
    Only the single-turn sets the platform offers count. The sets it offers are the rows of its `eval_sets` with
    `availability = 'qualified'`. Its public catalog, `https://api.reliqua.ai/api/v1/evaluations/catalog`, lists
    exactly those and needs no key. This read-only query, run in a checkout of reliquary-platform, lists them too,
@@ -225,8 +226,9 @@ with `docker exec`. The one exception is in step 3, on a non-production host.
      rebuilt image prints it, `$R2_ENV` reads a bucket other than the admin's (`R2_BUCKET_ID` missing, say): fix it
      and run the check again. If the admin's run prints it too, the card is missing from the admin's own bucket:
      step 4 before the switch, as for a failed comparison (below).
-   - `"sealed": false`: the card has no protocol, so neither comparison applies. Only step 3 tells whether the set
-     grades.
+   - `"sealed": false`: the card has no protocol, so neither comparison applies, and both read `null`. The admin
+     takes orders on such a legacy card (#547 checks sealed cards only) and grades it with no fingerprint or artifact
+     check, so only step 3 tells whether the set grades.
    - `grader_ok: false` on a sealed card: the grader fingerprint is checked first. `/grade` answers 422, and the
      order ends in `grading_timeout` after generation: charged, no report. On an admin carrying #547 the order is
      refused at job creation instead.
@@ -285,7 +287,24 @@ with `docker exec`. The one exception is in step 3, on a non-production host.
    at all. Grade it with a program, in a fenced code block, that passes that row's tests: the row grades only if
    its score is 1.0.
 4. **A drifted set cannot be republished under its id.** Publication is create-only (`eval/storage.py`). Use a
-   new set id and a new `eval_sets` row, and withdraw the old one.
+   new set id and a new `eval_sets` row, and withdraw the old one. Name the new set after the old id and the first
+   8 hex digits of the fingerprint it is sealed with, `<old id>-g<8 hex>` (`verifiers-math500-r0-n500-gc0b08e92`),
+   and build it with the image that will grade it: once the admin runs that image, in the admin's own container, as
+   SciCode's first position (SciCode, below). Before a switch, a card sealed with the rebuilt image's fingerprint is
+   one the running admin refuses: withdraw the set before the switch and seal it again after. Give `build-set` the
+   old card's selection (`--start`, `--count`, `--sample`, `--seed`) and `--taskset-args`, `--count-tokens` with its
+   tokenizer when the card holds `prompt_tokens`, and `--protocol` with its reviewed `data`, `licenses` and
+   `disjointness` when its protocol holds them. Before publishing, compare the new set with the old one: the same
+   `taskset` and `selection` on the card and, row for row, the same `source_index`, `task_key`, `prompt_sha256` and
+   `reference_sha256` in `grading.jsonl` and the same `messages` in `prompts.jsonl` (only `problem_id` and `set_id`
+   differ). A row that differs means the source changed since the old set was frozen: the new set is then another
+   sample, not the old one sealed again, and its scores do not compare with the old set's. Then `publish-set`, the
+   platform copy (SciCode, below), with the card's `prompt_tokens` added to the public `set.json` when it has them
+   (the platform sizes a job's `max_prompt_tokens` from them), and the new `eval_sets` row (platform
+   `docs/EVALUATIONS_API.md`): the old row's name, description and token figures, the new `prompts_sha256`. Then
+   withdraw the old row, and put the new id in `scripts/seal_check_admin.py`'s `SETS`. A withdrawn set is refused to
+   new quotes and to orders placed from earlier quotes (`set_withdrawn`), never to an order already taken: the
+   platform still reads its row.
 5. **Do not switch the admin while a single-turn evaluation is in flight.** An order already taken is not
    refused: its rows come back ungraded.
 
