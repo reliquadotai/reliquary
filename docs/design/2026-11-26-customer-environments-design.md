@@ -1,7 +1,8 @@
 # Customer environments: a private hub, run in the order's own sandboxes
 
 Status: steps 1, 2 and 4 implemented (`reliquary/orders/graders.py`, `reliquary/customer_env/`), not deployed.
-Step 3 (platform) on its own branch. RL on customer envs done (GPU smoke). Step 5 (agentic) is open: see
+Step 3 (platform) on its own branch, with order placement for batch, eval and RL. RL on customer envs done
+(GPU smoke). Step 5 (agentic) is open: see
 "Implementation status".
 
 ## Why
@@ -220,7 +221,9 @@ later choice: one path for everything, at the cost of a round trip per group.
 | customer env as a registry environment (frozen rows, remote rewards) | `customer_env/rl.py`, `environment/registry.py` | done |
 | packing tool, Prime Hub import (`prime env pull`) | `customer_env/pack.py` | done |
 | RL training orders naming a customer env (carried contract, lease settings, miner opt-in, rows from the controller) | see `2026-11-26-rl-settings-per-task.md` | done; GPU smoke passed |
-| batch `filter`/`annotate` with a customer env | orders delivery | **open** |
+| platform orders on a customer env: batch and eval quotes from `order-sets`, RL environments with settings | reliquary-platform `feat/customer-environments` | done (contract tests), not deployed |
+| scored batch rows | an eval order on the env | done: every sample with its score (`graded.parquet`), all audited |
+| batch `filter`/`annotate` at a partial audit | orders delivery | **open**: no platform order declares a job filter today, on any env; needs `CreateJob.filter` and a customer-env `job_grader` |
 | agentic customer images on the gateways | reliquary-sandbox | **open** (refused today as `agentic_not_supported`) |
 
 Verified: unit tests (`tests/unit/test_customer_env_*.py`, `test_order_reference_graders.py`) and a Docker run

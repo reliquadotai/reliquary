@@ -85,6 +85,11 @@ def test_submit_qualify_list_and_order_sets(app):
         assert [g["grader"] for g in grading] == [env, env]
         assert [json.loads(g["reference"])["key"] for g in grading] == ["t1", "t2"]
 
+        replaced = client.post("/admin/v1/customer-envs/order-sets", json={
+            "env_id": env, "account": "acct", "model": MODEL, "revision": REVISION, "purpose": "eval",
+            "sampling": {"messages": [{"role": "user", "content": "other"}]}})
+        assert replaced.status_code == 422 and "sampling takes only" in replaced.text
+
         refused = client.post("/admin/v1/customer-envs/order-sets", json={
             "env_id": env, "account": "other", "model": MODEL, "revision": REVISION, "purpose": "eval"})
         assert refused.status_code == 422 and "not_yours" in refused.text

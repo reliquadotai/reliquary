@@ -13,7 +13,7 @@ from typing import Any, Literal
 from urllib.parse import unquote
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from reliquary.customer_env import ACCOUNT_RE, NAME_RE, env_id, parse_env_id
 from reliquary.customer_env.registry import Registry, resolve
@@ -41,6 +41,17 @@ class OrderSets(BaseModel):
     start: int | None = Field(default=None, ge=0)
     end: int | None = Field(default=None, gt=0)
     max_prompt_tokens: int | None = Field(default=None, gt=0, le=131072)
+
+    @field_validator("sampling")
+    @classmethod
+    def _sampling_only(cls, value: dict[str, Any]) -> dict[str, Any]:
+        # Merged into each line's body: anything but sampling (``messages``...) would replace the frozen prompt.
+        from reliquary.orders.uploads import _SAMPLING_KEYS
+
+        extra = sorted(set(value) - _SAMPLING_KEYS)
+        if extra:
+            raise ValueError(f"sampling takes only {sorted(_SAMPLING_KEYS)}, not {extra}")
+        return value
 
 
 class _SyncStore:
