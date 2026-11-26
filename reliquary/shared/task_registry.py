@@ -78,6 +78,16 @@ KEEP = object()
 # starting prices pay a period at the target mix; the cap stays the most a
 # period pays. Absent: the cap.
 RL_START_POOL_PARAM = "rl_start_pool"
+# How a task's miners are paid, chosen when the task is added and never changed
+# after (no operation here rewrites a task's params but its cap and price):
+# ``native`` (also when absent) by the weights; ``collector``: the weight setter
+# gives the task no weight and the payer (``reliquary.ledger.payout``) pays its
+# settled obligations from the collector's stake at J+2. Only a task settled by
+# period can be paid by the collector: the payer pays period archives.
+PAYOUT_RAIL_PARAM = "payout_rail"
+PAYOUT_RAIL_NATIVE = "native"
+PAYOUT_RAIL_COLLECTOR = "collector"
+PAYOUT_RAILS = (PAYOUT_RAIL_NATIVE, PAYOUT_RAIL_COLLECTOR)
 
 # Float addition of exact decimals is not exact; 1.0 must not fail by 1e-16.
 _SUM_TOLERANCE = 1e-9
@@ -236,6 +246,26 @@ def _validate_pricing(entry: TaskEntry) -> None:
         raise RegistryError(f"task {entry.task_id!r}: {exc}") from exc
 
 
+def payout_rail(params) -> str:
+    """How a task's miners are paid (``PAYOUT_RAIL_PARAM``): ``native`` unless it
+    declares the collector."""
+    if isinstance(params, Mapping) and params.get(PAYOUT_RAIL_PARAM) == PAYOUT_RAIL_COLLECTOR:
+        return PAYOUT_RAIL_COLLECTOR
+    return PAYOUT_RAIL_NATIVE
+
+
+def _validate_payout_rail(entry: TaskEntry) -> None:
+    rail = entry.params.get(PAYOUT_RAIL_PARAM)
+    if rail is None:
+        return
+    if rail not in PAYOUT_RAILS:
+        raise RegistryError(f"task {entry.task_id!r}: {PAYOUT_RAIL_PARAM} must be one of "
+                            f"{', '.join(PAYOUT_RAILS)}, got {rail!r}")
+    if rail == PAYOUT_RAIL_COLLECTOR and entry.params.get("settlement") != SETTLEMENT_PERIOD_EMA:
+        raise RegistryError(f"task {entry.task_id!r}: only a task settled by period "
+                            f"({SETTLEMENT_PERIOD_EMA}) can be paid by the collector")
+
+
 def _validate_rl_start_pool(entry: TaskEntry, cap: float) -> None:
     if RL_START_POOL_PARAM not in entry.params:
         return
@@ -336,6 +366,7 @@ def validate_entry(entry: TaskEntry) -> None:
             raise RegistryError(f"{TAIL_CAP_PARAM} must be between 0.0 and 1.0, got {tail}")
     _validate_token_price(entry)
     _validate_pricing(entry)
+    _validate_payout_rail(entry)
     _validate_rl_start_pool(entry, cap)
     floor = _number(entry.params["floor"], "floor")
     if floor > cap:

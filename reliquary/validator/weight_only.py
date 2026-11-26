@@ -445,10 +445,17 @@ class WeightOnlyValidator:
         ``CATCHUP_ENTRIES`` such caps on that ground. An archive moved to an
         earlier entry (``replaces_entry_period``,
         scripts/requeue_period_archives.py) hides the one it replaces, should
-        that one still be listed."""
+        that one still be listed.
+
+        A task paid by the collector (``payout_rail: collector``) gets no
+        weight: the payer pays its archives from the collector's stake, and its
+        share goes where every unpaid share goes."""
+        from reliquary.shared.task_registry import PAYOUT_RAIL_COLLECTOR, payout_rail
         from reliquary.validator import corpus_periods as cp
 
-        tasks = sorted(str(t) for t, e in (declared or {}).items() if cp.is_period_task(e))
+        tasks = sorted(str(t) for t, e in (declared or {}).items()
+                       if cp.is_period_task(e)
+                       and payout_rail(getattr(e, "params", None)) != PAYOUT_RAIL_COLLECTOR)
         if not tasks:
             return {}
         if archives is None:
