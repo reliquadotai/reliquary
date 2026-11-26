@@ -439,6 +439,24 @@ def cap_limits(pool_max: float, *, drained_tasks=frozenset()) -> Callable[[Mappi
     return guard
 
 
+def cap_room(entries: Mapping, task_id: str, pool_max: float, *, drained_tasks=frozenset()) -> float:
+    """The largest cap the active corpus task ``task_id`` can hold, every other entry as it is: declared caps
+    within 1.0 (retired ones count, as ``validate_registry`` counts them), and ``cap_limits``'s paying caps
+    within 1.0 and paying corpus caps within ``pool_max``."""
+    from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION
+
+    def paying(e) -> bool:
+        return e.status == "active" or (e.mechanism == MECHANISM_CORPUS_GENERATION
+                                        and e.task_id not in drained_tasks)
+
+    others = [e for key, e in entries.items() if key != task_id]
+    declared = sum(float(e.params.get("cap") or 0.0) for e in others)
+    paying_all = sum(float(e.params.get("cap") or 0.0) for e in others if paying(e))
+    paying_corpus = sum(float(e.params.get("cap") or 0.0) for e in others
+                        if paying(e) and e.mechanism == MECHANISM_CORPUS_GENERATION)
+    return max(0.0, min(1.0 - declared, 1.0 - paying_all, float(pool_max) - paying_corpus))
+
+
 def _public_executor(document: Mapping) -> dict:
     return {k: v for k, v in document.items() if k != "token_sha256"}
 
@@ -1276,8 +1294,32 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         cap = sizing.sized_cap(asked, estimate=estimate, start=start)
         return replace(entry, params={**entry.params, "cap": cap, "floor": cap, sizing.CAP_MAX_PARAM: asked})
 
+    async def clamped_raise(task_id: str, sized: float) -> float | None:
+        """A raise the registry refused, taken as far as the free room allows with a new order's start
+        (``cap_sizing.START_CAP``) kept free: the cap written, or None when that would not raise the cap by
+        ``RESIZE_MIN_CHANGE`` or the registry refuses it too. Only an active task; never lower."""
+        from reliquary.admin import cap_sizing as sizing
+        from reliquary.shared.task_registry import RegistryError
+
+        entries, _ = await registry_store.read_registry(strict=False)
+        entry = entries.get(task_id)
+        if entry is None or entry.status != "active":
+            return None
+        current = float(entry.params["cap"])
+        room = cap_room(entries, task_id, float(pool_max), drained_tasks=set(drained_tasks))
+        cap = round(min(float(sized), room - sizing.START_CAP), 6)
+        if cap <= current or cap - current < sizing.RESIZE_MIN_CHANGE * current:
+            return None
+        try:
+            await registry_store.set_task_cap(task_id, cap, guard=await draining_limits(cap))
+        except (RegistryError, registry_store.RegistryConflict) as exc:
+            logger.warning("admin: cap of %s stays %s (clamped to %s): %s", task_id, current, cap, exc)
+            return None
+        return cap
+
     async def resize_order_caps() -> int:
-        """Resize every active order task with a ``cap_max`` from the control's status; the count changed."""
+        """Resize every active order task with a ``cap_max`` from the control's status; the count changed.
+        A raise the registry refuses is clamped to the free room (``clamped_raise``)."""
         from reliquary.admin import cap_sizing as sizing
         from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION, RegistryError
         from reliquary.validator.eval_control import read_control_status
@@ -1299,8 +1341,17 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             try:
                 await registry_store.set_task_cap(entry.task_id, cap, guard=await draining_limits(cap))
             except (RegistryError, registry_store.RegistryConflict) as exc:
-                logger.warning("admin: cap of %s stays %s (sized %s): %s", entry.task_id,
-                               entry.params["cap"], cap, exc)
+                # 2026-11-25: refused at 0.25 every 5 minutes, an order stayed at 0.0323 for hours while
+                # 0.152 was free. A refused raise now takes the room there is.
+                clamped = (await clamped_raise(entry.task_id, cap)
+                           if isinstance(exc, RegistryError) and cap > float(entry.params["cap"]) else None)
+                if clamped is None:
+                    logger.warning("admin: cap of %s stays %s (sized %s): %s", entry.task_id,
+                                   entry.params["cap"], cap, exc)
+                    continue
+                logger.info("admin: cap of %s %s -> %s (sized %s, clamped to the free room)", entry.task_id,
+                            entry.params["cap"], clamped, cap)
+                changed += 1
                 continue
             logger.info("admin: cap of %s %s -> %s", entry.task_id, entry.params["cap"], cap)
             changed += 1

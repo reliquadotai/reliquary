@@ -77,8 +77,13 @@ cap       = min(cap_max, max(CAP_FLOOR, paid x HEADROOM, min(ahead, estimate x H
   - The control publishes per job (`jobs.<id>.sizing`): its model, cards, what the settler paid in the last 3
     periods (`recent_paid`) and the most an unsettled period has accrued at the ceiling (`open_value`).
   - The estimate is recomputed with the current rate and card count, so a card added mid-order raises the cap.
-  - A change under 10 % of the current cap is not written. A raise the registry guard refuses keeps the cap
-    and is logged.
+  - A change under 10 % of the current cap is not written.
+  - A raise the registry refuses is clamped to the free room, with `START_CAP` kept free for a new order. The
+    free room is what keeps declared caps (retired ones included) within 1.0, paying caps within 1.0 and paying
+    corpus caps within `RELIQUARY_ADMIN_POOL_MAX` (`admin.service.cap_room`). The clamp is written only if it
+    raises the cap by 10 % or more, never on a retired task; otherwise the cap stays and the refusal is logged.
+    Until 2026-11-25 a refused raise kept the cap: an order asking 0.25 every 5 minutes stayed at 0.0323 for
+    hours while 0.152 was free.
 - The settler pays a period with the cap it holds when it settles that period, so a cap lowered mid-period
   also bounds the work already done in it. A resize therefore never goes under the open period's accrued
   value x `HEADROOM`. Lowering keeps `tail_cap` (the highest cap paid), so weights stay bounded by

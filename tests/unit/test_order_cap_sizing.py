@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import replace
 
 import pytest
 
@@ -220,6 +221,64 @@ def test_a_resize_the_pool_cannot_take_keeps_the_cap(admin, pins, rates, control
     assert asyncio.run(admin.app.state.resize_order_caps()) == 0
     assert admin.registry["entries"]["order-eval-p1"].params["cap"] == before
     monkeypatch.undo()
+
+
+def _with_cap(admin, task_id, cap):
+    """``task_id`` at ``cap``; a corpus order's floor follows (its price stays pinned)."""
+    entry = admin.registry["entries"][task_id]
+    pinned = {"floor": cap} if entry.params.get("floor") == entry.params.get("cap") else {}
+    admin.registry["entries"][task_id] = replace(entry, params={**entry.params, "cap": cap, **pinned})
+
+
+def _resize_asking_the_full_cap(admin, control):
+    facts = {"model": f"{MODEL}@{REVISION}", "audit_executors": 1, "recent_paid": [0.5], "open_value": 0.0}
+    control["document"] = _rates_status(jobs={"order-eval-p1": {"sizing": facts}})
+    return asyncio.run(admin.app.state.resize_order_caps())
+
+
+def test_a_refused_raise_takes_the_free_room_with_a_new_orders_start_kept_free(
+        admin, pins, rates, control, monkeypatch):  # noqa: F811
+    # 2026-11-25: a retired RL task's stranded cap left little room; an order refused at 0.25 every 5 minutes
+    # stayed at 0.0323 for hours while 0.152 was free.
+    from tests.unit.test_jobs_cli import _rl_entry
+
+    monkeypatch.setenv(sizing.SIZING_ENV, "on")
+    control["document"] = _rates_status()
+    assert admin("POST", "/admin/v1/jobs", _order(cap=0.25, max_price_usd_per_mtoken=CEILING)).status_code == 201
+    _with_cap(admin, "default", 0.3)
+    admin.registry["entries"]["order-train-x"] = replace(_rl_entry("order-train-x", 0.55), status="retired",
+                                                         retired_at=7)
+    assert _resize_asking_the_full_cap(admin, control) == 1
+    params = admin.registry["entries"]["order-eval-p1"].params
+    assert params["cap"] == pytest.approx(1.0 - 0.3 - 0.55 - sizing.START_CAP)
+    assert params[sizing.CAP_MAX_PARAM] == 0.25
+    assert admin.registry["entries"]["order-train-x"].params["cap"] == 0.55     # a retired cap is never touched
+
+
+def test_a_clamped_raise_stays_within_the_admin_pool(admin, pins, rates, control, monkeypatch):  # noqa: F811
+    monkeypatch.setenv(sizing.SIZING_ENV, "on")
+    control["document"] = _rates_status()
+    assert admin("POST", "/admin/v1/jobs", _order(cap=0.25, max_price_usd_per_mtoken=CEILING)).status_code == 201
+    created = admin("POST", "/admin/v1/jobs", _order(job_id="order-eval-p2", cap=0.25,
+                                                     max_price_usd_per_mtoken=CEILING))
+    assert created.status_code == 201, created.text
+    _with_cap(admin, "order-eval-p2", 0.2)
+    assert _resize_asking_the_full_cap(admin, control) == 1
+    # The admin pool is 0.3 and the other order holds 0.2 of it.
+    assert admin.registry["entries"]["order-eval-p1"].params["cap"] == pytest.approx(0.3 - 0.2 - sizing.START_CAP)
+    assert admin.registry["entries"]["order-eval-p2"].params["cap"] == 0.2
+
+
+def test_a_clamp_gaining_under_the_minimum_change_is_not_written(
+        admin, pins, rates, control, monkeypatch):  # noqa: F811
+    monkeypatch.setenv(sizing.SIZING_ENV, "on")
+    control["document"] = _rates_status()
+    assert admin("POST", "/admin/v1/jobs", _order(cap=0.25, max_price_usd_per_mtoken=CEILING)).status_code == 201
+    _with_cap(admin, "order-eval-p1", 0.10)
+    _with_cap(admin, "default", 0.875)
+    # The room is 0.125, so 0.105 with a start kept free: under 10 % over 0.10.
+    assert _resize_asking_the_full_cap(admin, control) == 0
+    assert admin.registry["entries"]["order-eval-p1"].params["cap"] == 0.10
 
 
 def test_a_resize_never_passes_the_asked_cap(admin, pins, rates, control, monkeypatch):  # noqa: F811
