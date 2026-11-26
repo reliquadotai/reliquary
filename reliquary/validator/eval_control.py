@@ -124,13 +124,15 @@ MIN_MEASURED_BUSY_SECONDS = 120.0
 # only after CLEAN_STREAK of them, so a card failing one call in two does not keep its work.
 LOST_RESULT_STRIKES = 2
 CLEAN_STREAK = 5
-# An audit lease lives twice the time the model's recent results took per item, for its items and those the
+# An audit lease lives twice the time the model's recent results took per token, for its tokens and those the
 # card already holds, plus LEASE_OVERHEAD_SECONDS, within [AUDIT_LEASE_FLOOR_SECONDS, the dispatcher's lease
-# seconds]; the dispatcher's lease seconds until LEASE_TIMES_NEEDED results were timed.
+# seconds]; the dispatcher's lease seconds until LEASE_TIMES_NEEDED results were timed. Per token, not per
+# item: one model audits short completions and long agentic episodes from the same queue.
 AUDIT_LEASE_FLOOR_SECONDS = 60.0
 LEASE_OVERHEAD_SECONDS = 30.0
 LEASE_TIMES_KEPT = 20
 LEASE_TIMES_NEEDED = 3
+QUARANTINE_REASONS_KEPT = 20
 HEARTBEAT_WRITE_SECONDS = 30.0
 EVAL_CONTROL_STATUS_KEY = "reliquary/eval/control/status.json"
 # The miners document every order shares: a hotkey's probation progress carries
@@ -304,6 +306,11 @@ class EvalExecutorDirectory:
                       and (d.get("status") == "quarantined" or d.get(WAS_QUARANTINED) is True))
 
 
+def _tokens(items) -> int:
+    """The tokens an audit of ``items`` scores."""
+    return sum(len(item["tokens"]) for item in items)
+
+
 def _placement(document: dict) -> tuple[str, str] | None:
     """Where an executor runs; None when it cannot be told apart from others."""
     provider, host = document.get("provider_id"), document.get("host")
@@ -371,7 +378,7 @@ class PairedAuditDispatcher:
         self._strikes: collections.Counter = collections.Counter()
         # Per executor, results delivered in time since its last lost one.
         self._clean: collections.Counter = collections.Counter()
-        # Per model, seconds per item its recent results took from grant to result.
+        # Per model, seconds per token its recent results took from grant to result.
         self._lease_times: dict[ModelKey, collections.deque] = collections.defaultdict(
             lambda: collections.deque(maxlen=LEASE_TIMES_KEPT))
         self._seen: dict[str, float] = {}
@@ -387,6 +394,8 @@ class PairedAuditDispatcher:
         self.attention: dict[str, list[str]] = collections.defaultdict(list)
         self.parked: collections.Counter = collections.Counter()
         self.quarantined: set[str] = set()
+        # The last quarantines and why, for the status: the registry keeps only the latest status reason.
+        self.quarantine_reasons: collections.OrderedDict[str, str] = collections.OrderedDict()
         self.stats = collections.Counter()
         # Throughput: per executor, since when it holds a lease; per model, (when, items scored, completion
         # tokens, prompt tokens) and (when it ended, busy seconds) of the last THROUGHPUT_WINDOW_SECONDS.
@@ -529,8 +538,8 @@ class PairedAuditDispatcher:
                 continue
             now = self._clock()
             lease = _Lease(lease_id=secrets.token_hex(16), batch=batch, executor_id=executor_id,
-                           expires_at=now + self.lease_time(batch.model, len(batch.items)
-                                                            + sum(len(h.batch.items) for h in held)),
+                           expires_at=now + self.lease_time(batch.model, _tokens(batch.items)
+                                                            + sum(_tokens(h.batch.items) for h in held)),
                            granted_at=now)
             self._leases[lease.lease_id] = lease
             self._mark_busy(executor_id, batch.model)
@@ -550,14 +559,14 @@ class PairedAuditDispatcher:
             }
         return None
 
-    def lease_time(self, model: ModelKey, items: int) -> float:
-        """Seconds an audit lease of ``items`` items (its own and those its card already holds) lives."""
+    def lease_time(self, model: ModelKey, tokens: int) -> float:
+        """Seconds an audit lease of ``tokens`` tokens (its own and those its card already holds) lives."""
         times = self._lease_times.get(model)
         if not times or len(times) < LEASE_TIMES_NEEDED:
             return self._lease_seconds
-        per_item = statistics.median(times)
+        per_token = statistics.median(times)
         return min(self._lease_seconds,
-                   max(AUDIT_LEASE_FLOOR_SECONDS, 2.0 * per_item * max(1, items) + LEASE_OVERHEAD_SECONDS))
+                   max(AUDIT_LEASE_FLOOR_SECONDS, 2.0 * per_token * max(1, tokens) + LEASE_OVERHEAD_SECONDS))
 
     def lease_of(self, lease_id: str) -> _Lease | None:
         return self._leases.get(lease_id)
@@ -577,9 +586,9 @@ class PairedAuditDispatcher:
             self._clean[executor_id] += 1
             if self._clean[executor_id] >= CLEAN_STREAK:
                 self._strikes[executor_id] = 0
-            if batch.items:
+            if _tokens(batch.items):
                 self._lease_times[batch.model].append(
-                    (self._clock() - lease.granted_at) / len(batch.items))
+                    (self._clock() - lease.granted_at) / _tokens(batch.items))
         scores = result.scores
         if len(scores) != len(batch.items) or any(_misfit(s, item) for s, item in zip(scores, batch.items)):
             raise LeaseRefused(422, "result_does_not_fit_the_lease")
@@ -783,7 +792,8 @@ class PairedAuditDispatcher:
                 for job_id, reasons in self.attention.items() if reasons}
         return {"schema": "reliquary/eval-control-status/v1", "updated_at": self._clock(),
                 "models": models, "jobs": jobs,
-                "quarantined": sorted(self.quarantined), "stats": dict(self.stats)}
+                "quarantined": sorted(self.quarantined),
+                "quarantine_reasons": dict(self.quarantine_reasons), "stats": dict(self.stats)}
 
     async def load_quarantined(self) -> list[str]:
         """Quarantines the registry holds that this process has not heard of (it forgets its own at a restart): each
@@ -799,6 +809,9 @@ class PairedAuditDispatcher:
             return
         logger.error("eval audit executor %s quarantined: %s", executor_id, reason)
         self.quarantined.add(executor_id)
+        self.quarantine_reasons[executor_id] = reason
+        while len(self.quarantine_reasons) > QUARANTINE_REASONS_KEPT:
+            self.quarantine_reasons.popitem(last=False)
         self._directory.revoke_locally(executor_id)
         self.stats["quarantined_loaded" if recorded else "quarantined"] += 1
         for lease_id, lease in list(self._leases.items()):

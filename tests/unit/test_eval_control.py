@@ -613,15 +613,53 @@ def test_an_audit_lease_lives_twice_the_measured_time_for_its_items():
         now = [0.0]
         h = _Harness(scorers=1)
         h.dispatcher._clock = lambda: now[0]
+        tokens = sum(len(item["tokens"]) for item in ITEMS)
         await _one_lease(h, now, deliver=True)
         # One result timed: still the dispatcher's lease seconds.
-        assert h.dispatcher.lease_time(MODEL_A, len(ITEMS)) == h.dispatcher._lease_seconds
+        assert h.dispatcher.lease_time(MODEL_A, tokens) == h.dispatcher._lease_seconds
         for _ in range(LEASE_TIMES_NEEDED - 1):
             await _one_lease(h, now, deliver=True)
-        # Each result took 10 s for 2 items: 5 s an item, twice for 2 items, plus the overhead, over the floor.
-        expected = max(AUDIT_LEASE_FLOOR_SECONDS, 2 * 5.0 * len(ITEMS) + LEASE_OVERHEAD_SECONDS)
-        assert h.dispatcher.lease_time(MODEL_A, len(ITEMS)) == expected
-        assert h.dispatcher.lease_time(MODEL_A, 100) == h.dispatcher._lease_seconds   # never past the ceiling
+        # Each result took 10 s for its tokens: twice that, plus the overhead, over the floor.
+        expected = max(AUDIT_LEASE_FLOOR_SECONDS, 2 * 10.0 + LEASE_OVERHEAD_SECONDS)
+        assert h.dispatcher.lease_time(MODEL_A, tokens) == pytest.approx(expected)
+        assert h.dispatcher.lease_time(MODEL_A, 100 * tokens) == h.dispatcher._lease_seconds   # never past the ceiling
         lease = await _one_lease(h, now, deliver=True)
-        assert lease["expires_at"] == now[0] - 10.0 + expected
+        assert lease["expires_at"] == pytest.approx(now[0] - 10.0 + expected)
+    _run(go)
+
+
+def test_short_results_never_shorten_the_lease_of_a_long_episode():
+    from reliquary.validator.eval_control import LEASE_TIMES_NEEDED
+
+    async def go():
+        now = [0.0]
+        h = _Harness(scorers=1)
+        h.dispatcher._clock = lambda: now[0]
+        for _ in range(LEASE_TIMES_NEEDED):
+            await _one_lease(h, now, deliver=True)      # 7 tokens in 10 s
+        tokens = sum(len(item["tokens"]) for item in ITEMS)
+        short = h.dispatcher.lease_time(MODEL_A, tokens)
+        # Same number of items, 1 000 times the tokens: the lease grows with them, up to the ceiling.
+        assert h.dispatcher.lease_time(MODEL_A, 1000 * tokens) > short
+        assert h.dispatcher.lease_time(MODEL_A, 1000 * tokens) == h.dispatcher._lease_seconds
+        episode = [{"tokens": list(range(6000)), "prompt_len": 2, "proofs": ["p"]},
+                   {"tokens": list(range(6000)), "prompt_len": 1, "proofs": ["q"]}]
+        scoring = asyncio.ensure_future(h.dispatcher.view(*MODEL_A, PROOF).score(episode))
+        await asyncio.sleep(0)
+        lease = h.dispatcher.claim(_executor("a"))
+        assert lease["expires_at"] == now[0] + h.dispatcher._lease_seconds
+        scoring.cancel()
+    _run(go)
+
+
+def test_the_status_says_why_an_executor_was_quarantined():
+    async def go():
+        now = [0.0]
+        h = _Harness(scorers=1)
+        h.dispatcher._clock = lambda: now[0]
+        await _one_lease(h, now, deliver=False)
+        await _one_lease(h, now, deliver=False)
+        status = h.dispatcher.status()
+        assert status["quarantined"] == ["a"]
+        assert "leases expired" in status["quarantine_reasons"]["a"]
     _run(go)
