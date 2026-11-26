@@ -22,6 +22,7 @@ import os
 import urllib.parse
 import urllib.request
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 
 from reliquary.ledger.obligations import (
@@ -141,14 +142,28 @@ class DirectoryArchives:
 # -- price ceilings --------------------------------------------------------------------------------------------
 
 
-def registry_ceilings(declared: Mapping) -> tuple[dict[str, list[Ceiling]], dict[str, float], list[str]]:
-    """From the registry's entries: each period task's price ceiling (with its
-    pricing, known for sure here: no ``pricing`` param is a fixed ceiling), each
-    one's pay ceiling (``cp.pay_ceiling``), and the tasks declaring an incentive
-    floor (the weight setter then pays their small hotkeys less than they earned)."""
+@dataclass(frozen=True, slots=True)
+class RegistryView:
+    """What the ledger and the payer read of the registry: each period task's
+    price ceiling (with its pricing, known for sure here: no ``pricing`` param
+    is a fixed ceiling), each one's pay ceiling (``cp.pay_ceiling``), the tasks
+    declaring an incentive floor (the weight setter then pays their small
+    hotkeys less than they earned), and the tasks on the collector rail."""
+
+    ceilings: dict[str, list[Ceiling]]
+    pay_ceilings: dict[str, float]
+    floored: list[str]
+    collector_tasks: list[str]
+
+
+def registry_ceilings(declared: Mapping) -> RegistryView:
+    """The ``RegistryView`` of the registry's entries."""
+    from reliquary.shared.task_registry import PAYOUT_RAIL_COLLECTOR, payout_rail
+
     ceilings: dict[str, list[Ceiling]] = {}
     pay_ceilings: dict[str, float] = {}
     floored: list[str] = []
+    collector: list[str] = []
     for task_id, entry in (declared or {}).items():
         params = getattr(entry, "params", None)
         if not isinstance(params, Mapping) or not cp.is_period_task(entry):
@@ -162,10 +177,13 @@ def registry_ceilings(declared: Mapping) -> tuple[dict[str, list[Ceiling]], dict
             pay_ceilings[str(task_id)] = bound
         if float(params.get("min_incentive_share") or 0.0) > 0:
             floored.append(str(task_id))
-    return ceilings, pay_ceilings, sorted(floored)
+        if payout_rail(params) == PAYOUT_RAIL_COLLECTOR:
+            collector.append(str(task_id))
+    return RegistryView(ceilings=ceilings, pay_ceilings=pay_ceilings, floored=sorted(floored),
+                        collector_tasks=sorted(collector))
 
 
-async def read_registry_ceilings(**client_kwargs):
+async def read_registry_ceilings(**client_kwargs) -> RegistryView:
     """``registry_ceilings`` of the registry in the bucket (read, never written)."""
     from reliquary.infrastructure.task_registry_store import read_registry
 
@@ -368,6 +386,7 @@ __all__ = [
     "BucketArchives",
     "DEFAULT_API",
     "DirectoryArchives",
+    "RegistryView",
     "api_ceilings",
     "api_pending",
     "chain_alpha_per_period",
