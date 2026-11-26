@@ -236,49 +236,132 @@ def _resize_asking_the_full_cap(admin, control):
     return asyncio.run(admin.app.state.resize_order_caps())
 
 
-def test_a_refused_raise_takes_the_free_room_with_a_new_orders_start_kept_free(
-        admin, pins, rates, control, monkeypatch):  # noqa: F811
+def _declare(admin, job_id):
+    return admin("POST", "/admin/v1/jobs", _order(job_id=job_id, cap=0.25, max_price_usd_per_mtoken=CEILING))
+
+
+def test_a_refused_raise_takes_the_free_room_with_a_new_orders_start_kept_free(  # noqa: F811
+        admin, pins, rates, control, monkeypatch):
     # 2026-11-25: a retired RL task's stranded cap left little room; an order refused at 0.25 every 5 minutes
-    # stayed at 0.0323 for hours while 0.152 was free.
+    # stayed at 0.0323 for hours when it could have held 0.152 (0.1197 free).
     from tests.unit.test_jobs_cli import _rl_entry
 
     monkeypatch.setenv(sizing.SIZING_ENV, "on")
     control["document"] = _rates_status()
-    assert admin("POST", "/admin/v1/jobs", _order(cap=0.25, max_price_usd_per_mtoken=CEILING)).status_code == 201
+    assert _declare(admin, "order-eval-p1").status_code == 201
     _with_cap(admin, "default", 0.3)
     admin.registry["entries"]["order-train-x"] = replace(_rl_entry("order-train-x", 0.55), status="retired",
                                                          retired_at=7)
     assert _resize_asking_the_full_cap(admin, control) == 1
     params = admin.registry["entries"]["order-eval-p1"].params
-    assert params["cap"] == pytest.approx(1.0 - 0.3 - 0.55 - sizing.START_CAP)
+    assert params["cap"] == pytest.approx(1.0 - 0.3 - 0.55 - sizing.NEW_ORDER_RESERVE, abs=1e-6)
+    assert params["cap"] <= 1.0 - 0.3 - 0.55 - sizing.NEW_ORDER_RESERVE + 1e-9    # the registry's tolerance
     assert params[sizing.CAP_MAX_PARAM] == 0.25
     assert admin.registry["entries"]["order-train-x"].params["cap"] == 0.55     # a retired cap is never touched
 
 
-def test_a_clamped_raise_stays_within_the_admin_pool(admin, pins, rates, control, monkeypatch):  # noqa: F811
+def test_a_raise_stays_within_the_admin_pool(admin, pins, rates, control, monkeypatch):  # noqa: F811
     monkeypatch.setenv(sizing.SIZING_ENV, "on")
     control["document"] = _rates_status()
-    assert admin("POST", "/admin/v1/jobs", _order(cap=0.25, max_price_usd_per_mtoken=CEILING)).status_code == 201
-    created = admin("POST", "/admin/v1/jobs", _order(job_id="order-eval-p2", cap=0.25,
-                                                     max_price_usd_per_mtoken=CEILING))
+    assert _declare(admin, "order-eval-p1").status_code == 201
+    created = _declare(admin, "order-eval-p2")
     assert created.status_code == 201, created.text
     _with_cap(admin, "order-eval-p2", 0.2)
     assert _resize_asking_the_full_cap(admin, control) == 1
     # The admin pool is 0.3 and the other order holds 0.2 of it.
-    assert admin.registry["entries"]["order-eval-p1"].params["cap"] == pytest.approx(0.3 - 0.2 - sizing.START_CAP)
+    cap = admin.registry["entries"]["order-eval-p1"].params["cap"]
+    assert cap == pytest.approx(0.3 - 0.2 - sizing.NEW_ORDER_RESERVE, abs=1e-6)
     assert admin.registry["entries"]["order-eval-p2"].params["cap"] == 0.2
 
 
-def test_a_clamp_gaining_under_the_minimum_change_is_not_written(
-        admin, pins, rates, control, monkeypatch):  # noqa: F811
+def test_a_raise_that_fits_still_keeps_a_new_orders_start_free(  # noqa: F811
+        admin, pins, rates, control, monkeypatch):
+    # The registry would take 0.25 (0.03 + 0.25 is within the 0.3 pool), which would leave no room for a start.
     monkeypatch.setenv(sizing.SIZING_ENV, "on")
     control["document"] = _rates_status()
-    assert admin("POST", "/admin/v1/jobs", _order(cap=0.25, max_price_usd_per_mtoken=CEILING)).status_code == 201
+    assert _declare(admin, "order-eval-p1").status_code == 201
+    assert _declare(admin, "order-eval-p2").status_code == 201
+    _with_cap(admin, "order-eval-p2", 0.03)
+    assert _resize_asking_the_full_cap(admin, control) == 1
+    cap = admin.registry["entries"]["order-eval-p1"].params["cap"]
+    assert cap == pytest.approx(0.3 - 0.03 - sizing.NEW_ORDER_RESERVE, abs=1e-6) and cap < 0.25
+
+
+def test_the_rounding_never_eats_into_the_reserve(admin, pins, rates, control, monkeypatch):  # noqa: F811
+    monkeypatch.setenv(sizing.SIZING_ENV, "on")
+    control["document"] = _rates_status()
+    assert _declare(admin, "order-eval-p1").status_code == 201
+    assert _declare(admin, "order-eval-p2").status_code == 201
+    _with_cap(admin, "order-eval-p2", 0.0123454321)       # more decimals than a written cap keeps
+    assert _resize_asking_the_full_cap(admin, control) == 1
+    entries = admin.registry["entries"]
+    held = entries["order-eval-p1"].params["cap"] + entries["order-eval-p2"].params["cap"]
+    assert 0.3 - held >= sizing.NEW_ORDER_RESERVE
+    # A new order still starts.
+    assert _declare(admin, "order-eval-p3").status_code == 201
+
+
+def test_a_raise_gaining_under_the_minimum_change_is_not_written(  # noqa: F811
+        admin, pins, rates, control, monkeypatch):
+    monkeypatch.setenv(sizing.SIZING_ENV, "on")
+    control["document"] = _rates_status()
+    assert _declare(admin, "order-eval-p1").status_code == 201
     _with_cap(admin, "order-eval-p1", 0.10)
-    _with_cap(admin, "default", 0.875)
-    # The room is 0.125, so 0.105 with a start kept free: under 10 % over 0.10.
+    _with_cap(admin, "default", 0.845)
+    # The room is 0.155, so 0.105 with the reserve kept free: under 10 % over 0.10.
     assert _resize_asking_the_full_cap(admin, control) == 0
     assert admin.registry["entries"]["order-eval-p1"].params["cap"] == 0.10
+
+
+def test_a_raise_never_lowers_a_cap(admin, pins, rates, control, monkeypatch):  # noqa: F811
+    monkeypatch.setenv(sizing.SIZING_ENV, "on")
+    control["document"] = _rates_status()
+    assert _declare(admin, "order-eval-p1").status_code == 201
+    _with_cap(admin, "order-eval-p1", 0.10)
+    _with_cap(admin, "default", 0.875)
+    # The room is 0.125, so 0.075 with the reserve kept free: below the cap held.
+    assert _resize_asking_the_full_cap(admin, control) == 0
+    assert admin.registry["entries"]["order-eval-p1"].params["cap"] == 0.10
+
+
+def test_a_raise_never_overwrites_a_concurrent_write(admin, pins, rates, control, monkeypatch):  # noqa: F811
+    from reliquary.infrastructure import task_registry_store as store
+    from tests.unit.test_jobs_cli import _rl_entry
+
+    monkeypatch.setenv(sizing.SIZING_ENV, "on")
+    control["document"] = _rates_status()
+    assert _declare(admin, "order-eval-p1").status_code == 201
+    _with_cap(admin, "default", 0.3)
+    admin.registry["entries"]["order-train-x"] = replace(_rl_entry("order-train-x", 0.55), status="retired",
+                                                         retired_at=7)
+    written = store.set_task_cap
+
+    async def racing(task_id, cap, **kwargs):
+        _with_cap(admin, "order-eval-p1", 0.145)     # an operator's PATCH lands first
+        return await written(task_id, cap, **kwargs)
+
+    monkeypatch.setattr(store, "set_task_cap", racing)
+    assert _resize_asking_the_full_cap(admin, control) == 0
+    assert admin.registry["entries"]["order-eval-p1"].params["cap"] == 0.145
+
+
+def test_a_paused_or_closing_order_is_never_raised(admin, pins, rates, control, monkeypatch):  # noqa: F811
+    monkeypatch.setenv(sizing.SIZING_ENV, "on")
+    control["document"] = _rates_status()
+    assert _declare(admin, "order-eval-p1").status_code == 201
+    entry = admin.registry["entries"]["order-eval-p1"]
+    admin.registry["entries"]["order-eval-p1"] = replace(entry, admission="paused")
+    assert _resize_asking_the_full_cap(admin, control) == 0
+    admin.registry["entries"]["order-eval-p1"] = entry
+    _with_cap(admin, "order-eval-p1", 0.0)
+    assert _resize_asking_the_full_cap(admin, control) == 0
+    assert admin.registry["entries"]["order-eval-p1"].params["cap"] == 0.0
+
+
+def test_the_reserve_holds_any_new_orders_start():
+    from reliquary.admin.training import DEFAULT_TRAINING_CAP
+
+    assert sizing.NEW_ORDER_RESERVE >= max(sizing.START_CAP, DEFAULT_TRAINING_CAP)
 
 
 def test_a_resize_never_passes_the_asked_cap(admin, pins, rates, control, monkeypatch):  # noqa: F811

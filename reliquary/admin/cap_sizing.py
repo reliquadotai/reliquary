@@ -32,6 +32,9 @@ RESIZE_SECONDS = 300.0
 RESIZE_MIN_CHANGE = 0.1
 # A new order's cap (or one paying nothing yet): its pay raises it within a resize or two.
 START_CAP = 0.02
+# Kept free by every raise (``admin.service.bounded_raise``): room for any new order's start, a corpus order's
+# (``START_CAP``) or a training order's (``admin.training.DEFAULT_TRAINING_CAP``, 0.05; a test pins it).
+NEW_ORDER_RESERVE = 0.05
 # Early in a period, its accrued value is projected over at least this share of the period: at most x4.
 MIN_ELAPSED_SHARE = 0.25
 
