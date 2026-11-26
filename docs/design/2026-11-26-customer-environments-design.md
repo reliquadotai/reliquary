@@ -1,6 +1,8 @@
 # Customer environments: a private hub, run in the order's own sandboxes
 
-Status: draft, nothing implemented.
+Status: steps 1, 2 and 4 implemented (`reliquary/orders/graders.py`, `reliquary/customer_env/`), not deployed.
+Step 3 (platform) on its own branch. RL training orders on a customer env and step 5 (agentic) are open: see
+"Implementation status".
 
 ## Why
 
@@ -201,3 +203,41 @@ later choice: one path for everything, at the cost of a round trip per group.
 
 * The allowance's size, once qualification costs are measured.
 * Latency of the reward server round trip on the RL critical path: to be measured on a group of 512.
+
+## Implementation status
+
+| piece | where | state |
+|---|---|---|
+| declarative graders `numeric_v1`, `choice_v1`, `json_match_v1` | `orders/graders.py` | done |
+| package checks (shape only, never unpacked on the admin host) | `customer_env/package.py` | done |
+| our Dockerfile, base image, build and push by digest | `customer_env/image.py`, `docker/customer-env/Dockerfile.base` | done; base not pushed (`BASE_IMAGE` is a placeholder digest) |
+| reward worker (stdio JSON lines, protocol on its own descriptor) | `customer_env/worker.py` | done |
+| sealed container (gVisor, no network, read-only, nobody, limits) and its client | `customer_env/runner.py` | done |
+| reward host and builder host (mTLS, our registry only, warm or fresh sandbox) | `customer_env/host.py` | done; no host deployed |
+| version index, qualification (examples, determinism, warm cost) | `customer_env/registry.py`, `qualify.py` | done |
+| admin routes, order sets through the upload compiler | `customer_env/admin.py`, `orders.py` | done |
+| eval grading of customer rows on the reward host | `eval/grading.py`, `customer_env/scoring.py` | done |
+| customer env as a registry environment (frozen rows, remote rewards) | `customer_env/rl.py`, `environment/registry.py` | done |
+| packing tool, Prime Hub import (`prime env pull`) | `customer_env/pack.py` | done |
+| RL training orders naming a customer env | `admin/training.py`, `protocol/profiles.py` | **open**: a training order's envs must be in a static profile; a customer env needs a per-order profile entry (max tokens, cooldown) |
+| miners reading a customer env's rows | `RELIQUARY_CUSTOMER_ENV_ROWS_DIR` | **open**: the controller must mirror `prompts.jsonl` to its miners |
+| batch `filter`/`annotate` with a customer env | orders delivery | **open** |
+| agentic customer images on the gateways | reliquary-sandbox | **open** (refused today as `agentic_not_supported`) |
+
+Verified: unit tests (`tests/unit/test_customer_env_*.py`, `test_order_reference_graders.py`) and a Docker run
+(`RELIQUARY_DOCKER_TESTS=1 pytest tests/unit/test_customer_env_docker.py`, runc here; gVisor to run on the reward
+host): the toy env packs, builds, qualifies for every use at 2.5 ms per item, and from inside the sealed container
+has no egress, no write outside `/tmp`, no exec in `/tmp`, no setuid.
+
+## Deploying
+
+1. Push the base: `docker build -f docker/customer-env/Dockerfile.base` to `registry.reliqua.ai/customer-envs/base`,
+   set `image.BASE_IMAGE` to its digest.
+2. A builder host (no secret; registry push; egress to package indexes): `python -m reliquary.customer_env.host
+   --build` with TLS cert, key and client CA.
+3. Reward hosts (no secret; registry pull; `runsc` installed as a Docker runtime): `python -m
+   reliquary.customer_env.host` with TLS. One per training for RL (the training's own sandbox), a shared pool for
+   evaluations.
+4. Admin host: `RELIQUARY_CUSTOMER_ENV_DB`, `RELIQUARY_BUILDER_URL`, `RELIQUARY_REWARD_HOST_URL`,
+   `RELIQUARY_REWARD_HOST_CLIENT_CERT`/`_CLIENT_KEY`/`_CA`. Unset, the routes answer 503.
+5. Run the Docker test on a reward host with `RELIQUARY_DOCKER_RUNTIME=runsc` before opening the routes.
