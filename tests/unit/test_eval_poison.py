@@ -1129,6 +1129,58 @@ def test_a_pass_parked_in_a_re_audit_is_retried_alone():
     _run(go)
 
 
+def test_a_re_audit_in_slices_keeps_the_passes_parked_in_each_slice_in_flight(monkeypatch):
+    """The re-audit reads and audits a quarantined executor's passes in slices, several at once, each slice's audit
+    in a task of its own (`_reaudit_in_slices`). A pass parked in any of those slices is recorded in that task
+    (`_record_park` reads `_REAUDIT_PARKED` there) and kept on the executor's list with its cool-down, neither
+    voided nor charged, while a failure beside it is voided as usual. Once cooled down, each is tried again alone and
+    leaves the list. Recorded outside the re-audit, a parked pass would leave the list unaudited and stay paid."""
+    from reliquary.validator import corpus_auditor
+
+    monkeypatch.setattr(corpus_auditor, "REAUDIT_SLICE_RECORDS", 3)
+    monkeypatch.setattr(corpus_auditor, "REAUDIT_SLICES_IN_FLIGHT", 3)
+
+    async def go():
+        remote, clock = _Remote(), _Clock(50_000.0)
+        sids = [f"s{k}" for k in range(9)]
+        records = _Records({sid: _record(sid, 10 + k) for k, sid in enumerate(sids)})
+        auditor = _order_auditor(records, clock, remote)
+        auditor._late_reaudits["x"] = asyncio.get_running_loop().create_future()   # no background retry here
+        auditor._remote_scored["x"] = list(sids)
+        parked = ["s1", "s4", "s7"]
+        remote.lost.update({11, 14, 17})
+        remote.failing.add(15)                             # s5: a failure, beside s4 in the listing
+        score, in_flight = remote.score, {"now": 0, "most": 0}
+
+        async def overlapping(items):
+            # Each call is answered later, as the executors do: the slices in flight overlap.
+            in_flight["now"] += 1
+            in_flight["most"] = max(in_flight["most"], in_flight["now"])
+            try:
+                await asyncio.sleep(0.01)
+                return await score(items)
+            finally:
+                in_flight["now"] -= 1
+
+        remote.score = overlapping
+        assert await auditor.reaudit_executor("x") == ["s5"]
+        assert in_flight["most"] >= 2, "the slices were not audited at once"
+        holding = [k for k, marks in enumerate(remote.calls) if set(marks) & {11, 14, 17}]
+        assert len(holding) >= 2, f"the parked passes were not spread over several slices: {remote.calls}"
+        assert set(records.voided) == {"s5"}
+        assert auditor._remote_scored.get("x") == parked and set(auditor._reaudit_parked) == set(parked)
+        assert not set(parked) & auditor.parked_ids
+        clock.now += RETRY
+        remote.lost.clear()
+        remote.calls.clear()
+        assert await auditor.reaudit_executor("x") == []
+        assert sorted(remote.calls) == [[11], [14], [17]]  # each alone
+        assert not auditor._remote_scored.get("x") and not auditor._reaudit_parked
+        assert set(records.voided) == {"s5"}
+        auditor._late_reaudits["x"].cancel()
+    _run(go)
+
+
 def test_a_loss_resets_the_clean_streak():
     async def go():
         pool = _Pool()
