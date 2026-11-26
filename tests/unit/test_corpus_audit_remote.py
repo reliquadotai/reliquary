@@ -1343,6 +1343,33 @@ def test_after_a_restart_a_hotkeys_passes_of_a_healthy_executor_count_too(monkey
     assert [records.voided[sid]["penalty"] for sid in drifts] == [False] * 3 and "5Y" not in states.states
 
 
+def test_after_a_restart_the_reaudit_charges_the_latest_drift(monkeypatch):
+    """Three passes of 5X scored by pod-1, received 10 s apart, their ids in the reverse order, and a fourth of 5X by
+    pod-2 received between the last two. After a restart pod-1's passes are listed in id order; the re-audit counts
+    its drifts in receipt order, as the judging passes took them, so the frequent-refusals charge lands on the latest
+    drift, and at q < 1 its forfeit reaches the pod-2 pass. In id order it landed on the oldest, and forfeited only
+    up to it."""
+    from tests.unit.test_eval_draw import _job as draw_job
+
+    records, states = _VoidingRecords({}), _States()
+    _population(records, refusals=0)
+    oldest, middle, latest, honest = "c" * 64, "b" * 64, "a" * 64, "d" * 64
+    for k, sid in enumerate((oldest, middle, latest)):
+        _written(records, sid, "5X", scored_by=["pod-1"], received_at=99_000.0 + 10 * k)
+    _written(records, honest, "5X", scored_by=["pod-2"], received_at=99_015.0)
+    auditor = _restart(records, states, draw_job(), q=0.25)
+
+    async def audit(batch, *, local=False):
+        return [{**_DRAW_REFUSAL, "penalty": False} if r["hotkey"] == "5X" else dict(_PASSING) for r in batch]
+
+    monkeypatch.setattr(auditor, "_audit_outcomes", audit)
+    asyncio.run(auditor.restore_scored())
+    assert [records.voided[sid].get("charged_for") for sid in (oldest, middle, latest)] == [
+        None, None, "frequent_refusals"]
+    assert states.states["5X"].failure_ids == [latest] and states.states["5X"].forfeit_before == 99_020.0
+    assert records.voided[honest]["reason"] == "forfeited"
+
+
 def test_a_reaudit_counts_no_pass_it_confirms_twice(monkeypatch):
     """Without a restart, every pass the re-audit confirms was counted by its judging pass, and stays counted once:
     5X's three passes stay three audits. Counted again (`_draw_counted` not checked where the re-audit counts them),

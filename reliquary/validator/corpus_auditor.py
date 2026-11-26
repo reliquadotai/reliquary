@@ -1890,10 +1890,10 @@ class CorpusAuditor:
         for frequent refusals; charged or not, its slot reopens as soon as its
         void is written, as that pass reopens every refused sample's (`_write`).
         The draw counts take what that pass counts: each forced-draw refusal
-        repeated as a refusal of its hotkey (`_recount_refusal`), and each pass
-        confirmed that this process never counted as a passing audit
-        (`_count_refusal`); a judge's restart counts every audit written before
-        it first (`EvalAuditor.restore_scored`)."""
+        repeated as a refusal of its hotkey (`_recount_refusal`, in receipt
+        order), and each pass confirmed that this process never counted as a
+        passing audit (`_count_refusal`); a judge's restart counts every audit
+        written before it first (`EvalAuditor.restore_scored`)."""
         # Its outcomes computed ahead are not taken either: those records are audited again by their pass.
         self._ahead = {sid: outcome for sid, outcome in self._ahead.items()
                        if executor_id not in (outcome.get("scored_by") or ())}
@@ -1929,40 +1929,50 @@ class CorpusAuditor:
                 self._count_refusal(sid, records[sid]["hotkey"], outcome)
         drifts = {sid for sid, outcome in failed.items() if not outcome.get("penalty", True)}
         if failed:
+            # In receipt order, as the judging passes that wrote them took them: the rule then charges the latest
+            # drifts, whose forfeit (q < 1) reaches furthest. After a restart, the passes of an executor are listed in
+            # verdict id order (`EvalAuditor.restore_scored`), which has nothing to do with time.
+            failed = dict(sorted(failed.items(), key=lambda item: (
+                self._received(item[0], records[item[0]]) or 0.0, item[0])))
             for sid, outcome in failed.items():
                 # Its judging pass counted a pass: a forced-draw refusal now, as a judging pass that refused it
                 # counts one. A drift is charged if its hotkey is now refused far more often than the job's other
                 # hotkeys, as that pass would charge it; a penalised refusal comes back as it is.
                 failed[sid] = self._recount_refusal(sid, records[sid]["hotkey"], outcome)
+            writer = getattr(self._records, "write_voided", None)
             documents = {sid: {"schema": VOIDED_SCHEMA, "submission_id": sid, "hotkey": records[sid]["hotkey"],
                                "executor_id": executor_id, "reason": "executor_quarantined", "voided_at": now,
                                **outcome}
                          for sid, outcome in failed.items()}
+            # A refusal without penalty (forced-draw drift) is no confirmed failure: no suspicion, no ban, no forfeit,
+            # not even of its own pass. Still voided below: a judging pass would have refused it.
+            uncharged = {sid for sid, outcome in failed.items() if not outcome.get("penalty", True)}
+            if writer is not None:
+                for sid in uncharged:
+                    # Out of the stake before anything below awaits, so no decision meanwhile counts it. If the
+                    # escalation or a void write raises, it stays unvoided and payable until a retry voids it, but
+                    # out of the stake: its operator's later records are audited more often, never less, and a later
+                    # forfeit still voids it (it stays in `_paid`).
+                    self._unstake(sid)
             by_hotkey: dict[str, list[str]] = {}
-            for sid, outcome in failed.items():
-                # A refusal without penalty (forced-draw drift) is no confirmed failure: no suspicion, no ban,
-                # no forfeit. Still voided below: a judging pass would have refused it.
-                if outcome.get("penalty", True):
+            for sid in failed:
+                if sid not in uncharged:
                     by_hotkey.setdefault(records[sid]["hotkey"], []).append(sid)
             if by_hotkey:
                 # Its forfeit writes this re-audit's own void for each of its failures it voids (`_void_forfeited`).
                 await self._escalate(by_hotkey, now, {sid: self._received(sid, records[sid]) for sid in failed},
                                      documents=documents)
-            writer = getattr(self._records, "write_voided", None)
-            for sid, outcome in failed.items():
-                if writer is not None:
-                    document = documents[sid]
+            if writer is not None:
+                for sid, document in documents.items():
                     await writer(self._job_id, sid, document)
-                    if not outcome.get("penalty", True):
-                        # Uncharged, it forfeits nothing, not even its own pass (`_void_forfeited`): this takes it out
-                        # of the forfeit books (a later forfeit must not void it again; a list of the job's voids read
-                        # later holds it) and out of the stake.
+                    if sid in uncharged:
+                        # Out of the forfeit books: a later forfeit must not void it again (a list of the job's voids
+                        # read later holds it).
                         if self._voided_ids is not None:
                             self._voided_ids.add(sid)
                         hotkey = records[sid]["hotkey"]
                         if hotkey in self._paid:
                             self._paid[hotkey] = [paid for paid in self._paid[hotkey] if paid[1] != sid]
-                        self._unstake(sid)
                     if sid in drifts:
                         # A refused sample, charged for frequent refusals or not: its slot reopens before the status
                         # hears of the void, as a judging pass reopens every refused sample's (`_write`). A forfeit
