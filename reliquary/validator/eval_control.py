@@ -1912,7 +1912,10 @@ def eval_auditor(**kwargs):
         async def restore_scored(self) -> int:
             """A judge process that restarted: which executor scored each pass a quarantine could still void
             (unsettled, or settled inside the hold, as ``reaudit_executor`` chooses), read back from the verdicts,
-            then the re-audit of those scored by an executor already quarantined.
+            then the re-audit of those scored by an executor already quarantined, in slices, a few at once
+            (`REAUDIT_SLICES_IN_FLIGHT`). A pass that re-audit confirmed is re-audited again at every start, until it
+            is settled and its audit older than the hold: nothing durable records the confirmation (its verdict is
+            create-only). Its count is not added to again (`_count_draw`).
 
             On a forced-draw job, the draw counts first take every audit written before this process as the judging
             passes and re-audits that wrote them counted it (`_count_restored`): every verdict, voided or not, scored

@@ -193,3 +193,56 @@ def test_a_void_that_failed_is_raised_and_voided_by_the_next_try():
     assert asyncio.run(auditor._void_forfeited(states, T0 + 70)) == [sids[1]]
     assert set(store.voided) == set(sids)
     assert auditor._paid[HK] == []
+
+
+def test_a_processs_first_forfeit_reads_the_jobs_passes_a_few_at_a_time(monkeypatch):
+    """The first forfeit of a process reads every unsettled verdict of its job (`_load_paid`): with a task and a
+    whole verdict held per id until the last read, ~143 MiB for ~59k verdicts with read latency (synthetic
+    benchmark: fake store, synthetic verdicts). READ_CONCURRENCY in flight, only a pass's hotkey and receipt kept
+    past its read: the same passes, in the same order."""
+    import weakref
+
+    from reliquary.validator import corpus_auditor
+
+    monkeypatch.setattr(corpus_auditor, "READ_CONCURRENCY", 4)
+
+    class _Verdict(dict):
+        """A verdict a weak reference can follow."""
+
+    class Counting(_Store):
+        live = most_live = most_tasks = 0
+
+        async def read_verdict(self, job_id, sid):
+            await asyncio.sleep(0.001 * (int(sid, 16) % 3))         # out of order, as the store answers
+            Counting.most_tasks = max(Counting.most_tasks, len(asyncio.all_tasks()))
+            verdict = _Verdict(self.verdicts[sid])
+            Counting.live += 1
+            Counting.most_live = max(Counting.most_live, Counting.live)
+            weakref.finalize(verdict, Counting.drop)
+            return verdict
+
+        @staticmethod
+        def drop():
+            Counting.live -= 1
+
+    passes, theirs, settled, voided = (_ids(False, n, start=s) for n, s in ((30, 0), (5, 300), (3, 600), (3, 900)))
+    failed, undated, known = _ids(False, 4, start=1200), _ids(False, 2, start=1500), _ids(False, 1, start=1800)
+    store = Counting({})
+    for sid in [*passes, *settled, *voided, *known]:
+        store.verdicts[sid] = _paid(sid, received_at=T0 + int(sid, 16) % 50)
+    for sid in theirs:
+        store.verdicts[sid] = _paid(sid, hotkey=OTHER, received_at=T0)
+    for sid in failed:
+        store.verdicts[sid] = {**_paid(sid), "passed": False}
+    for sid in undated:
+        store.verdicts[sid] = {**_paid(sid), "received_at": None}
+    auditor = _judge(store, _States({HK: SAMPLED}), _Clock(T0 + 70), beacon=_Beacon())
+    auditor._voided_ids, auditor._paid[HK] = set(voided), [(T0, known[0])]
+    asyncio.run(auditor._load_paid(set(settled)))
+    assert auditor._paid_loaded
+    listed = sorted(store.verdicts)                                     # the order the store lists them in
+    assert auditor._paid == {
+        HK: [(T0, known[0])] + [(T0 + int(sid, 16) % 50, sid) for sid in listed if sid in passes],
+        OTHER: [(T0, sid) for sid in listed if sid in theirs]}
+    assert Counting.most_live <= 4           # the reads in flight (every verdict read, when held to the end)
+    assert Counting.most_tasks <= 4 + 1      # a worker per read in flight, and asyncio.run's own task
