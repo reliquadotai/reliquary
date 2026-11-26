@@ -6,6 +6,7 @@ No os.getenv() overrides. Changes require coordinated deployment.
 
 import math as _math
 import os as _os
+import re as _re
 
 from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE
 from reliquary.environment.grader import (
@@ -721,6 +722,38 @@ _UID_BURN_RAW = _os.environ.get("RELIQUARY_UID_BURN", "").strip()
 UID_BURN: int | None = int(_UID_BURN_RAW) if _UID_BURN_RAW else None
 if UID_BURN is not None and UID_BURN < 0:
     raise ValueError("RELIQUARY_UID_BURN must be a non-negative uid")
+
+# A collector for part of the unpaid share, instead of the burn. Both unset (the
+# default): everything unpaid burns as above.
+#
+# RELIQUARY_PAYOUT_HOTKEY is an SS58 hotkey, resolved to its UID at every
+# weight-set in the same metagraph snapshot as the owner's. With no UID there,
+# or held by the subnet owner's coldkey (the chain keeps an owner hotkey's
+# incentive), its part burns: never a guessed UID. RELIQUARY_PAYOUT_FRACTION
+# (0 to 1, default 0) is the part of the unpaid share it receives; the rest
+# burns. Every validator with a permit must set the same two values, or Yuma
+# consensus clips the collector's weight.
+def payout_settings(hotkey: str | None, fraction: str | None) -> tuple[str | None, float]:
+    """``(PAYOUT_HOTKEY, PAYOUT_FRACTION)`` from their environment values;
+    refuses anything that is not a hotkey and a fraction in [0, 1], and a
+    fraction above 0 without a hotkey."""
+    key = (hotkey or "").strip() or None
+    if key is not None and not _re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{46,48}", key):
+        raise ValueError(f"RELIQUARY_PAYOUT_HOTKEY={key!r} is not an SS58 address")
+    raw = (fraction or "").strip() or "0"
+    try:
+        share = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"RELIQUARY_PAYOUT_FRACTION={raw!r} is not a number") from exc
+    if not 0.0 <= share <= 1.0:  # NaN fails too
+        raise ValueError(f"RELIQUARY_PAYOUT_FRACTION must be in [0.0, 1.0], got {raw!r}")
+    if share > 0.0 and key is None:
+        raise ValueError("RELIQUARY_PAYOUT_FRACTION is set but RELIQUARY_PAYOUT_HOTKEY is not")
+    return key, share
+
+
+PAYOUT_HOTKEY, PAYOUT_FRACTION = payout_settings(_os.environ.get("RELIQUARY_PAYOUT_HOTKEY"),
+                                                 _os.environ.get("RELIQUARY_PAYOUT_FRACTION"))
 
 # ────────────────  CONTINUOUS VALIDATION  ────────────────
 
