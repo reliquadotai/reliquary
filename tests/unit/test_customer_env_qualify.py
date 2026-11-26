@@ -31,8 +31,16 @@ class Builder:
     def __init__(self, fail=None):
         self.fail, self.contexts = fail, []
 
-    def build(self, context, env):
-        self.contexts.append(sorted(p.name for p in context.iterdir()))
+    def build_archive(self, data, env):
+        import tempfile
+        from pathlib import Path
+
+        from reliquary.customer_env.image import write_context
+        from reliquary.customer_env.package import read_package
+
+        with tempfile.TemporaryDirectory() as tmp:
+            context = write_context(Path(tmp), data, read_package(data))
+            self.contexts.append(sorted(p.name for p in context.iterdir()))
         if self.fail:
             raise BuildFailed(self.fail)
         return IMAGE

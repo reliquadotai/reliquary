@@ -16,13 +16,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import tempfile
 import time
 from collections.abc import Callable
-from pathlib import Path
 
 from reliquary.customer_env import USES, parse_env_id
-from reliquary.customer_env.image import BuildFailed, write_context
+from reliquary.customer_env.image import BuildFailed
 from reliquary.customer_env.package import PackageInvalid, read_package
 from reliquary.customer_env.registry import Record, Registry, subnet_key
 from reliquary.customer_env.runner import RewardClient, RewardInfrastructureError
@@ -44,7 +42,7 @@ def rows_body(rows: list[dict]) -> bytes:
 
 
 class Qualifier:
-    """``read_object(key) -> bytes``; ``builder.build(context, env) -> image digest``; ``open_worker(image) ->
+    """``read_object(key) -> bytes``; ``builder.build_archive(data, env) -> image digest``; ``open_worker(image) ->
     RewardClient`` (a fresh sandbox each call); ``store.create_bytes(key, body)`` (the subnet bucket)."""
 
     def __init__(self, registry: Registry, *, read_object: Callable[[str], bytes], builder,
@@ -76,15 +74,16 @@ class Qualifier:
         if package.kind == "agentic":
             raise _Refused("agentic_not_supported",
                            "agentic environments run on the order's gateways: not served yet")
-        with tempfile.TemporaryDirectory(prefix="customer-env-") as tmp:
-            try:
-                context = write_context(Path(tmp), data, package)
-            except PackageInvalid as exc:
-                raise _Refused("package_invalid", str(exc)) from None
-            try:
-                image = self._builder.build(context, env)
-            except BuildFailed as exc:
-                raise _Refused("build_failed", str(exc)) from None
+        try:
+            from reliquary.customer_env.image import check_lock
+
+            check_lock(package)
+        except PackageInvalid as exc:
+            raise _Refused("package_invalid", str(exc)) from None
+        try:
+            image = self._builder.build_archive(data, env)
+        except BuildFailed as exc:
+            raise _Refused("build_failed", str(exc)) from None
         self._registry.update(record.env_id, status="qualifying", image_digest=image)
 
         first = self._open(image)

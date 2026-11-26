@@ -117,5 +117,21 @@ class DockerBuilder:
         return digests[0]
 
 
-__all__ = ["BASE_IMAGE", "BuildFailed", "DockerBuilder", "check_lock", "dockerfile", "image_tag", "manifest",
+@dataclass
+class LocalBuilder:
+    """``build_archive(data, env)`` on this host: the build context in a temporary directory, then ``inner``."""
+
+    inner: DockerBuilder
+
+    def build_archive(self, data: bytes, env: EnvId) -> str:
+        import tempfile
+
+        from reliquary.customer_env.package import read_package
+
+        package = read_package(data)
+        with tempfile.TemporaryDirectory(prefix="customer-env-") as tmp:
+            return self.inner.build(write_context(Path(tmp), data, package), env)
+
+
+__all__ = ["BASE_IMAGE", "BuildFailed", "DockerBuilder", "LocalBuilder", "check_lock", "dockerfile", "image_tag", "manifest",
            "write_context"]
