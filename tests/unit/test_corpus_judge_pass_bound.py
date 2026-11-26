@@ -29,7 +29,7 @@ def without_forfeit(monkeypatch):
 
     monkeypatch.setattr(corpus_auditor, "forfeits", lambda state, received_at: False)
 
-    async def nothing(self, states, now):
+    async def nothing(self, states, now, documents=None):
         return []
 
     monkeypatch.setattr(corpus_auditor.CorpusAuditor, "_void_forfeited", nothing)
