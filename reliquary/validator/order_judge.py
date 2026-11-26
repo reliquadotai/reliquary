@@ -166,7 +166,7 @@ class DispatchServer:
                                executor_id)
 
     def _unparked(self, job_id: str, batch_id: int) -> None:
-        """A batch parked on its losses got a scored answer: its records, in the judge, are tried again at once."""
+        """A batch parked on its losses got a measured answer: its records, in the judge, are tried again at once."""
         frame = encode_frame({"event": "unparked", "job": job_id, "batch": batch_id})
         for connection in list(self._connections):
             task = asyncio.ensure_future(self._send_event(connection, frame))
@@ -410,7 +410,7 @@ class RemotePoolView:
         self.listeners.append(listener)
 
     def subscribe_unparked(self, listener) -> None:
-        """``listener(batch_id)``: a batch of this order parked on its losses got a scored answer."""
+        """``listener(batch_id)``: a batch of this order parked on its losses got a measured answer."""
         self.unpark_listeners.append(listener)
 
     def quarantined(self) -> set[str]:

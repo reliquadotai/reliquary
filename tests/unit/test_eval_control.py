@@ -835,7 +835,7 @@ def test_a_card_answering_nothing_is_still_set_aside_after_two_lost_results():
         await _trained(h, now)
         scoring = [asyncio.ensure_future(h.dispatcher.view(*MODEL_A, PROOF).score(ITEMS)) for _ in range(2)]
         await asyncio.sleep(0)
-        for _ in range(2):                                 # a batch (benched from the one it lost), never answered
+        for _ in range(2):                                 # it takes a batch and never answers
             lease = h.dispatcher.claim(_executor("lost"))
             assert lease is not None
             now[0] = lease["expires_at"] + 1

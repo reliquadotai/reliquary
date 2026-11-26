@@ -167,15 +167,18 @@ LEASE_TIMES_KEPT = 20
 LEASE_TIMES_NEEDED = 3
 LEASE_TIMES_MAX_AGE_SECONDS = 3600.0
 # A parked record (neither a verdict nor a validator error: an item no executor can read, or a batch parked) is tried
-# again after PARK_RETRY_SECONDS, doubling up to MAX_PARK_RETRY_SECONDS, or at once when its batch gets a scored
-# answer; each retry audits it in a call of its own. It holds its period's close for two periods after its receipt at
-# most, as a record whose arrival cannot be read (corpus_auditor.UNKNOWN_ARRIVAL_GIVE_UP_SECONDS); then its period
-# closes without it and it no longer holds its operator's unaudited passes as a sibling. At q < 1 the verdicts of its
-# operator received in its period still wait for its decision (`settle_hold`, the stake guarantee); whatever is
-# decided late is paid late, within what is left of its period's budget.
+# again after PARK_RETRY_SECONDS, doubling up to MAX_PARK_RETRY_SECONDS, or at once when its batch gets a measured
+# answer; each retry audits it alone, in the background, so no judge pass waits on it. It holds its period's close two
+# periods after its receipt at most, as a record whose arrival cannot be read (corpus_auditor.
+# UNKNOWN_ARRIVAL_GIVE_UP_SECONDS); one parked with other records' items, until its first retry alone had
+# SOLO_RETRY_SECONDS to decide it too, so no honest batch-mate leaves first. Then its period closes without it and it no
+# longer holds its operator's unaudited passes as a sibling. At q < 1 its operator's verdicts of its period received up
+# to its receipt still wait for its decision (`settle_hold`, the stake guarantee); its own verdict, decided after its
+# period was settled without it, is paid within what is left of the period's cap (`settle_capped`).
 PARK_RETRY_SECONDS = 1800.0
 MAX_PARK_RETRY_SECONDS = 4 * 3600.0
 PARKED_CLOSE_GIVE_UP_SECONDS = 2.0 * PERIOD_SECONDS
+SOLO_RETRY_SECONDS = 600.0
 PARK_UNREADABLE = "unreadable"
 PARK_LOST = "parked"
 # Records without a submission id in them (tests' fakes) are told apart by identity, the last KNOWN_RECORDS read.
@@ -393,10 +396,11 @@ def _scored(result: AuditResult, items: Sequence[dict]) -> bool:
 
 
 def _measured(result: AuditResult, items: Sequence[dict]) -> bool:
-    """Whether ``result`` fits ``items`` and measured every one (ok, with its chunks or its draw's diagnostics): what
-    witnesses that its card scores. An answer of statuses with no measure (proof_undecodable) costs no GPU."""
-    return (_scored(result, items) and all(s.status == ITEM_OK for s in result.scores)
-            and any(s.chunks or s.draw is not None for s in result.scores))
+    """Whether ``result`` fits ``items``, errs on none, and measured at least one (ok, with its chunks or its draw's
+    diagnostics): what witnesses that its card scores. An answer of statuses with no measure (proof_undecodable)
+    costs no GPU; one undecodable proof beside measured items is the miner's, not the card's."""
+    return _scored(result, items) and any(s.status == ITEM_OK and (s.chunks or s.draw is not None)
+                                          for s in result.scores)
 
 
 def _wire_item(item: dict) -> dict:
@@ -439,10 +443,11 @@ def _unreadable_items(model: ModelKey, proof, items: Sequence[dict]) -> dict[int
 
 @dataclass
 class _Loss:
-    """One executor's lost leases of a batch: its provider, whether one of them was witnessed, and the leases that
-    struck it."""
+    """One executor's lost leases of a batch: its provider, whether one of them was witnessed (and when, last), and the
+    leases that struck it."""
     provider: str
     witnessed: bool = False
+    witnessed_at: float = float("-inf")
     leases: list = field(default_factory=list)
 
 
@@ -466,7 +471,7 @@ class _Batch:
     losses: dict[str, _Loss] = field(default_factory=dict)
     benched: dict[str, float] = field(default_factory=dict)
     benches: collections.Counter = field(default_factory=collections.Counter)
-    # Parked on its losses: a scored answer to one of its leases, late or not, says a card can answer it.
+    # Parked on its losses: a measured answer to one of its leases, late or not, says a card can answer it.
     parked: bool = False
 
 
@@ -531,7 +536,7 @@ class PairedAuditDispatcher:
         self._parks_by: dict[str, collections.deque] = collections.defaultdict(collections.deque)
         self._seen: dict[str, float] = {}
         self._listeners: list[Callable[[str], Awaitable[Any]]] = []
-        # Told (job id, batch id) when a batch parked on its losses gets a scored answer: its records are tried again.
+        # Told (job id, batch id) when a batch parked on its losses gets a measured answer: its records are tried again.
         self._unpark_listeners: list[Callable[[str, int], Any]] = []
         self._background: set[asyncio.Task] = set()
         self._unwritten: dict[str, str] = {}
@@ -568,7 +573,7 @@ class PairedAuditDispatcher:
         self._listeners = [other for other in self._listeners if other != listener]
 
     def subscribe_unparked(self, listener: Callable[[str, int], Any]) -> None:
-        """``listener(job_id, batch_id)``: a batch parked on its losses got a scored answer, late or not."""
+        """``listener(job_id, batch_id)``: a batch parked on its losses got a measured answer, late or not."""
         self._unpark_listeners.append(listener)
 
     def unsubscribe_unparked(self, listener) -> None:
@@ -611,6 +616,7 @@ class PairedAuditDispatcher:
                          "records are parked before any lease", job_id, len(unreadable), len(items), first,
                          unreadable[first])
             self.parked[job_id] += 1
+            self.stats["parked"] += 1
             self._flag(job_id, f"{len(unreadable)} item(s) no executor can read ({unreadable[first]})")
             raise ItemsUnreadable(unreadable)
         plain = [k for k, item in enumerate(items) if item.get("draw") is None]
@@ -787,7 +793,11 @@ class PairedAuditDispatcher:
         evidence against it any more, a batch parked on its losses is unparked (`_unpark`), and the card's bench
         on it is lifted (unless its lease was the longest)."""
         batch = lease.batch
-        if batch.reuse_auditors_only or not _scored(result, batch.items):
+        if batch.reuse_auditors_only:
+            return
+        if not _scored(result, batch.items):
+            # An error or a misfit, late: benched from the batch, as before the sweep.
+            self._bench(batch, lease.executor_id)
             return
         self.stats["answered_late"] += 1
         logger.warning("eval audit executor %s answered lease %s of batch %s late, %.0f s after its grant: "
@@ -856,10 +866,14 @@ class PairedAuditDispatcher:
         if not batch.future.done() and evidence:
             place = batch.places.get(executor_id)
             loss = batch.losses.setdefault(executor_id, _Loss(provider=place[0] if place else executor_id))
-            loss.witnessed = loss.witnessed or witnessed
-            # Only witnessed losses are evidence; not those of a card quarantined since, nor past its provider's cap.
+            if witnessed:
+                loss.witnessed, loss.witnessed_at = True, now
+            # Only fresh witnessed losses are evidence (within PARK_WINDOW_SECONDS); not those of a card quarantined or
+            # released since, nor past its provider's cap.
             losers = sorted((e, other) for e, other in batch.losses.items()
-                            if other.witnessed and e not in self.quarantined and self._counted(other.provider, now))
+                            if other.witnessed and now - other.witnessed_at <= PARK_WINDOW_SECONDS
+                            and e not in self.quarantined and e not in self._releasing
+                            and self._counted(other.provider, now))
             providers = {other.provider for _, other in losers}
             if len(providers) >= UNANSWERED_PROVIDERS_PARK + max(0, batch.needed - 1):
                 park = (losers, providers)
@@ -1319,7 +1333,7 @@ class PoolView:
         self._dispatcher.subscribe(listener)
 
     def subscribe_unparked(self, listener) -> None:
-        """``listener(batch_id)``: a batch of this job parked on its losses got a scored answer."""
+        """``listener(batch_id)``: a batch of this job parked on its losses got a measured answer."""
         job_id = self._job_id
 
         def mine(batch_job: str, batch_id: int) -> None:
@@ -1373,9 +1387,18 @@ def eval_auditor(**kwargs):
                        and now < state.retry_at}
             again = [i for i, sid in enumerate(sids) if i not in cooling and sid is not None
                      and (sid in self._park_state or sid in self._reaudit_parked)]
+            if _REAUDIT_PARKED.get() is None:
+                # A pending record parked before is tried again alone, in the background: one record no executor can
+                # score then parks nobody else's, and a retry no card answers holds no pass. Its outcome is taken by its
+                # next pass (`_ahead`).
+                for i in again:
+                    if sids[i] not in self._retries:
+                        self._retries[sids[i]] = asyncio.ensure_future(self._retry_alone(records[i], sids[i]))
+                    cooling[i] = _Parked(f"tried again alone: {self._park_state[sids[i]].why}"
+                                         if sids[i] in self._park_state else "tried again alone")
+                again = []
             rest = [i for i in range(len(records)) if i not in cooling and i not in again]
-            # Each record parked before is tried again in a call of its own: one record no executor can score then
-            # parks nobody else's (its first park took its whole batch).
+            # A re-audit tries each pass parked before in a call of its own, and waits for it.
             parts = [[i] for i in again] + ([rest] if rest else [])
             if len(parts) == 1 and not cooling:
                 return await self._forward_part(records, sids)
@@ -1427,11 +1450,13 @@ def eval_auditor(**kwargs):
                 if left and not hit and len(left) == len(todo):
                     # Parked, naming none of the call's items: every record still to score was in it.
                     hit = [(j, "parked", PARK_LOST, ()) for j in range(len(todo))]
+                # A park that held one record's items alone names its culprit.
+                hit_records = {items[todo[j]][0] for j, *_ in hit}
                 for j, why, kind, batch_ids in hit:
                     i = items[todo[j]][0]
                     if i not in parked:
                         parked[i] = why
-                        self._record_park(sids[i], why, kind, batch_ids)
+                        self._record_park(sids[i], why, kind, batch_ids, alone=len(hit_records) == 1)
                 todo = [k for k in left if items[k][0] not in parked]
             for i, why in parked.items():
                 results[i] = _Parked(why)
@@ -1461,19 +1486,19 @@ def eval_auditor(**kwargs):
                                (state.retry_at - self._clock()) if state is not None else PARK_RETRY_SECONDS)
             return judged
 
-        def _record_park(self, sid, why, kind, batch_ids) -> None:
+        def _record_park(self, sid, why, kind, batch_ids, *, alone=False) -> None:
             """Park ``sid`` now (a re-audit keeps its own): its batch's unpark may come before the call ends."""
             if sid is None:
                 return
             reaudit = _REAUDIT_PARKED.get()
             if reaudit is not None:
                 reaudit.add(sid)
-                self._park_again(self._reaudit_parked, sid, why, kind, batch_ids)
+                self._park_again(self._reaudit_parked, sid, why, kind, batch_ids, alone)
             elif sid not in self._judged:
-                self._park_again(self._park_state, sid, why, kind, batch_ids)
+                self._park_again(self._park_state, sid, why, kind, batch_ids, alone)
                 self.parked_ids.add(sid)
 
-        def _park_again(self, states, sid, why, kind, batch_ids) -> None:
+        def _park_again(self, states, sid, why, kind, batch_ids, alone=False) -> None:
             """Park ``sid`` (or again): tried after PARK_RETRY_SECONDS, doubling up to MAX_PARK_RETRY_SECONDS, or at
             once if its batch was unparked already."""
             now = self._clock()
@@ -1485,29 +1510,53 @@ def eval_auditor(**kwargs):
                 state.tries += 1
             state.retry_at = now + state.backoff
             state.why, state.kind, state.batches = why, kind, set(batch_ids)
+            state.alone = state.alone or alone or kind == PARK_UNREADABLE
             for gone in [b for b, at in self._unparked_batches.items() if now - at > LATE_ANSWER_SECONDS]:
                 del self._unparked_batches[gone]
             if any(b in self._unparked_batches for b in state.batches):
-                state.retry_at = now
+                # Its batch got a measured answer before this park was recorded: as `_batch_unparked` would.
+                state.retry_at, state.backoff = now, PARK_RETRY_SECONDS / 2
+                state.tries, state.alone, state.since = 0, False, now
+
+        async def _retry_alone(self, record, sid) -> None:
+            """A parked record tried again alone, in the background. Decided: its outcome waits for its pass in
+            `_ahead`, and the pass is due now. Parked again: its cool-down doubled (`_park_again`)."""
+            state = self._park_state.get(sid)
+            if state is not None:
+                # Not tried again while this retry is out.
+                state.retry_at = self._clock() + max(state.backoff, PARK_RETRY_SECONDS)
+            try:
+                outcome, = await self._forward_part([record], [sid])
+            except (ValueError, RuntimeError):
+                logger.warning("eval job %s: retry of parked %s failed on the validator; tried again later",
+                               self._job_id, sid[:12], exc_info=True)
+                return
+            finally:
+                self._retries.pop(sid, None)
+            if isinstance(outcome, dict) and sid not in self._judged:
+                self._ahead[sid] = outcome
+                self._schedule(sid, self._clock())
 
         def _unpark_record(self, sid) -> None:
             if self._park_state.pop(sid, None) is not None:
                 self.parked_ids.discard(sid)
                 logger.info("eval job %s: parked %s decided", self._job_id, sid[:12])
-                self._wake_operator(sid)
+                self._wake_held(sid)
 
-        def _wake_operator(self, sid) -> None:
-            """A parked record decided or unparked: its operator's passes it held as a sibling are judged again now."""
-            meta = self._meta.get(sid)
-            if meta is None:
-                return
+        def _note_held(self, submission_id: str, parked) -> None:
+            for sid in parked:
+                self._held_by.setdefault(sid, set()).add(submission_id)
+
+        def _wake_held(self, sid) -> None:
+            """A parked record decided or unparked: the passes it held as a sibling are judged again now."""
             now = self._clock()
-            for member in self._members.get(self._operator(meta[0]), ()):
-                for other in self._unjudged.get(member, ()):
-                    if other in self._next_due and self._next_due[other] > now:
-                        self._next_due[other] = now
-                    if other in self._due and self._due[other] > now and other not in self._park_state:
-                        self._schedule(other, now)
+            for other in self._held_by.pop(sid, ()):
+                if other in self._judged:
+                    continue
+                if other in self._next_due and self._next_due[other] > now:
+                    self._next_due[other] = now
+                if other in self._due and self._due[other] > now:
+                    self._schedule(other, now)
 
         def _batch_unparked(self, batch_id) -> None:
             """A batch parked on its losses got a measured answer: its records are tried again at once."""
@@ -1519,13 +1568,16 @@ def eval_auditor(**kwargs):
                     if batch_id not in state.batches:
                         continue
                     moved += 1
+                    # A card answered its batch: the park is no evidence against it any more. It holds the close again
+                    # until its retry decides it or parks it alone again (SOLO_RETRY_SECONDS at most).
                     state.retry_at, state.backoff = now, PARK_RETRY_SECONDS / 2
+                    state.tries, state.alone, state.since, state.left_out = 0, False, now, False
                     if states is self._park_state:
                         if sid in self._next_due:
                             self._next_due[sid] = now
                         if sid in self._due:
                             self._schedule(sid, now)
-                        self._wake_operator(sid)
+                        self._wake_held(sid)
             if moved:
                 logger.info("eval job %s: batch %s unparked; %d parked record(s) tried again now", self._job_id,
                             batch_id, moved)
@@ -1559,30 +1611,29 @@ def eval_auditor(**kwargs):
             return submission_id in self._park_state
 
         def _give_up_at(self, submission_id: str) -> float | None:
-            meta = self._meta.get(submission_id)
-            return None if meta is None else meta[1] + PARKED_CLOSE_GIVE_UP_SECONDS
-
-        def _give_up_due(self, submission_id: str) -> bool:
-            """Whether a parked record may leave the close at its give-up: one an executor cannot read is the fault
-            itself; one parked with its batch only once it parked again alone (its first retry), so no record batched
-            with the culprit leaves before that retry decides it."""
-            state = self._park_state.get(submission_id)
-            return state is not None and (state.kind == PARK_UNREADABLE or state.tries >= 1)
+            """When a parked record lets go of its period's close: PARKED_CLOSE_GIVE_UP_SECONDS after its receipt
+            (durable: a restart does not start it again). One parked with other records' items, never alone, waits too
+            until its first retry alone had SOLO_RETRY_SECONDS: no honest batch-mate leaves before it is decided."""
+            meta, state = self._meta.get(submission_id), self._park_state.get(submission_id)
+            if meta is None or state is None:
+                return None
+            give_up = meta[1] + PARKED_CLOSE_GIVE_UP_SECONDS
+            if state.alone or state.tries >= 1:
+                return give_up
+            return max(give_up, state.since + PARK_RETRY_SECONDS + SOLO_RETRY_SECONDS)
 
         def _parked_wait(self, submission_id: str, now: float) -> float | None:
             state = self._park_state.get(submission_id)
             if state is None or now >= state.retry_at:
                 return None
-            give_up = self._give_up_at(submission_id) if self._give_up_due(submission_id) else None
+            give_up = self._give_up_at(submission_id)
             return state.retry_at if give_up is None or give_up <= now else min(state.retry_at, give_up)
 
         def _left_out_of_close(self, submission_id: str, now: float) -> bool:
-            # A parked record holds its period's close PARKED_CLOSE_GIVE_UP_SECONDS after its receipt at most (durable:
-            # a restart does not start it again), past its first retry alone: one record no executor can score must not
-            # freeze the order's pay.
+            # One record no executor can score must not freeze the order's pay: it lets go of the close at its give-up.
             state = self._park_state.get(submission_id)
-            give_up = self._give_up_at(submission_id) if state is not None else None
-            if give_up is None or now <= give_up or not self._give_up_due(submission_id):
+            give_up = self._give_up_at(submission_id)
+            if give_up is None or now <= give_up:
                 return False
             if not state.left_out:
                 state.left_out = True
@@ -1618,10 +1669,12 @@ def eval_auditor(**kwargs):
                     held.add(sid)
             return held
 
-        def settle_capped(self, submission_ids) -> set[str]:
-            """The late verdicts paid within what is left of their period's cap (owner, 2026-11-26): parked records
-            decided after their period closed without them. Any other late verdict is paid as before."""
-            return {sid for sid in submission_ids if sid in self._left_out_ids}
+        def settle_capped(self, verdicts) -> set[str]:
+            """The verdicts paid within what is left of their period's cap, if their period was settled without them
+            (owner, 2026-11-26): parked records decided after they left the close (marked in their verdict, so a
+            restart keeps it). Any other late verdict is paid as before."""
+            return {sid for sid, verdict in verdicts.items()
+                    if sid in self._left_out_ids or (verdict or {}).get("left_out_of_close")}
 
         async def _audit_outcomes(self, records, *, local: bool = False):
             # A parked record is neither the miner's fault nor a validator error (`_Parked`): it stays pending, tried
@@ -1777,6 +1830,9 @@ def eval_auditor(**kwargs):
                 self._reopening.pop(_REOPEN_BACKLOG, None)
 
         async def _write(self, submission_id, verdict):
+            if submission_id in self._left_out_ids:
+                # Durable: its late pay stays within the cap after a restart too (`settle_capped`).
+                verdict = {**verdict, "left_out_of_close": True}
             stored, written = await super()._write(submission_id, verdict)
             if not (stored or verdict).get("passed"):
                 await self._record_failure(submission_id)
@@ -1899,7 +1955,7 @@ def eval_auditor(**kwargs):
                 if restore is not None:
                     restore.cancel()
                     await asyncio.gather(restore, return_exceptions=True)
-                late = list(self._late_reaudits.values())
+                late = list(self._late_reaudits.values()) + list(self._retries.values())
                 for task in late:
                     task.cancel()
                 await asyncio.gather(*late, return_exceptions=True)
@@ -1933,6 +1989,9 @@ def eval_auditor(**kwargs):
     # lately (a park recorded after its batch's unpark is tried at once).
     auditor._left_out_ids = set()
     auditor._unparked_batches = {}
+    # Retries of parked records running alone, and the passes each parked record holds as a sibling.
+    auditor._retries = {}
+    auditor._held_by = {}
     auditor._ids_by_object = collections.OrderedDict()
     if callable(getattr(auditor._remote, "subscribe_unparked", None)):
         auditor._remote.subscribe_unparked(auditor._batch_unparked)
@@ -1958,7 +2017,8 @@ class _Parked(str):
 @dataclass
 class _ParkState:
     """A parked record: since when, why and how (PARK_UNREADABLE / PARK_LOST), the batches parked with it, when it is
-    tried again, its current cool-down and how often it was parked again; whether its give-up was logged."""
+    tried again, its current cool-down, how often it was parked again, whether a park held its items alone (no other
+    record's: it is the culprit), and whether its give-up was logged."""
     since: float
     backoff: float
     retry_at: float = 0.0
@@ -1966,6 +2026,7 @@ class _ParkState:
     kind: str = ""
     batches: set = field(default_factory=set)
     tries: int = 0
+    alone: bool = False
     left_out: bool = False
 
 
@@ -2450,7 +2511,7 @@ def wire_order_judge(w, *, records, job_store, remote, params, miner_states, bea
         max_price=cp.max_price(entry.params), max_input_price=cp.max_input_price(entry.params),
         # The stake guarantee past a parked record's give-up, and its late verdict paid within the cap.
         hold=lambda verdicts, period_of: w.auditor.settle_hold(verdicts, period_of),
-        capped=lambda submission_ids: w.auditor.settle_capped(submission_ids))
+        capped=lambda verdicts: w.auditor.settle_capped(verdicts))
     w.auditor = eval_auditor(
         job_id=job.job_id, records=records, tokenizer=w.tokenizer, proof=w.proof,
         params=params, miner_states=miner_states, beacon=beacon, round_at=round_at,

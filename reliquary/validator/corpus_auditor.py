@@ -553,6 +553,9 @@ class CorpusAuditor:
         sibling (a parked record past its give-up)."""
         return False
 
+    def _note_held(self, submission_id: str, parked) -> None:
+        """``submission_id`` waits for these parked siblings: judged again once one is decided (none here)."""
+
     def audits_pending(self) -> int | None:
         """Pending records that may still need a GPU audit: every one not decided yet, and every one waiting out
         its hold whose decision at the hold's end could still be an audit. Not counted: a record known undrawn
@@ -2052,8 +2055,8 @@ class CorpusAuditor:
         await self._learn_shortest(known, states, now)
 
         audit_ids, draws, unaudited, voided = [], {}, [], []
-        # Per operator, (receipt, when it next changes) of its parked siblings cooling down (`_parked_wait`).
-        parked_siblings: dict[str, list[tuple[float, float]]] = {}
+        # Per operator, (receipt, when it next changes, id) of its parked siblings cooling down (`_parked_wait`).
+        parked_siblings: dict[str, list[tuple[float, float, str]]] = {}
         # Per operator (`_operator`: the hotkey alone unless its coldkey is known), arrival times of records whose
         # draw round is not out yet. Every guard below that keeps a record unpaid until the records that could
         # catch it are decided spans its operator, as its stake does (`_stake_of`).
@@ -2155,7 +2158,7 @@ class CorpusAuditor:
                     if at is not None:
                         # Parked, cooling down: undecided until it is tried again (or let go of the close).
                         self._choices["sibling_parked"] += 1
-                        parked_siblings.setdefault(operator, []).append((self._meta[sid][1], at))
+                        parked_siblings.setdefault(operator, []).append((self._meta[sid][1], at, sid))
                         continue
                     with self._timed("decide"):
                         choice, draw = await self._decide(sid, now, states[self._meta[sid][0]])
@@ -2237,11 +2240,13 @@ class CorpusAuditor:
                     for t in undecided.get(operator, ())):
                 self._next_due[submission_id] = self._retry_at(hotkey, now)
                 continue
-            parked_until = [at for t, at in parked_siblings.get(operator, ())
+            parked_until = [(at, sid) for t, at, sid in parked_siblings.get(operator, ())
                             if t <= received_at + self._params.hold_seconds]
             if parked_until:
-                # A parked sibling could still catch it: judged again when that sibling is tried or let go.
-                self._next_due[submission_id] = max(now, min(parked_until))
+                # A parked sibling could still catch it: judged again when that sibling is tried or let go, or as soon
+                # as it is decided (`_note_held`).
+                self._next_due[submission_id] = max(now, min(at for at, _ in parked_until))
+                self._note_held(submission_id, [sid for _, sid in parked_until])
                 continue
             paid = {"passed": True, "audited": False, "reason": None, **_WORST_ZERO}
             if forfeits(states[hotkey], received_at):

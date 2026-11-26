@@ -223,7 +223,7 @@ def test_a_parked_records_late_verdict_is_paid_within_what_is_left_of_its_cap():
     records.verdicts["b"] = verdict("b", "b", 10, at(2))       # an ordinary late verdict
     late = CorpusPeriodSettler(task_id="eval-x", job_id="eval-x", cap=0.1, records=records, archives=archives,
                                oldest_pending=lambda: None, genesis=lambda: GENESIS, clock=lambda: at(9, 3000),
-                               capped=lambda ids: {sid for sid in ids if sid == "p"})
+                               capped=lambda verdicts: {sid for sid in verdicts if sid == "p"})
     asyncio.run(late.settle_once())
     assert archives.docs[(2, 11)]["rewards_by_hotkey"] == {"b": pytest.approx(0.1 * 10 / 40)}
     assert "p" in records.state["settled"] and set(archives.docs) == {(2, 10), (2, 11)}   # its period paid its cap
@@ -231,11 +231,40 @@ def test_a_parked_records_late_verdict_is_paid_within_what_is_left_of_its_cap():
     records.verdicts["q"] = verdict("q", "q", 400, at(2))
     raised = CorpusPeriodSettler(task_id="eval-x", job_id="eval-x", cap=0.2, records=records, archives=archives,
                                  oldest_pending=lambda: None, genesis=lambda: GENESIS, clock=lambda: at(9, 3500),
-                                 capped=lambda ids: set(ids))
+                                 capped=lambda verdicts: set(verdicts))
     asyncio.run(raised.settle_once())
     # Its share (0.2 x 400/440) is past what is left of the cap (0.2 - 0.1 - 0.025): it gets that, never more.
     assert archives.docs[(2, 12)]["rewards_by_hotkey"] == {"q": pytest.approx(0.2 - 0.1 - 0.1 * 10 / 40)}
     assert sum(v for doc in archives.docs.values() for v in doc["rewards_by_hotkey"].values()) == pytest.approx(0.2)
+
+
+def test_a_parked_record_of_a_period_settled_for_the_first_time_is_paid_with_it():
+    """Capped only when its period was settled before without it: one decided before its period's first settlement
+    shares its cap with the others, whatever kept the period open meanwhile."""
+    records, archives = Records(), Archives()
+    records.verdicts = {"o": verdict("o", "o", 10, at(2)), "p": verdict("p", "p", 10, at(2))}
+    first = CorpusPeriodSettler(task_id="eval-x", job_id="eval-x", cap=0.1, records=records, archives=archives,
+                                oldest_pending=lambda: None, genesis=lambda: GENESIS, clock=lambda: at(9),
+                                capped=lambda verdicts: {"p"} & set(verdicts))
+    asyncio.run(first.settle_once())
+    assert archives.docs[(2, 10)]["rewards_by_hotkey"] == {"o": pytest.approx(0.05), "p": pytest.approx(0.05)}
+
+
+def test_a_periods_ordinary_late_verdicts_are_settled_before_its_capped_ones():
+    """With room left under the cap, the ordinary late verdict takes its whole-count share first; the parked record
+    gets what is left of the cap after it."""
+    records, archives = Records(), Archives()
+    records.verdicts = {"a": verdict("a", "a", 30, at(2))}
+    asyncio.run(settler(records, archives, at(9)).settle_once())            # cap 0.1, paid in full
+    records.verdicts["p"] = verdict("p", "p", 10, at(2))
+    records.verdicts["b"] = verdict("b", "b", 10, at(2))
+    late = CorpusPeriodSettler(task_id="eval-x", job_id="eval-x", cap=0.2, records=records, archives=archives,
+                               oldest_pending=lambda: None, genesis=lambda: GENESIS, clock=lambda: at(9, 3000),
+                               capped=lambda verdicts: {"p"} & set(verdicts))
+    asyncio.run(late.settle_once())
+    paid = {hk: v for doc in archives.docs.values() for hk, v in doc["rewards_by_hotkey"].items()}
+    assert paid["b"] == pytest.approx(0.2 * 10 / 40)
+    assert paid["p"] == pytest.approx(min(0.2 * 10 / 50, 0.2 - 0.1 - 0.2 * 10 / 40))
 
 
 def test_an_old_verdict_without_arrival_is_dated_by_its_audit():

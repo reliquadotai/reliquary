@@ -79,10 +79,12 @@ class CorpusPeriodSettler:
     give-up holds its operator's verdicts it could forfeit: ``EvalAuditor.settle_hold``);
     a later call settles them, as any late verdict.
 
-    ``capped(ids)``: which late verdicts are paid within what is left of their
-    period's cap, never past it (an order's parked records decided after their
-    period closed without them: ``EvalAuditor.settle_capped``). Any other late
-    verdict is paid against its period's whole count, as before."""
+    ``capped({id: verdict})``: which verdicts are paid within what is left of
+    their period's cap, never past it, when that period was settled before
+    without them (an order's parked records decided after they left the close:
+    ``EvalAuditor.settle_capped``). Any other late verdict is paid against its
+    period's whole count, as before; a verdict of a period settled for the first
+    time is paid with its period, capped or not."""
 
     def __init__(self, *, task_id, job_id, cap, records, archives,
                  oldest_pending: Callable[[], float | None],
@@ -92,7 +94,7 @@ class CorpusPeriodSettler:
                  ready: Callable[[list[str]], Awaitable[set[str]]] | None = None,
                  max_price: float | None = None, max_input_price: float | None = None,
                  hold: Callable[[dict, Callable[[float], int]], set[str]] | None = None,
-                 capped: Callable[[list[str]], set[str]] | None = None) -> None:
+                 capped: Callable[[dict], set[str]] | None = None) -> None:
         self._ready = ready
         self._hold = hold
         self._capped = capped
@@ -416,8 +418,12 @@ class CorpusPeriodSettler:
             period = self._work_period(verdict, genesis)
             if period <= closed and sid not in held:
                 by_period[period].append(sid)
-        capped = (self._capped([sid for ids in by_period.values() for sid in ids])
-                  if self._capped is not None and by_period else set())
+        # Capped only in a period settled before this call (without them); in a period settled for the first time they
+        # are paid with it.
+        paid_before = {int(period) for period, tokens in (state.get("period_tokens") or {}).items() if tokens}
+        capped = (self._capped({sid: verdicts[sid] for period, ids in by_period.items() if period in paid_before
+                                for sid in ids})
+                  if self._capped is not None and paid_before & set(by_period) else set())
         # A period's capped verdicts are settled apart, after its others: the cap they are paid within counts them.
         batches = sorted({(period, sid in capped) for period, ids in by_period.items() for sid in ids})
         last = None

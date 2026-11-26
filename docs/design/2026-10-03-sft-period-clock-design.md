@@ -289,10 +289,11 @@ time. Reassign once the tail has run out.
   unreadable holds periods open for two periods, then is left out with an error,
   so one corrupt record cannot freeze a task's pay. An order's parked record (an
   audit no executor can return, `eval_control`) is left out the same way two
-  periods after its receipt, once tried again alone; at q < 1 its operator's
-  verdicts received in its period up to its receipt (what its failure can forfeit)
-  stay unsettled until it is decided (the settler's `hold`), and it no longer
-  holds its operator's unaudited passes as a sibling. An undecided submission
+  periods after its receipt (one parked with other records' items, once its
+  first retry alone had its time too); at q < 1 its operator's verdicts received
+  in its period up to its receipt (what its stake counts) stay unsettled until it
+  is decided (the settler's `hold`), and it no longer holds its operator's
+  unaudited passes as a sibling. An undecided submission
   older than six periods is reported.
 - **A late verdict** (one whose period was already settled, which the bounds above
   should prevent) is still paid against the period's whole token count, logged as
