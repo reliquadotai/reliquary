@@ -146,9 +146,10 @@ and build and start have fixed time budgets, so pushes cannot be used to tie up 
 
 ## Data-only graders (no code)
 
-Many customers need no code. `orders.graders` grows declarative graders, run where they run today:
-numeric tolerance, multiple choice, regex, JSON schema, and code against customer tests given as data (run by our
-existing code grader). An LLM judge is offered for evaluations and annotation only. These stay the default path.
+Many customers need no code. `orders.graders` holds declarative graders, run where they run today:
+`numeric_v1` (tolerance), `choice_v1` (multiple choice) and `json_match_v1` are in. Still to come: JSON schema
+(no `pattern` keywords: the admin host runs no customer regex), code against customer tests given as data (run by
+our existing code grader), and an LLM judge for evaluations and annotation only. These stay the default path.
 
 ## Our own environments
 
