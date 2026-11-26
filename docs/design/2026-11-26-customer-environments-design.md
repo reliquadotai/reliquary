@@ -96,8 +96,20 @@ existing `precompute_rewards` path), and the honesty re-check calls the same ser
 | batch, SFT corpus  | sandboxes allocated to the order, only when the order filters or annotates with the env |
 | evaluation         | sandboxes allocated to the evaluation                                     |
 
+For a single-turn environment the isolation is the container, not the machine: its reward server may run on the
+training's trainer box (already the customer's) or as one `runsc` container per environment version on a shared
+pool of CPU reward hosts. Only an agentic environment needs gateways of its own.
+
 Never on a validator, never on the admin host, never on a miner's machine. A miner gets prompts (token ids) and,
 for agentic tasks, a session on our gateway; never the image, the grader or the references.
+
+## Billing of scoring
+
+* Catalog environments (math, code, ...): unchanged; their grading is part of the token price.
+* Agentic environments, ours or a customer's: gateway-hours, as today.
+* A customer's single-turn environment: qualification measures its scoring CPU-seconds per item. Under a
+  threshold (a math-like check), scoring is included in the token price. Above it (long customer tests), the
+  order is quoted with scoring CPU-seconds at the reward pool's cost, billed on actual use, capped at the quote.
 
 ## Prompts are frozen at qualification
 
