@@ -84,6 +84,17 @@ def from_environment() -> CustomerEnvs | None:
     return CustomerEnvs(registry, make_qualifier)
 
 
+def order_resolver(envs: CustomerEnvs | None):
+    """``resolve(env, account)`` for a training order (ValueError when it may not train on it), or None."""
+    if envs is None:
+        return None
+
+    def resolve_for_rl(env: str, account: str):
+        return resolve(envs.registry, env, account=account, product="rl")
+
+    return resolve_for_rl
+
+
 def add_routes(router: APIRouter, envs: CustomerEnvs | None, *, deliveries, eval_store,
                load_tokenizer=None) -> None:
     running: dict[str, asyncio.Task] = {}
@@ -199,4 +210,4 @@ class _SubnetErrors:
 
 
 __all__ = ["CustomerEnvs", "MAX_IN_FLIGHT_PER_ACCOUNT", "OrderSets", "SubmitVersion", "add_routes",
-           "from_environment"]
+           "from_environment", "order_resolver"]

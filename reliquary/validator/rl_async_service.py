@@ -750,6 +750,10 @@ def mount_rl_async(server, rl: RlAsync, *, validator_hotkey: str, registration=N
             return JSONResponse(status_code=404, content={"reason": "no_feed"})
         return Response(content=body, media_type="application/json", headers={"Cache-Control": "max-age=60"})
 
+    from reliquary.customer_env.rl import mount_rows_routes
+
+    mount_rows_routes(router)
+
     if rl.settings.episodes:
         from fastapi.responses import JSONResponse as _Json
 

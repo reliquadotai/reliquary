@@ -1622,6 +1622,12 @@ def resolve_protocol_profile(profile_id: str | None = None) -> ProtocolProfile:
         ) from exc
 
 
+def entry_profile(entry) -> ProtocolProfile:
+    """The profile a registry entry runs: its carried contract when it has one, else its compiled profile."""
+    contract = getattr(entry, "contract", None)
+    return profile_from_contract(contract) if contract is not None else PROFILES[entry.profile_id]
+
+
 def _profile_from_contract_file(path: str) -> ProtocolProfile:
     """Read the contract this process was given, or refuse to start.
 

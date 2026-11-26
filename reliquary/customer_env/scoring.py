@@ -80,23 +80,53 @@ def from_environment() -> CustomerScorer | None:
     (``RELIQUARY_REWARD_HOST_CLIENT_CERT`` / ``_CLIENT_KEY``), the host's CA (``RELIQUARY_REWARD_HOST_CA``) and the
     version index (``RELIQUARY_CUSTOMER_ENV_DB``)."""
     url, db = os.environ.get("RELIQUARY_REWARD_HOST_URL"), os.environ.get("RELIQUARY_CUSTOMER_ENV_DB")
-    if not url or not db:
+    if not url:
         return None
     from reliquary.customer_env.host import RemoteRewardClient
-    from reliquary.customer_env.registry import Registry
 
-    registry = Registry(db)
     cert = (os.environ.get("RELIQUARY_REWARD_HOST_CLIENT_CERT"), os.environ.get("RELIQUARY_REWARD_HOST_CLIENT_KEY"))
     ca = os.environ.get("RELIQUARY_REWARD_HOST_CA")
+    if db:
+        from reliquary.customer_env.registry import Registry
 
-    def image_for(env_id: str) -> str:
-        record = registry.get(env_id)
-        if record is None or record.status != "qualified" or not record.image_digest:
-            raise LookupError(f"{env_id} is not a qualified version")
-        return record.image_digest
+        registry = Registry(db)
+
+        def image_for(env_id: str) -> str:
+            record = registry.get(env_id)
+            if record is None or record.status != "qualified" or not record.image_digest:
+                raise LookupError(f"{env_id} is not a qualified version")
+            return record.image_digest
+    else:
+        # A validator (no admin index): the version's qualified record in the subnet bucket names its image.
+        image_for = bucket_image_for()
 
     return CustomerScorer(image_for, lambda image: RemoteRewardClient(
         url, image, cert=cert if all(cert) else None, ca=ca))
 
 
-__all__ = ["CustomerScorer", "check_reference", "from_environment", "is_customer_env", "reference"]
+def bucket_image_for(read=None) -> Callable[[str], str]:
+    def get(key: str) -> bytes | None:
+        import asyncio
+
+        from reliquary.eval.storage import SubnetEvalStore
+
+        return asyncio.run(SubnetEvalStore().get_bytes(key))
+
+    read = read or get
+    cache: dict[str, str] = {}
+
+    def image_for(env_id: str) -> str:
+        if env_id not in cache:
+            from reliquary.customer_env.registry import subnet_key
+
+            body = read(subnet_key(parse_env_id(env_id), "record.json"))
+            record = json.loads(body) if body else {}
+            if record.get("status") != "qualified" or not record.get("image_digest"):
+                raise LookupError(f"{env_id} is not a qualified version")
+            cache[env_id] = record["image_digest"]
+        return cache[env_id]
+
+    return image_for
+
+
+__all__ = ["CustomerScorer", "bucket_image_for", "check_reference", "from_environment", "is_customer_env", "reference"]

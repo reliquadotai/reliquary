@@ -4701,6 +4701,10 @@ def mine_async(
         "", "--rl-task", help="Mine this RL task only (its /rl/<task> routes). Default: the task that pays best "
                               "for your envs (GET /rl/tasks), chosen again every 10 min; bare /rl on a validator "
                               "without it"),
+    rl_customer_envs: bool = typer.Option(
+        False, "--rl-customer-envs",
+        help="Also serve the customer environments a task trains: their prompts and generation settings come from "
+             "the task's validator, their rewards from its reward host. A bare --ask-alpha-per-mtoken prices them"),
     log_level: str = typer.Option("INFO", help="Log level"),
 ) -> None:
     """Mine the asynchronous RL protocol: lease prompts within the measured quota, generate 16 rollouts per lease
@@ -4734,9 +4738,12 @@ def mine_async(
 
             task_prefix(rl_task)
         asks = _rl_asks(ask_alpha_per_mtoken, names, ask_capacity or max_open)
+        customer_ask = _rl_asks([v for v in ask_alpha_per_mtoken if "=" not in v], ("customer:*",),
+                                ask_capacity or max_open).get("customer:*")
         config = AsyncMinerConfig(environments=names, lease_batch=lease_batch, max_open=max_open,
                                   queue_groups=queue_groups, batch_groups=batch_groups,
-                                  state_dir=str(Path(work_dir) / "state"), asks=asks)
+                                  state_dir=str(Path(work_dir) / "state"), asks=asks,
+                                  customer_envs=rl_customer_envs, customer_ask=customer_ask)
     except ValueError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc

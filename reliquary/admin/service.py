@@ -588,6 +588,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=401, detail=refusal)
 
     router = APIRouter(prefix="/admin/v1", dependencies=[Depends(signed)])
+    from reliquary.customer_env import admin as customer_env_admin
+
+    customer_envs_served = customer_envs if customer_envs is not None else customer_env_admin.from_environment()
 
     def in_scope(name: str) -> None:
         if not name.startswith(task_prefix):
@@ -1709,14 +1712,25 @@ def create_admin_app(*, secret: bytes, pool_max: float,
 
             if (answer := await replayed()) is not None:
                 return answer
-            refusal = training_refusal(body)
+            customer_env = customer_env_admin.order_resolver(customer_envs_served)
+            refusal = training_refusal(body, customer_env=customer_env)
             if refusal is not None:
                 raise HTTPException(status_code=422, detail=refusal)
+            architecture = None
+            if any(e.name.startswith("customer:") for e in body.environments):
+                from reliquary.protocol.profiles import PROFILES
+
+                template = PROFILES[body.profile_id]
+                try:
+                    architecture = (await model_facts(template.model_id, template.model_revision))["architecture"]
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail=f"model_files_unreadable: {exc}") from exc
             try:
                 entry = training_entry(body, task_prefix=task_prefix,
                                        price_params=await token_price(
                                            TokenCeiling(input=0.0, output=body.max_price_usd_per_mtoken)),
-                                       created_at=clock())
+                                       created_at=clock(), customer_env=customer_env,
+                                       model_architecture=architecture)
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
             try:
@@ -2155,11 +2169,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             logger.warning("upload %s could not be ingested", body.object_key, exc_info=True)
             raise HTTPException(status_code=503, detail="upload_unavailable") from exc
 
-    from reliquary.customer_env import admin as customer_env_admin
-
-    customer_env_admin.add_routes(
-        router, customer_envs if customer_envs is not None else customer_env_admin.from_environment(),
-        deliveries=deliveries, eval_store=eval_store, load_tokenizer=upload_tokenizer)
+    customer_env_admin.add_routes(router, customer_envs_served, deliveries=deliveries, eval_store=eval_store,
+                                  load_tokenizer=upload_tokenizer)
 
     @router.get("/architectures")
     async def architectures() -> dict:

@@ -49,7 +49,22 @@ def _number(value: Any) -> float | None:
     return out if out == out and out not in (float("inf"), float("-inf")) else None
 
 
-def expected_pay(task: Mapping[str, Any], *, served_envs: Iterable[str], asks: Mapping[str, float]) -> float | None:
+CUSTOMER_PREFIX = "customer:"
+
+
+def served_in(task: Mapping[str, Any], served_envs: Iterable[str], *, customer_envs: bool = False) -> list[str]:
+    """The envs of ``task`` this miner serves: its own list, and with ``customer_envs`` every customer env the task
+    trains (their prompts and settings come from the task itself)."""
+    served = list(dict.fromkeys(served_envs))
+    if customer_envs:
+        auction = task.get("auction")
+        envs = auction.get("environments") if isinstance(auction, Mapping) else None
+        served += sorted(e for e in (envs or {}) if str(e).startswith(CUSTOMER_PREFIX) and e not in served)
+    return served
+
+
+def expected_pay(task: Mapping[str, Any], *, served_envs: Iterable[str], asks: Mapping[str, float],
+                 customer_envs: bool = False) -> float | None:
     """Alpha per million matched tokens the task is expected to pay this miner, or None when none of its served envs
     has work for it (no auction, no budget nor allowance, or its ask over the ceiling)."""
     auction = task.get("auction")
@@ -57,7 +72,7 @@ def expected_pay(task: Mapping[str, Any], *, served_envs: Iterable[str], asks: M
     if not isinstance(envs, Mapping):
         return None
     total, any_work = 0.0, False
-    for env in served_envs:
+    for env in served_in(task, served_envs, customer_envs=customer_envs):
         view = envs.get(env)
         if not isinstance(view, Mapping):
             continue
@@ -81,7 +96,8 @@ def _model_fits(task: Mapping[str, Any], model: Mapping[str, Any] | None, curren
     return (named.get("id"), named.get("revision")) == (model.get("id"), model.get("revision"))
 
 
-def _best(tasks: list[dict], *, served_envs, asks, model, current, excluded) -> tuple[float, str] | None:
+def _best(tasks: list[dict], *, served_envs, asks, model, current, excluded,
+          customer_envs: bool = False) -> tuple[float, str] | None:
     best: tuple[float, str] | None = None
     for task in tasks:
         if not isinstance(task, Mapping) or not TASK_ID.fullmatch(str(task.get("task_id"))):
@@ -89,7 +105,7 @@ def _best(tasks: list[dict], *, served_envs, asks, model, current, excluded) -> 
         task_id = str(task["task_id"])
         if task_id in excluded or not _model_fits(task, model, current):
             continue
-        pay = expected_pay(task, served_envs=served_envs, asks=asks)
+        pay = expected_pay(task, served_envs=served_envs, asks=asks, customer_envs=customer_envs)
         if pay is None:
             continue
         if best is None or pay > best[0] or (pay == best[0] and task_id < best[1]):
@@ -149,8 +165,8 @@ class TaskChooser:
     """``fetch``: the task list (``fetch_tasks``). ``asks``: the miner's own offers, alpha per million tokens."""
 
     def __init__(self, fetch: Callable[[], Awaitable[list[dict] | None]], *, served_envs: Iterable[str],
-                 asks: Mapping[str, float], pinned: str | None = None) -> None:
-        self._fetch, self.pinned = fetch, pinned
+                 asks: Mapping[str, float], pinned: str | None = None, customer_envs: bool = False) -> None:
+        self._fetch, self.pinned, self.customer_envs = fetch, pinned, customer_envs
         self.served_envs, self.asks = set(served_envs), dict(asks)
         self.model: Mapping[str, Any] | None = None     # the engine's, once known (``adopt_model``)
         self.denied: set[str] = set()                   # tasks the engine cannot play, for the process's life
@@ -182,13 +198,13 @@ class TaskChooser:
             return None
         self.listed = {str(t["task_id"]): t for t in tasks if isinstance(t, Mapping) and "task_id" in t}
         best = _best(tasks, served_envs=self.served_envs, asks=self.asks, model=self.model, current=current,
-                     excluded=self.denied)
+                     excluded=self.denied, customer_envs=self.customer_envs)
         if current is None:
             return None if best is None else best[1]
         here = self.listed.get(current)
         if here is None or current in self.denied:            # gone, or not the engine's
             return None if best is None else best[1]
-        pay = expected_pay(here, served_envs=self.served_envs, asks=self.asks)
+        pay = expected_pay(here, served_envs=self.served_envs, asks=self.asks, customer_envs=self.customer_envs)
         if best is None or best[1] == current:
             return current
         if pay is None or best[0] >= MOVE_GAIN * pay:

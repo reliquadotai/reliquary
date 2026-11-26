@@ -31,7 +31,71 @@ def _bucket_get(key: str) -> bytes | None:
     return asyncio.run(SubnetEvalStore().get_bytes(key))
 
 
-def load_rows(env_id: str, *, read=_bucket_get, rows_dir: str | None = None) -> list[dict]:
+ROWS_URL_ENV = "RELIQUARY_CUSTOMER_ENV_ROWS_URL"
+PROMPT_SET_HEADER = "X-Prompt-Set-Sha256"
+
+
+def _rows_from_controller(base_url: str, env_id: str, *, get=None) -> list[dict]:
+    """A miner's rows: its task's controller serves them (the miner has no bucket access), hashed as qualified."""
+    if get is None:
+        import httpx
+
+        def get(url, params):
+            return httpx.get(url, params=params, timeout=120.0)
+
+    response = get(f"{base_url.rstrip('/')}/customer-envs/rows", {"env": env_id})
+    if response.status_code != 200:
+        raise RuntimeError(f"{env_id}: the controller serves no rows ({response.status_code})")
+    body = response.content
+    if hashlib.sha256(body).hexdigest() != response.headers.get(PROMPT_SET_HEADER):
+        raise RuntimeError(f"{env_id}: the served rows do not hash to the qualified prompt set")
+    return [json.loads(line) for line in body.splitlines() if line.strip()]
+
+
+def task_environments() -> list[str]:
+    """The customer envs this controller's contract names (its process profile)."""
+    from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE
+
+    return sorted(name for name in ACTIVE_PROTOCOL_PROFILE.environments if is_customer_env(name))
+
+
+_ROWS_CACHE: dict[str, tuple[bytes, str]] = {}
+
+
+def rows_body(env_id: str, *, read=_bucket_get) -> tuple[bytes, str]:
+    """The qualified rows' bytes and sha256, checked against the version's record (cached)."""
+    if env_id not in _ROWS_CACHE:
+        rows = load_rows(env_id, read=read, rows_dir="")
+        body = b"".join(json.dumps(r, sort_keys=True, separators=(",", ":")).encode() + b"\n" for r in rows)
+        _ROWS_CACHE[env_id] = (body, hashlib.sha256(body).hexdigest())
+    return _ROWS_CACHE[env_id]
+
+
+def mount_rows_routes(router) -> None:
+    """``GET /rl/customer-envs``: the task's customer envs; ``GET /rl/customer-envs/rows?env=``: one's rows."""
+    from fastapi.responses import JSONResponse, Response
+
+    @router.get("/rl/customer-envs")
+    async def customer_envs():
+        return {"environments": task_environments()}
+
+    @router.get("/rl/customer-envs/rows")
+    async def customer_env_rows(env: str = ""):
+        if env not in task_environments():
+            return JSONResponse(status_code=404, content={"reason": "unknown_environment"})
+        try:
+            body, sha = await asyncio.to_thread(rows_body, env)
+        except RuntimeError as exc:
+            return JSONResponse(status_code=503, content={"reason": str(exc)[:300]})
+        return Response(content=body, media_type="application/x-ndjson",
+                        headers={PROMPT_SET_HEADER: sha, "Cache-Control": "max-age=300"})
+
+
+def load_rows(env_id: str, *, read=_bucket_get, rows_dir: str | None = None, rows_url: str | None = None,
+              get=None) -> list[dict]:
+    rows_url = rows_url if rows_url is not None else os.environ.get(ROWS_URL_ENV)
+    if rows_url:
+        return _rows_from_controller(rows_url, env_id, get=get)
     env = parse_env_id(env_id)
     record_body = read(subnet_key(env, "record.json"))
     if record_body is None:
@@ -46,7 +110,10 @@ def load_rows(env_id: str, *, read=_bucket_get, rows_dir: str | None = None) -> 
         body = read(subnet_key(env, "prompts.jsonl"))
     if body is None or hashlib.sha256(body).hexdigest() != record["prompt_set"]["sha256"]:
         raise RuntimeError(f"{env_id}: its frozen rows are missing or changed")
-    return [json.loads(line) for line in body.splitlines() if line.strip()]
+    rows = [json.loads(line) for line in body.splitlines() if line.strip()]
+    if any(r.get("system") for r in rows):
+        raise RuntimeError(f"{env_id}: rows with a system prompt are not served to RL")
+    return rows
 
 
 class CustomerEnvironment:
@@ -119,4 +186,5 @@ def customer_spec(name: str):
         reward_lattice_policy="customer-continuous-v1", attainable_rewards=(), contract_version=CONTRACT_VERSION)
 
 
-__all__ = ["CONTRACT_VERSION", "CustomerEnvironment", "customer_spec", "load_rows", "score_customer_answers"]
+__all__ = ["CONTRACT_VERSION", "PROMPT_SET_HEADER", "ROWS_URL_ENV", "CustomerEnvironment", "customer_spec",
+           "load_rows", "mount_rows_routes", "rows_body", "score_customer_answers", "task_environments"]

@@ -615,7 +615,7 @@ def test_a_batch_of_leases_is_one_engine_call_each_request_keyed_by_its_own_leas
     generator = VllmGroupGenerator.__new__(VllmGroupGenerator)
     generator._engine = vllm_generation.VLLMRolloutGenerator("m", engine=llm, sampling_params_class=SimpleNamespace)
     generator.eos_ids = [10**6]
-    generator._prompt = lambda env, idx: [idx % vocab, (idx * 3) % vocab]
+    generator._prompt = lambda lease: [lease.prompt_idx % vocab, (lease.prompt_idx * 3) % vocab]
     monkeypatch.setattr("reliquary.constants.max_new_tokens_for_environment", lambda env: steps)
     leases = [HeldLease(f"L{i}", "math", 10 + i, 2, f"{i:02x}" * 32, 1e12) for i in range(3)]
     groups = generator.generate(leases)
@@ -624,7 +624,7 @@ def test_a_batch_of_leases_is_one_engine_call_each_request_keyed_by_its_own_leas
         assert len(group) == ROLLOUTS
         for index, completion in enumerate(group):
             uniforms, last, want = lease_uniforms(lease.nonce, lease.prompt_idx, 2, index, steps), \
-                generator._prompt("math", lease.prompt_idx)[-1], []
+                generator._prompt(lease)[-1], []
             for u in uniforms:
                 last = int(fs.pick_rows(table[last:last + 1], [u], draw=fs.DRAW_GUMBEL_MAX)[0])
                 want.append(last)

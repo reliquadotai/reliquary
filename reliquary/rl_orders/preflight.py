@@ -111,10 +111,10 @@ def _order(config, entry, now):
 
 def _async_settings(config, entry):
     from reliquary.cli.main import _envs_need_grader
-    from reliquary.protocol.profiles import PROFILES
+    from reliquary.protocol.profiles import entry_profile
     from reliquary.validator.rl_async_service import rl_async_settings
 
-    profile = PROFILES[entry.profile_id]
+    profile = entry_profile(entry)
     settings = rl_async_settings(entry, float(entry.params["cap"]), run=config.run_id,
                                  max_tokens=lambda env: profile.environments[env].max_new_tokens,
                                  environ={"RELIQUARY_RL_PAY_OUTAGE_FILL": "off",
