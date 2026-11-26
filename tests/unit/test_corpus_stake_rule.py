@@ -206,6 +206,58 @@ def test_a_reaudited_drift_leaves_every_stake_of_its_operator_in_its_hold(hotkey
     assert (store.verdicts[x]["audited"], store.verdicts[x]["passed"]) == (True, True)
 
 
+def test_a_reaudited_drift_leaves_the_stake_before_the_reaudit_awaits_anything():
+    """The drift Y leaves the stake as soon as the re-audit has counted it: before the escalation of the re-audit's
+    charged failure (5Cheat's) and before any void write awaits, so no decision meanwhile counts it. Here Y's void write
+    then raises (a store PUT failing after its retries): Y stays unvoided, payable until a retry voids it, but out of
+    the stake. X, received after it and held on Y's pass alone, is audited at its hold's end instead of paid unaudited
+    on it, and a later charged failure of Y's hotkey still forfeits Y (it stays in the forfeit books)."""
+    y, c, x = _ids(False, 1)[0], _ids(False, 1, start=300)[0], _ids(False, 1, start=500)[0]
+    store = _Store({y: _rec(0, received_at=T0), c: _rec(0, received_at=T0 + 10, hotkey="5Cheat"),
+                    x: _rec(0, received_at=T0 + 30)})
+    clock = _Clock(T0)
+    auditor = _auditor(store, clock, states=_States({HK: SAMPLED, "5Cheat": SAMPLED}))
+    auditor._draw_job = object()
+    passing = {"passed": True, "worst_exp": 0, "worst_mant_mean": 0.0, "worst_mant_median": 0.0}
+    refusing = {"now": False}
+
+    def judge(batch):
+        if not refusing["now"]:
+            return [dict(passing) for _ in batch]
+        return [{"passed": False, "reason": "draw_mismatch", **({"penalty": False} if r["hotkey"] == HK else {})}
+                for r in batch]
+
+    auditor._judge_many = judge
+    _judge_at(auditor, clock, T0 + 20, [y, c])
+    auditor._remote_scored["pod-1"] = [y, c]  # their passing audits, as if scored by pod-1
+    _judge_at(auditor, clock, T0 + 40, [x])
+    assert x not in store.verdicts and auditor._stake_of(x, T0 + 40) == 1.0 / Q  # Y's pass at stake: X waits
+    staked, escalate, write = [], auditor._escalate, store.write_voided
+
+    async def spy(*args, **kwargs):
+        staked.append(x in auditor._stake)
+        return await escalate(*args, **kwargs)
+
+    async def failing(job_id, sid, document):
+        if sid == y:
+            raise OSError("store PUT failed after its retries")
+        return await write(job_id, sid, document)
+
+    auditor._escalate, store.write_voided = spy, failing
+    refusing["now"], clock.now = True, T0 + 50
+    with pytest.raises(OSError):
+        asyncio.run(auditor.reaudit_executor("pod-1"))
+    assert staked == [False]
+    assert y not in store.voided and store.verdicts[y]["passed"] and auditor._stake_of(x, T0 + 50) == 1.0
+    refusing["now"] = False
+    _judge_at(auditor, clock, T0 + 30 + HOLD + 1, [x])
+    assert (store.verdicts[x]["audited"], store.verdicts[x]["passed"]) == (True, True)
+    store.write_voided = write
+    later = _ids(False, 1, start=900)[0]
+    asyncio.run(auditor._escalate({HK: [later]}, clock.now, {later: T0 + 5}))
+    assert store.voided[y]["reason"] == "forfeited" and x not in store.voided
+
+
 def test_the_stake_is_counted_once():
     y = _ids(False, 1)[0]
     sid = _ids(False, 1, start=500)[0]

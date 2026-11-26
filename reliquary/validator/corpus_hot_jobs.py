@@ -24,6 +24,22 @@ JOB_REFRESH_SECONDS = 60.0
 # Transient wiring failures of one task before they are logged as errors.
 WIRE_FAILURES_LOUD = 5
 
+# How long a job the registry lists but this process has not wired is waited for (503 `job_not_ready`, listed
+# `restoring`), and any unknown job while the registry is unread (`booting`): until RESTORE_ATTEMPTS passes ended
+# without wiring it (or registry reads failed), or RESTORE_SECONDS since it was first waited for, whichever comes
+# first. Then it is unknown again (404): a miner stops instead of waiting on an order that is not coming back.
+# Both are checked when a pass or a failed registry read ends, never when a pass starts: a job not given up yet is
+# waited for through the pass that retries it, however late that starts. So they bound only passes that end: a pass
+# that never returns, or registry reads failing once one succeeded (the pass stops there), keep the jobs at 503.
+# A restart's first pass is one attempt, however long: on 2026-11-24's registry it read 203, then 243, final
+# statuses one after another before each SWE order, then spent up to 120 s on its ledgers and 60 s on its gateway
+# digest (`STARTUP_LEDGER_TIMEOUT_SECONDS`, `eval_control.GATEWAY_DIGEST_TIMEOUT_S`): about 10 minutes at worst for
+# the second SWE order. RESTORE_SECONDS lets that pass end with minutes to spare, and its retry is then waited for
+# in full. Three failed passes (a minute apart) are a fault, not a restart: a manifest or ledger that does not parse
+# fails the same way every time.
+RESTORE_ATTEMPTS = 3
+RESTORE_SECONDS = 900.0
+
 # Miner statuses cached at once, across jobs: the oldest is dropped first.
 MINER_STATUS_ENTRIES = 4096
 
@@ -228,6 +244,16 @@ class CorpusJobSet:
         self._retired_before: set[str] = set()
         # Transient wiring failures per task id, retried every refresh.
         self._wire_failures: collections.Counter = collections.Counter()
+        # What the restoring and booting bounds count (`RESTORE_ATTEMPTS`, `RESTORE_SECONDS`): per job id waited
+        # for, since when and the passes that ended without wiring it; the jobs no longer waited for.
+        self._booted_at = clock()
+        self._boot_failures = 0
+        self._restoring_since: dict[str, float] = {}
+        self._restore_failures: collections.Counter = collections.Counter()
+        self._given_up: set[str] = set()
+        if self.refreshing:
+            # Until the registry is read, a job a miner names may be one about to be wired again.
+            routes.booting = True
 
     @property
     def refreshing(self) -> bool:
@@ -281,12 +307,14 @@ class CorpusJobSet:
         except Exception:
             logger.exception("corpus job refresh: the task registry could not be read; "
                              "serving the same jobs until the next refresh")
+            self._boot_failed()
             return
         from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION
 
         corpus = {task_id: entry for task_id, entry in sorted(entries.items())
                   if getattr(entry, "mechanism", None) == MECHANISM_CORPUS_GENERATION}
         by_task = {str(w.entry.task_id): job_id for job_id, w in self.served.items()}
+        self._mark_restoring(corpus, by_task)
         for task_id, job_id in by_task.items():
             entry = corpus.get(task_id)
             wiring = self.served[job_id]
@@ -314,11 +342,65 @@ class CorpusJobSet:
                 if await self._finished_for_good(task_id, str(entry.job_id)):
                     continue
             await self._consider(entry)
+        # Left restoring: the jobs whose wiring failed for now and is retried next refresh.
+        self._mark_restoring(corpus, by_task, attempted=True)
         # Never in the refresh that retired it: a submit admitted just before
         # may not have written its record yet.
         for job_id in [j for j in self.served if j in self._retired_before]:
             await self._maybe_unwire(job_id)
         self._retired_before = {j for j in self.served if self.is_retired(j)}
+
+    def _mark_restoring(self, corpus: Mapping[str, Any], by_task: Mapping[str, str], *,
+                        attempted: bool = False) -> None:
+        """The active jobs this refresh may still wire: a miner asking for one hears `job_not_ready`. ``attempted``:
+        the pass is over, each one left failed to wire this time. Only then are the bounds checked
+        (`RESTORE_ATTEMPTS`, `RESTORE_SECONDS`, counted from the start for a job a read lists while booting, else from
+        the pass that first lists it): past them it is unknown again (404), through the later passes too, while its
+        wiring is still retried. One not given up yet is waited for through the next pass, however late that starts:
+        its attempt may wire it."""
+        now = self._clock()
+        waiting = {
+            str(entry.job_id) for task_id, entry in corpus.items()
+            if entry.status == "active" and task_id not in by_task and task_id not in self._passed_over
+            and str(entry.job_id) not in self.served and str(entry.job_id) not in self.finished
+            # Passed over from the entry alone (`screen`: another control's job), by this pass: never waited for.
+            and (self._screen is None or self._screen(entry) is None)}
+        first_read = getattr(self._routes, "booting", False)
+        restoring = set()
+        for job_id in sorted(waiting):
+            since = self._restoring_since.setdefault(job_id, self._booted_at if first_read else now)
+            if job_id in self._given_up:
+                continue
+            if attempted:
+                self._restore_failures[job_id] += 1
+                failures = self._restore_failures[job_id]
+                if failures >= RESTORE_ATTEMPTS or now - since >= RESTORE_SECONDS:
+                    self._given_up.add(job_id)
+                    logger.error("corpus job %s: still not wired after %d attempt(s) in %d s; miners asking for it "
+                                 "hear 404 corpus_job_not_served again (its wiring is still retried)", job_id,
+                                 failures, round(now - since))
+                    continue
+            restoring.add(job_id)
+        for job_id in set(self._restoring_since) - waiting:
+            # Wired, refused or no longer active: a later wait starts afresh.
+            del self._restoring_since[job_id]
+            self._restore_failures.pop(job_id, None)
+            self._given_up.discard(job_id)
+        self._routes.restoring = restoring
+        self._routes.booting = False
+
+    def _boot_failed(self) -> None:
+        """A registry read failed before any succeeded: past the bounds, a job not served here is unknown again
+        (404) and the order list answers with what is served."""
+        if not getattr(self._routes, "booting", False):
+            return
+        self._boot_failures += 1
+        waited = self._clock() - self._booted_at
+        if self._boot_failures >= RESTORE_ATTEMPTS or waited >= RESTORE_SECONDS:
+            self._routes.booting = False
+            logger.error("corpus job refresh: the task registry is still unread after %d attempt(s) in %d s; "
+                         "jobs not served here answer 404 corpus_job_not_served again", self._boot_failures,
+                         round(waited))
 
     async def _finished_for_good(self, task_id: str, job_id: str) -> bool:
         """A retired job whose final status is stored: never wired again."""

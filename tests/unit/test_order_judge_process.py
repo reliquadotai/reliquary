@@ -686,7 +686,8 @@ def _restart_reaudit(monkeypatch, slice_records, *, slice_tokens=None, in_flight
     in order; ``run.most_live``: the most records alive at once; ``run.most_audits``: the most audits under way at
     once. ``wait``: how long an audit takes, four times that with a record whose index is in ``slow``. ``broken``:
     (index, exception) of a record that fails every batch it is in, as a malformed record does
-    (`EvalAuditor._audit_outcomes` turns it into a validator error per record)."""
+    (`EvalAuditor._audit_outcomes` turns it into a validator error per record), or (index, outcome) of one whose
+    every batch comes back with that outcome per record (a parked batch: `_Parked`)."""
     import weakref
 
     from reliquary.validator import corpus_auditor, eval_control
@@ -756,12 +757,14 @@ def _restart_reaudit(monkeypatch, slice_records, *, slice_tokens=None, in_flight
             run.firsts.append(ids)                  # a slice's first audit
         seen.update(ids)
         if broken is not None and any(record["submission_id"] == run.broken for record in records):
-            raise broken[1]
+            if isinstance(broken[1], BaseException):
+                raise broken[1]
+            return [broken[1] for _ in records]
         return [{"passed": False, "reason": "draw_mismatch", **({"penalty": False} if sid == run.drift else {})}
                 if sid in (run.charged, run.drift) else {"passed": True}
                 for sid in (record["submission_id"] for record in records)]
 
-    async def escalate(failures, now, received=None):
+    async def escalate(failures, now, received=None, documents=None):
         run.events.append(("escalate", {hotkey: sorted(ids) for hotkey, ids in failures.items()}, dict(received)))
         return {}
 
@@ -783,7 +786,7 @@ def _restart_reaudit(monkeypatch, slice_records, *, slice_tokens=None, in_flight
 
 def _restart_effects(run):
     """What `_restart_reaudit` pins when both refusals are re-audited: the charge, both voids, the drift's slot
-    reopened as its void lands, the charged refusal's after every void."""
+    reopened once every void is written, before the status hears of its void, the charged refusal's after."""
     return [("escalate", {"5B": [run.charged]}, {run.charged: float(int(run.charged, 16)),
                                                  run.drift: float(int(run.drift, 16))}),
             ("void", run.charged, "X", True), ("reported", run.charged),
@@ -843,13 +846,14 @@ def test_a_restart_re_audit_keeps_a_few_slices_in_flight(monkeypatch, in_flight)
                                    RuntimeError("trajectory audit is not available on remote executors"),
                                    "parked"])
 def test_a_batch_error_spares_only_its_slices_passes(monkeypatch, error):
-    """A batch the eval auditor's audit fails (a malformed record, a trajectory refused here, or a parked batch)
-    leaves its records with a validator error: neither voided nor charged. Only its slice's: the drift two slices on
-    is still voided, while the refusal sharing the slice of the record that breaks the batch is spared until the
-    next start. With one audit of every pass, that one record shielded them all."""
-    from reliquary.validator.eval_control import BatchParked
+    """A batch the eval auditor's audit fails (a malformed record, a trajectory refused here) leaves its records with
+    a validator error, and a parked batch leaves them parked (`_Parked`, per record): neither voided nor charged.
+    Only its slice's: the drift two slices on is still voided, while the refusal sharing the slice of the record that
+    breaks the batch is spared until the next start. With one audit of every pass, that one record shielded them
+    all."""
+    from reliquary.validator.eval_control import _Parked
 
-    error = BatchParked("no v3 executor") if error == "parked" else error
+    error = _Parked("no v3 executor") if error == "parked" else error
     run = _restart_reaudit(monkeypatch, 4, broken=(1, error))
     assert run.effects == [("void", run.drift, "X", False), ("reopen", run.drift), ("ledger", run.drift),
                            ("reported", run.drift)]

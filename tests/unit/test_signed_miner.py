@@ -519,6 +519,109 @@ def test_a_permanent_session_refusal_halts_the_identity():
     assert counts["session_refused:hotkey_not_registered"] == 1 and counts["halted"] == 1
 
 
+class FirstRunsLongRunner(LoopRunner):
+    """The first episode runs on; every later open is refused ``refuse``."""
+
+    def __init__(self, refuse):
+        super().__init__()
+        self.later_refusal, self.calls = refuse, 0
+
+    async def run(self, index, on_session=None):
+        self.calls += 1
+        if self.calls > 1:
+            raise self.later_refusal
+        on_session(f"s{index}")
+        await asyncio.sleep(0.05)
+        return await super().run(index, on_session=on_session)
+
+
+def _mine_two(loop_runner, client=None):
+    identity = Identity("5Hot", sign=lambda body: "sig", episodes=5, sign_binding=lambda binding: "s")
+    counts = asyncio.run(mine_agentic(
+        job=JOB, identities=[identity], client=client or FakeClient(), engine=FakeEngine(), runners={},
+        runner_for=lambda identity: loop_runner, decode=lambda ids: "".join(map(str, ids)), concurrency=2))
+    return counts["5Hot"]
+
+
+def test_a_validator_that_stops_answering_opens_keeps_the_running_episodes():
+    # 2026-11-24: a control restart made miners cancel episodes up to 45 minutes old.
+    loop_runner = FirstRunsLongRunner(SessionRefused("validator_unavailable"))
+    counts = _mine_two(loop_runner)
+    assert counts["halted"] == 1 and counts["episode_cancelled"] == 0
+    assert counts["accepted"] == 1 and len(loop_runner.submitted) == 1
+    assert loop_runner.calls == 2
+
+
+def test_a_refused_hotkey_still_cancels_the_running_episodes():
+    loop_runner = FirstRunsLongRunner(SessionRefused("hotkey_not_registered"))
+    counts = _mine_two(loop_runner)
+    assert counts["halted"] == 1 and counts["episode_cancelled"] == 1
+    assert counts["accepted"] == 0 and loop_runner.released == []
+
+
+def test_a_submission_the_validator_never_answers_keeps_the_other_episodes(monkeypatch):
+    import reliquary.miner.agentic_miner as agentic_miner
+    from reliquary.miner.corpus_miner import CorpusMinerHalted
+
+    calls = []
+
+    def submit(client, body, counts, submit_by=None):
+        calls.append(body["prompt_index"])
+        if len(calls) == 1:
+            raise CorpusMinerHalted("5 consecutive permanent failures: 404", counts=counts, failed_call=True)
+        return {"reason": "accepted", "accepted": True}
+
+    class TwoRunner(LoopRunner):
+        runs = 0
+
+        async def run(self, index, on_session=None):
+            # The second episode ends after the first one's submission failed.
+            self.runs += 1
+            if self.runs > 1:
+                on_session(f"s{index}")
+                await asyncio.sleep(0.05)
+            return await super().run(index, on_session=on_session)
+
+    monkeypatch.setattr(agentic_miner, "_submit", submit)
+    loop_runner = TwoRunner()
+    counts = _mine_two(loop_runner)
+    assert counts["halted"] == 1 and counts["episode_cancelled"] == 0
+    assert len(calls) == 2 and len(loop_runner.submitted) == 1
+
+
+@pytest.mark.parametrize("stop", ["job_retired", "hotkey_refused"])
+def test_a_retired_job_or_a_refused_hotkey_on_a_submission_cancels_the_episodes_under_way(monkeypatch, stop):
+    # `stop_on`'s other branch: what the validator answered for good (a retired job, this hotkey refused, never a
+    # call that kept failing) cancels the episodes under way too, which would only submit into the same refusal.
+    import reliquary.miner.agentic_miner as agentic_miner
+    from reliquary.miner.corpus_miner import CorpusJobRetired, CorpusMinerHalted
+
+    calls = []
+
+    def submit(client, body, counts, submit_by=None):
+        calls.append(body["prompt_index"])
+        if stop == "job_retired":
+            raise CorpusJobRetired("410 job_retired from /corpus/jobs/x/submit")
+        raise CorpusMinerHalted("the validator refused this hotkey: hotkey_not_registered", counts=counts)
+
+    class TwoRunner(LoopRunner):
+        runs = 0
+
+        async def run(self, index, on_session=None):
+            # The second episode has its session and is under way when the first one's submission is refused.
+            self.runs += 1
+            if self.runs > 1:
+                on_session(f"s{index}")
+                await asyncio.sleep(0.05)
+            return await super().run(index, on_session=on_session)
+
+    monkeypatch.setattr(agentic_miner, "_submit", submit)
+    loop_runner = TwoRunner()
+    counts = _mine_two(loop_runner)
+    assert counts["halted"] == 1 and counts["episode_cancelled"] == 1
+    assert len(calls) == 1 and loop_runner.submitted == []
+
+
 def test_a_bad_signature_halts_with_a_validator_hotkey_hint(caplog):
     caplog.set_level("INFO", logger="reliquary.miner.agentic_miner")
     counts, _ = _mine(LoopRunner(refuse=SessionRefused("bad_signature", status=403)))
