@@ -195,31 +195,63 @@ def test_the_record_with_an_unreadable_item_is_parked_alone_and_the_rest_of_its_
 # -- parking only on evidence against the batch --------------------------------
 
 
-def test_a_batch_lost_on_two_providers_once_witnessed_is_parked_and_its_witnessed_strikes_taken_back():
+async def _settled():
+    """A few loop turns: a call whose batch was parked by a sweep has ended by then."""
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+
+async def _lose(pool, eid, *, witnessed=True, **placement):
+    """``eid`` takes the oldest batch it may and loses it (its lease expires); witnessed when it scored another
+    lease meanwhile. Returns the lost lease."""
+    lease = pool.claim(eid, **placement)
+    assert lease is not None
+    if witnessed:
+        await _witness(pool, eid, **placement)
+    await pool.expire(lease)
+    return lease
+
+
+def test_a_batch_lost_by_working_cards_on_two_providers_is_parked_and_their_strikes_taken_back():
     async def go():
         pool = _Pool()
-        poison, good = pool.call(_items(1)), pool.call(_items(1))
+        poison = pool.call(_items(1))
         await asyncio.sleep(0)
-        a1 = pool.claim("a")                               # the poison batch, the oldest
-        a2 = pool.claim("a")                               # and the good one
-        pool.now += 1
-        assert await pool.answer("a", a2) == "accepted"    # a scores: its loss of the poison is witnessed
-        await _ended(good)
-        await pool.expire(a1)
+        a1 = await _lose(pool, "a")
+        await _settled()
         assert pool.strikes("a") == 1 and not poison.done()    # struck, as #493 does; the batch still queued
-        b1 = pool.claim("b")                               # another provider takes it, answers nothing
+        b1 = await _lose(pool, "b")                        # a working card of another provider loses it too
         assert b1["batch"] == a1["batch"]
-        await pool.expire(b1)
         with pytest.raises(BatchParked) as parked:
             await _ended(poison)
         assert parked.value.indexes == [0] and parked.value.batch_ids == [a1["batch"]]
-        assert pool.strikes("a") == 0                      # it works, the batch does not: taken back
-        assert pool.strikes("b") == 1                      # unwitnessed: it stands
+        assert pool.strikes("a") == 0 and pool.strikes("b") == 0   # they work, the batch does not
         status = pool.dispatcher.status()
         reason = status["jobs"][JOB]["reasons"][-1]
-        assert "a (prov-a, witnessed)" in reason and "b (prov-b)" in reason and "2 providers" in reason
-        assert status["parks_by_executor"] == {"a": 1, "b": 1} and status["stats"]["unanswered_parked"] == 1
+        assert "lost by working cards on 2 providers: a (prov-a), b (prov-b)" in reason
+        assert status["parks_by_provider"] == {"prov-a": 1, "prov-b": 1}
+        assert status["stats"]["unanswered_parked"] == 1 and status["jobs"][JOB]["parked_batches"] == 1
         assert pool.quarantined == []
+    _run(go)
+
+
+def test_an_unwitnessed_loss_is_no_evidence_however_old_or_fresh():
+    """A loss by a card that scored nothing since (dead, slow, or long gone) proves nothing against the batch: it
+    cannot complete another card's witnessed loss (the review of 8349fe16b borrowed such a loss to park)."""
+    async def go():
+        pool = _Pool()
+        poison = pool.call(_items(1))
+        await asyncio.sleep(0)
+        h1 = await _lose(pool, "h", witnessed=False)       # an old loss, of a card that answered nothing
+        pool.now += 11_000
+        m1 = await _lose(pool, "m")                        # a working card of another provider, hours later
+        assert m1["batch"] == h1["batch"]
+        await _settled()
+        assert not poison.done(), "a witnessed loss borrowed an unwitnessed one to park"
+        assert pool.strikes("m") == 1
+        await _lose(pool, "c")                             # a second working card: now the evidence holds
+        with pytest.raises(BatchParked):
+            await _ended(poison)
     _run(go)
 
 
@@ -229,27 +261,25 @@ def test_losses_on_one_provider_never_park_a_batch_and_its_cards_take_other_work
         poison = pool.call(_items(1))
         await asyncio.sleep(0)
         for eid in ("a", "b"):                             # two working cards of one provider, on two hosts
-            lease = pool.claim(eid, provider="prov-x")
-            await _witness(pool, eid, provider="prov-x")
-            await pool.expire(lease)
+            await _lose(pool, eid, provider="prov-x")
             # Benched from the batch it lost: it takes other work instead of losing that one again at once.
             assert pool.claim(eid, provider="prov-x") is None
+        await _settled()
         assert not poison.done(), "one provider's losses parked a batch"
         nxt = pool.call(_items(1), job="order-eval-next")
         await asyncio.sleep(0)
         lease = pool.claim("b", provider="prov-x")
         assert lease["job"] == "order-eval-next" and await pool.answer("b", lease) == "accepted"
         await _ended(nxt)
-        c = pool.claim("c")                                # a third provider: the evidence that was missing
-        await pool.expire(c)
+        await _lose(pool, "c")                             # a third provider: the evidence that was missing
         with pytest.raises(BatchParked):
             await _ended(poison)
     _run(go)
 
 
-def test_cards_that_answer_nothing_never_park_a_batch_and_are_still_set_aside():
-    """#493: a card that answers nothing is set aside after two lost results. None of its losses is witnessed, so a dead
-    pool parks nothing, and the first working card scores the batches."""
+def test_cards_that_answer_nothing_never_park_a_batch_and_are_still_set_aside_as_before():
+    """#493: a card that answers nothing is set aside after two lost results, as soon as before (it is not benched).
+    None of its losses is witnessed, so a dead pool parks nothing and the first working card scores the batches."""
     async def go():
         pool = _Pool()
         calls = [pool.call(_items(1)) for _ in range(2)]
@@ -258,9 +288,10 @@ def test_cards_that_answer_nothing_never_park_a_batch_and_are_still_set_aside():
             first = pool.claim(eid)
             await pool.expire(first)
             second = pool.claim(eid)
-            assert second["batch"] != first["batch"]      # benched from the batch it lost
+            assert second["batch"] == first["batch"]       # not benched: it is a lost card, not a lost batch
             await pool.expire(second)
         assert pool.quarantined == ["dead1", "dead2"]
+        await _settled()
         assert not any(call.done() for call in calls)
         for _ in range(2):
             assert await pool.answer("good", pool.claim("good")) == "accepted"
@@ -269,26 +300,55 @@ def test_cards_that_answer_nothing_never_park_a_batch_and_are_still_set_aside():
 
 
 def test_an_answer_with_no_measure_witnesses_nothing():
-    """A result of statuses with no chunk (proof_undecodable) costs no GPU: it proves nothing about its card."""
+    """A result of statuses with no chunk (proof_undecodable) costs no GPU, nor does a partly unmeasured one: neither
+    proves anything about its card."""
+    from reliquary.validator.corpus_audit_protocol import AuditResult as Result
+
     async def go():
         pool = _Pool()
         poison = pool.call(_items(1))
         await asyncio.sleep(0)
-        a1 = pool.claim("a")
-        pool.now += 1
-        cheap = pool.call(_items(1), job="order-eval-cheap")
-        await asyncio.sleep(0)
-        a2 = pool.claim("a")
-        assert await pool.answer("a", a2, _status(a2, "proof_undecodable")) == "accepted"
-        await cheap
-        await pool.expire(a1)
-        await pool.expire(pool.claim("b"))
+        for eid, answer in (("a", lambda lease: _status(lease, "proof_undecodable")),
+                            ("b", lambda lease: Result.model_validate({"scores": [
+                                {"status": "ok", "chunks": [[1, 1.0, 1.0]]},
+                                {"status": "proof_undecodable", "chunks": []}]}))):
+            lost = pool.claim(eid)
+            pool.now += 1
+            cheap = pool.call(_items(2), job=f"order-eval-cheap-{eid}")
+            await asyncio.sleep(0)
+            other = pool.claim(eid)
+            assert await pool.answer(eid, other, answer(other)) == "accepted"
+            await _ended(cheap)
+            await pool.expire(lost)
+        await _settled()
         assert not poison.done(), "an answer with no measure was taken for a witness"
-        c1 = pool.claim("c")                               # a measured witness, then a loss: now it parks
-        await _witness(pool, "c")
-        await pool.expire(c1)
-        with pytest.raises(BatchParked):
-            await _ended(poison)
+        assert pool.dispatcher.stats["witnessed_losses"] == 0
+    _run(go)
+
+
+def test_a_measured_answer_witnesses_only_later_leases_and_only_for_an_undecided_batch():
+    """A card that scored once and then died witnesses nothing; nor does an answer to a batch already decided or
+    cancelled (it costs nothing: nobody reads it)."""
+    async def go():
+        pool = _Pool()
+        await _witness(pool, "a")                          # a scores before it takes the poison
+        pool.now += 1
+        poison = pool.call(_items(1))
+        await asyncio.sleep(0)
+        await _lose(pool, "a", witnessed=False)
+        gone = pool.call(_items(1), job="order-eval-gone")
+        await asyncio.sleep(0)
+        b1 = pool.claim("b")
+        b2 = pool.claim("b")
+        assert (b1["job"], b2["job"]) == (JOB, "order-eval-gone")
+        gone.cancel()
+        await asyncio.sleep(0)
+        pool.now += 1
+        assert await pool.answer("b", b2) == "unneeded"    # measured, but for a batch nobody waits for
+        await pool.expire(b1)
+        await _settled()
+        assert not poison.done() and pool.dispatcher.stats["witnessed_losses"] == 0
+        poison.cancel()
     _run(go)
 
 
@@ -297,9 +357,7 @@ def test_the_losses_of_a_card_quarantined_since_no_longer_count():
         pool = _Pool()
         poison = pool.call(_items(1))
         await asyncio.sleep(0)
-        a1 = pool.claim("a")
-        await _witness(pool, "a")
-        await pool.expire(a1)                              # a: one witnessed loss of the poison
+        a1 = await _lose(pool, "a")                        # a: one witnessed loss of the poison
         other = pool.call(_items(1), job="order-eval-other")
         await asyncio.sleep(0)
         a2 = pool.claim("a")                               # benched from the poison: a loses another batch
@@ -308,66 +366,130 @@ def test_the_losses_of_a_card_quarantined_since_no_longer_count():
         assert pool.quarantined == ["a"]
         b1 = pool.claim("b")
         b2 = pool.claim("b")
-        assert (b1["job"], b2["job"]) == (JOB, "order-eval-other")
+        assert (b1["batch"], b2["job"]) == (a1["batch"], "order-eval-other")
         pool.now += 1
         assert await pool.answer("b", b2) == "accepted"    # b works: its loss is witnessed
         await _ended(other)
         await pool.expire(b1)
+        await _settled()
         assert not poison.done(), "a quarantined card's loss still counted"
-        c1 = pool.claim("c")
-        await _witness(pool, "c")
-        await pool.expire(c1)
+        await _lose(pool, "c")
         with pytest.raises(BatchParked):
             await _ended(poison)
     _run(go)
 
 
-def test_a_cards_losses_count_towards_two_parks_an_hour_at_most():
+def test_a_providers_losses_count_towards_two_parks_an_hour_at_most_whatever_its_card():
+    """The cap is the provider's: a card rented again on it (a fresh executor id) does not start a fresh cap."""
     async def go():
         pool = _Pool()
         for k in range(3):
             call = pool.call(_items(1))
             await asyncio.sleep(0)
-            m = pool.claim("m")                            # m drops the batch, but scores elsewhere
-            await _witness(pool, "m")
-            await pool.expire(m)
-            await pool.expire(pool.claim(f"o{k}"))         # a fresh card of another provider loses it too
+            await _lose(pool, f"m{k}", provider="prov-m")  # each time a fresh card of the same provider
+            await _lose(pool, f"o{k}")                     # and a working card of another provider
             if k < 2:
                 with pytest.raises(BatchParked):
                     await _ended(call)
-                assert pool.strikes("m") == 0
+                assert pool.strikes(f"m{k}") == 0
             else:
-                assert not call.done(), "a third park in the hour counted m's losses"
-                assert pool.strikes("m") == 1
+                await _settled()
+                assert not call.done(), "a third park in the hour counted prov-m's losses"
+                assert pool.strikes("m2") == 1
                 call.cancel()
-        last = pool.call(_items(1))
+        assert pool.dispatcher.status()["parks_by_provider"]["prov-m"] == 2
+        pool.now += 3601                                   # an hour later its losses count again
+        call = pool.call(_items(1))
         await asyncio.sleep(0)
-        await pool.expire(pool.claim("m"))                 # past its cap its losses only strike
-        assert "m" in pool.quarantined
-        last.cancel()
+        await _lose(pool, "m3", provider="prov-m")
+        await _lose(pool, "o3")
+        with pytest.raises(BatchParked):
+            await _ended(call)
     _run(go)
 
 
-def test_witnessed_losses_count_against_their_card():
+def test_a_park_takes_back_only_the_strikes_its_batch_gave_and_none_a_clean_streak_cleared():
+    async def go():
+        pool = _Pool()
+        pool.dispatcher._strikes_limit = 4
+        poison = pool.call(_items(1))
+        await asyncio.sleep(0)
+        e1 = pool.claim("e")
+        await _witness(pool, "e")
+        with pytest.raises(LeaseRefused):
+            await pool.answer("e", e1, _misfit(e1))        # a witnessed lost result: strike 1
+        for _ in range(ec.CLEAN_STREAK):                   # a clean streak clears it
+            await _witness(pool, "e")
+        assert pool.strikes("e") == 0
+        other = pool.call(_items(1), job="order-eval-other")
+        await asyncio.sleep(0)
+        e2 = pool.claim("e")
+        assert e2["job"] == "order-eval-other"
+        await pool.expire(e2)                              # a new loss elsewhere: strike 1
+        assert pool.strikes("e") == 1
+        other.cancel()
+        await asyncio.sleep(0)
+        await _lose(pool, "b")                             # a working card of another provider: parked
+        with pytest.raises(BatchParked):
+            await _ended(poison)
+        assert pool.strikes("e") == 1, "the park took back a strike the clean streak had already cleared"
+    _run(go)
+
+
+def test_witnessed_losses_count_against_their_card_and_reset_its_clean_streak():
     """A card that scores some leases and drops others is still set aside after two lost results (#493's card on the
     2026-11-11 DNS fault delivered some results): a witnessed loss strikes as any loss, and resets its clean streak."""
     async def go():
         pool = _Pool()
-        for k in range(2):
+        pool.dispatcher._strikes_limit = 3
+        for k in range(3):
             call = pool.call(_items(1), job=f"order-eval-{k}")
             await asyncio.sleep(0)
-            lost = pool.claim("flaky")
-            await _witness(pool, "flaky")
-            await pool.expire(lost)
+            await _lose(pool, "flaky")
             call.cancel()
-        assert pool.quarantined == ["flaky"] and pool.dispatcher.stats["witnessed_losses"] == 2
+            for _ in range(k):                             # fewer than a clean streak between losses
+                await _witness(pool, "flaky")
+        assert pool.quarantined == ["flaky"] and pool.dispatcher.stats["witnessed_losses"] == 3
+    _run(go)
+
+
+def test_two_scorers_need_witnessed_losses_on_a_third_provider():
+    async def go():
+        pool = _Pool(scorers=2)
+        poison = pool.call(_items(1))
+        await asyncio.sleep(0)
+        a1, b1 = pool.claim("a"), pool.claim("b")
+        assert a1["batch"] == b1["batch"]
+        witnesses = []
+
+        async def witness(eid):                            # a measured answer to an undecided batch of its own
+            pool.now += 1
+            witnesses.append(pool.call(_items(1), job=f"order-eval-witness-{eid}"))
+            await asyncio.sleep(0)
+            lease = pool.claim(eid)                        # its own, or another's still needing a second scorer
+            assert lease["job"].startswith("order-eval-witness-")
+            pool.now += 1
+            assert await pool.answer(eid, lease) == "accepted"
+
+        await witness("a")
+        await witness("b")
+        await pool.expire(a1)
+        await _settled()
+        assert not poison.done(), "two providers parked a batch that needs two scorers"
+        c1 = pool.claim("c")
+        await witness("c")
+        await pool.expire(c1)
+        with pytest.raises(BatchParked):
+            await _ended(poison)
+        for call in witnesses:
+            call.cancel()
     _run(go)
 
 
 # -- one card cannot hold a batch; the 2 s before a sweep ------------------------
 
 
-def test_an_error_answer_benches_its_card_from_that_batch():
+def test_an_error_answer_benches_its_card_from_that_batch_doubling_up_to_an_hour():
     """Before: an ITEM_ERROR answered in time struck nothing and the card took the same batch again at once, so one
     card held the oldest batch, and the queue behind it, for ever."""
     async def go():
@@ -381,10 +503,16 @@ def test_an_error_answer_benches_its_card_from_that_batch():
         assert second["batch"] != first["batch"], "the card took the batch it answered with errors again"
         assert await pool.answer("e", second) == "accepted"
         await _ended(behind)
-        assert pool.claim("e") is None                     # still benched from the first
-        pool.now += BENCH + 1
-        again = pool.claim("e")
-        assert again["batch"] == first["batch"] and await pool.answer("e", again) == "accepted"
+        for seconds in (300, 600, 1200, 2400, 3600, 3600):
+            pool.now += seconds - 1
+            assert pool.claim("e") is None, f"benched less than {seconds} s"
+            pool.now += 1.5
+            again = pool.claim("e")
+            assert again is not None and again["batch"] == first["batch"]
+            if seconds == 3600 and pool.dispatcher.stats["benched"] >= 6:
+                assert await pool.answer("e", again) == "accepted"
+                break
+            assert await pool.answer("e", again, _status(again, "error")) == "requeued"
         await _ended(held)
     _run(go)
 
@@ -404,7 +532,8 @@ def test_a_result_that_does_not_fit_in_time_is_a_lost_result():
 
 
 @pytest.mark.parametrize("answer", ["error", "misfit"])
-def test_an_answer_between_expiry_and_sweep_counts_as_the_sweep_would(answer):
+@pytest.mark.parametrize("full_length", [True, False])
+def test_an_answer_between_expiry_and_sweep_counts_as_the_sweep_would(answer, full_length):
     """Before: anything posted in the 2 s between a lease's expiry and the next sweep removed the lease and struck
     nothing; the executor knows its expires_at exactly."""
     async def go():
@@ -412,11 +541,27 @@ def test_an_answer_between_expiry_and_sweep_counts_as_the_sweep_would(answer):
         call = pool.call(_items(1))
         await asyncio.sleep(0)
         lease = pool.claim("w")
+        pool.dispatcher.lease_of(lease["lease_id"]).full_length = full_length
         pool.now = lease["expires_at"] + 0.05              # expired, not swept yet
         with pytest.raises(LeaseRefused) as refused:
             await pool.answer("w", lease, _status(lease, "error") if answer == "error" else _misfit(lease))
         assert refused.value.status == 410
         assert pool.strikes("w") == 1 and pool.claim("w") is None
+        call.cancel()
+    _run(go)
+
+
+def test_a_scored_answer_between_expiry_and_sweep_to_the_longest_lease_stays_a_lost_result():
+    async def go():
+        pool = _Pool()
+        call = pool.call(_items(1))
+        await asyncio.sleep(0)
+        lease = pool.claim("w")
+        assert pool.dispatcher.lease_of(lease["lease_id"]).full_length
+        pool.now = lease["expires_at"] + 0.05
+        with pytest.raises(LeaseRefused):
+            await pool.answer("w", lease)
+        assert pool.strikes("w") == 1
         call.cancel()
     _run(go)
 
@@ -434,18 +579,19 @@ def test_the_first_park_ends_the_call_at_once_cancels_its_other_batches_and_keep
             middle = pool.claim(eid)                       # an error on batch 1 benches it from that batch
             assert len(middle["items"]) == 64
             assert await pool.answer(eid, middle, _status(middle, "error")) == "requeued"
-            last = pool.claim(eid)                         # batch 2, lost on two providers, once witnessed
+            last = pool.claim(eid)                         # batch 2: lost by working cards on two providers
             assert len(last["items"]) == 1
+            await _witness(pool, eid)
             if eid == "a":
-                await _witness(pool, "a")
                 await pool.expire(last)
         pool.now += 5
-        slow = pool.claim("slow")                          # batch 1, out for a while
+        slow = pool.claim("slow")                          # batch 1, out for a while (a card slower than the rest)
         assert len(slow["items"]) == 64
+        pool.dispatcher.lease_of(slow["lease_id"]).expires_at = slow["expires_at"] = pool.now + 3000
         await pool.expire(last)
         assert pool.now < slow["expires_at"], "the slow lease must still be out"
         with pytest.raises(BatchParked) as parked:
-            await _ended(call)        # at once: batch 1 is still leased
+            await _ended(call)                             # at once: batch 1 is still leased
         assert parked.value.indexes == [128]
         assert sorted(parked.value.scored) == list(range(64)) and parked.value.scored[0][2] == ("c",)
         assert pool.dispatcher.lease_of(slow["lease_id"]).batch.future.cancelled()
@@ -454,31 +600,59 @@ def test_the_first_park_ends_the_call_at_once_cancels_its_other_batches_and_keep
     _run(go)
 
 
-# -- a parked batch that gets a scored answer is unparked ----------------------
+# -- a parked batch that gets a measured answer is unparked --------------------
 
 
-def test_a_scored_late_answer_unparks_the_batch_and_takes_its_loss_back():
+async def _parked_with_a_late_answerer(pool, *, full_length):
+    """A batch parked on the witnessed losses of a and s; s still holds an expired lease of it, answerable late."""
+    poison = pool.call(_items(1))
+    await asyncio.sleep(0)
+    await _lose(pool, "a")
+    s1 = pool.claim("s")
+    await _witness(pool, "s")
+    await pool.expire(s1)
+    with pytest.raises(BatchParked) as parked:
+        await _ended(poison)
+    pool.dispatcher._expired[s1["lease_id"]].full_length = full_length
+    return s1, parked.value.batch_ids[0]
+
+
+@pytest.mark.parametrize("full_length", [True, False])
+def test_a_measured_late_answer_unparks_the_batch(full_length):
+    async def go():
+        pool = _Pool()
+        s1, batch_id = await _parked_with_a_late_answerer(pool, full_length=full_length)
+        with pytest.raises(LeaseRefused):
+            await pool.answer("s", s1)                     # late, measured: the batch can be answered after all
+        assert pool.unparked == [(JOB, batch_id)] and pool.dispatcher.stats["unparked"] == 1
+    _run(go)
+
+
+def test_a_late_answer_with_no_measure_unparks_nothing():
+    async def go():
+        pool = _Pool()
+        s1, _ = await _parked_with_a_late_answerer(pool, full_length=False)
+        with pytest.raises(LeaseRefused):
+            await pool.answer("s", s1, _status(s1, "proof_undecodable"))
+        assert pool.unparked == [] and pool.dispatcher.stats["unparked"] == 0
+    _run(go)
+
+
+def test_a_measured_late_answer_takes_its_cards_loss_out_of_the_evidence():
     async def go():
         pool = _Pool()
         poison = pool.call(_items(1))
         await asyncio.sleep(0)
-        a1 = pool.claim("a")
-        await _witness(pool, "a")
-        await pool.expire(a1)
-        s1 = pool.claim("s")                               # slow: its lease expires while it scores
-        await pool.expire(s1)
-        with pytest.raises(BatchParked) as parked:
-            await _ended(poison)
-        assert pool.strikes("s") == 1
-        pool.dispatcher._expired[s1["lease_id"]].full_length = False   # an adaptive lease, not the longest one
+        s1 = pool.claim("s")
+        await _witness(pool, "s")
+        await pool.expire(s1)                              # s: a witnessed loss
         with pytest.raises(LeaseRefused):
-            await pool.answer("s", s1)                     # late, scored: the batch can be answered after all
-        assert pool.unparked == [(JOB, parked.value.batch_ids[0])]
-        assert pool.strikes("s") == 0 and pool.dispatcher.stats["unparked"] == 1
+            await pool.answer("s", s1)                     # ... answered late and measured: slow, not lost
+        await _lose(pool, "a")                             # a witnessed loss on a second provider
+        await _settled()
+        assert not poison.done(), "a card that answered the batch still counted as evidence against it"
+        poison.cancel()
     _run(go)
-
-
-# -- parked records: per record, a cool-down, a retry alone ---------------------
 
 
 def _parked_error(message, indexes, batch_ids):
@@ -494,7 +668,7 @@ class _Remote:
     marked ``lost`` has its batch parked; one marked ``unreadable`` has an item no executor can read."""
 
     def __init__(self):
-        self.calls, self.unreadable, self.lost, self.unpark = [], set(), set(), None
+        self.calls, self.unreadable, self.lost, self.failing, self.unpark = [], set(), set(), set(), None
 
     def connected(self):
         return True
@@ -517,7 +691,7 @@ class _Remote:
         lost = [k for k, mark in enumerate(marks) if mark in self.lost]
         if lost:
             raise _parked_error("its leases were lost", lost, [42])
-        return [("ok", (ChunkResult(1, 1.0, 1.0),), ("x",)) for _ in items]
+        return [("ok", (ChunkResult(500 if mark in self.failing else 1, 1.0, 1.0),), ("x",)) for mark in marks]
 
 
 class _Clock:
@@ -675,6 +849,205 @@ def test_a_parked_re_audit_keeps_its_passes_listed_and_tries_them_again():
     _run(go)
 
 
+def test_the_cool_down_doubles_up_to_four_hours():
+    async def go():
+        remote, clock = _Remote(), _Clock(50_000.0)
+        records = _Records({"p": _record("p", 4, received_at=49_000.0)})
+        auditor = _order_auditor(records, clock, remote)
+        remote.lost.add(4)
+        await auditor.judge_many(["p"])
+        for backoff in (1800, 3600, 7200, 14400, 14400):
+            remote.calls.clear()
+            clock.now += backoff - 1
+            await auditor.judge_many(["p"])
+            assert remote.calls == [], f"tried before {backoff} s"
+            clock.now += 1
+            await auditor.judge_many(["p"])
+            assert remote.calls == [[4]], f"not tried at {backoff} s"
+    _run(go)
+
+
+class _RaceRemote(_Remote):
+    """Parks the record marked 4 with its batch 42 on the first call; ``hook`` runs inside the next call."""
+
+    def __init__(self):
+        super().__init__()
+        self.hook, self.before_park = None, None
+
+    async def score(self, items):
+        marks = [item["tokens"][-1] for item in items]
+        if 4 in marks:
+            self.calls.append(marks)
+            if self.before_park is not None:
+                self.before_park()
+            raise _parked_error("lost", [marks.index(4)], [42])
+        if self.hook is not None:
+            self.hook()
+        return await super().score(items)
+
+
+def test_an_unpark_while_the_rest_of_the_call_is_scored_again_is_not_lost():
+    """Parks are recorded when they are caught, before the rest of the call is scored again (the main path of a
+    multi-batch pass): an unpark arriving meanwhile moves the record to now."""
+    async def go():
+        remote, clock = _RaceRemote(), _Clock(50_000.0)
+        auditor = _order_auditor(None, clock, remote)
+        remote.hook = lambda: remote.unpark(42)
+        outcomes = await auditor._audit_outcomes([_record("a", 3), _record("p", 4)])
+        assert outcomes[0]["passed"] and not isinstance(outcomes[1], dict)
+        assert auditor._parked_wait("p", clock.now) is None, "the unpark that came during the relaunch was lost"
+    _run(go)
+
+
+def test_an_unpark_heard_before_its_park_is_recorded_still_counts():
+    async def go():
+        remote, clock = _RaceRemote(), _Clock(50_000.0)
+        auditor = _order_auditor(None, clock, remote)
+        remote.before_park = lambda: remote.unpark(42)    # the late answer lands before the auditor hears of the park
+        await auditor._audit_outcomes([_record("p", 4)])
+        assert auditor.parked_ids == {"p"} and auditor._parked_wait("p", clock.now) is None
+    _run(go)
+
+
+def test_a_failed_relaunch_keeps_what_was_parked():
+    async def go():
+        remote, clock = _RaceRemote(), _Clock(50_000.0)
+        auditor = _order_auditor(None, clock, remote)
+
+        def unwired():
+            raise RuntimeError("the batch of order was cancelled")
+
+        remote.hook = unwired
+        results, _ = await auditor._audit_records(["a", "p"], [_record("a", 3), _record("p", 4)], {})
+        assert results == [None, None] and auditor.parked_ids == {"p"}
+        assert auditor._validator_errors == 1              # a's error only: p is parked, not an error
+    _run(go)
+
+
+def test_a_parked_record_cooling_down_is_never_scored_whoever_asks():
+    """A pass that meets a parked record in an audit-ahead flight does not score it again at once."""
+    async def go():
+        remote, clock = _Remote(), _Clock(50_000.0)
+        auditor = _order_auditor(None, clock, remote)
+        remote.lost.add(4)
+        await auditor._audit_outcomes([_record("p", 4)])
+        calls = len(remote.calls)
+        outcome, = await auditor._audit_outcomes([_record("p", 4)])
+        assert not isinstance(outcome, dict) and len(remote.calls) == calls
+        assert auditor._park_state["p"].tries == 0         # not parked again: its cool-down stands
+    _run(go)
+
+
+def test_an_unpark_reschedules_the_record_now():
+    async def go():
+        remote, clock = _Remote(), _Clock(50_000.0)
+        records = _Records({"p": _record("p", 4, received_at=49_000.0)})
+        auditor = _order_auditor(records, clock, remote)
+        remote.lost.add(4)
+        auditor._queued.add("p")
+        await auditor.judge_many(["p"])
+        auditor._reschedule(["p"])
+        clock.now += 60
+        auditor._queued.add("p")
+        await auditor.judge_many(["p"])                    # cooling: due at its retry
+        auditor._reschedule(["p"])
+        assert auditor._due["p"] > clock.now + 600
+        remote.unpark(42)
+        assert auditor._due["p"] == clock.now
+    _run(go)
+
+
+def test_a_parked_re_audit_is_retried_in_the_background_after_its_cool_down():
+    async def go():
+        remote, clock = _Remote(), _Clock(50_000.0)
+        records = _Records({"s1": _record("s1", 4)})
+        auditor = _order_auditor(records, clock, remote)
+        calls = []
+        real = auditor.reaudit_executor
+
+        async def counting(executor_id):
+            calls.append(clock.now)
+            return await real(executor_id)
+
+        auditor.reaudit_executor = counting
+        auditor._remote_scored["x"] = ["s1"]
+        remote.lost.add(4)
+        assert await auditor.reaudit_executor("x") == []
+        state = auditor._reaudit_parked["s1"]
+        clock.now = state.retry_at - 0.5                   # the background retry first sees it cooling
+        task = auditor._late_reaudits.get("x")
+        assert task is not None, "no background retry"
+        await asyncio.sleep(0.3)
+        clock.now = state.retry_at + 1
+        remote.lost.clear()
+        await asyncio.wait_for(asyncio.shield(task), timeout=5)
+        assert not auditor._remote_scored.get("x"), "the parked pass was never retried"
+        assert len(calls) < 10, f"the background retry spins ({len(calls)} calls)"
+    _run(go)
+
+
+def test_a_pass_parked_in_a_re_audit_is_retried_alone():
+    async def go():
+        remote, clock = _Remote(), _Clock(50_000.0)
+        records = _Records({"s1": _record("s1", 4), "s2": _record("s2", 5)})
+        auditor = _order_auditor(records, clock, remote)
+        auditor._late_reaudits["x"] = asyncio.get_running_loop().create_future()
+        auditor._remote_scored["x"] = ["s1"]
+        remote.lost.add(4)
+        assert await auditor.reaudit_executor("x") == []
+        auditor._remote_scored["x"].append("s2")
+        clock.now += RETRY
+        remote.lost.clear()
+        remote.calls.clear()
+        await auditor.reaudit_executor("x")
+        assert sorted(remote.calls) == [[4], [5]]
+        auditor._late_reaudits["x"].cancel()
+    _run(go)
+
+
+def test_a_loss_resets_the_clean_streak():
+    async def go():
+        pool = _Pool()
+        pool.dispatcher._strikes_limit = 3
+        for k, delivered in enumerate((3, 2)):
+            call = pool.call(_items(1), job=f"order-eval-lost-{k}")
+            await asyncio.sleep(0)
+            await pool.expire(pool.claim("c"))
+            call.cancel()
+            for _ in range(delivered):
+                await _witness(pool, "c")
+        assert pool.strikes("c") == 2                      # five deliveries, but never five in a row
+    _run(go)
+
+
+def test_a_park_takes_back_every_struck_lease_of_its_batch_and_only_those_once():
+    async def go():
+        pool = _Pool()
+        pool.dispatcher._strikes_limit = 4
+        poison = pool.call(_items(1))
+        await asyncio.sleep(0)
+        a1 = await _lose(pool, "a")                        # witnessed, strike 1, benched 300 s
+        pool.now += BENCH + 1
+        a2 = await _lose(pool, "a")                        # the same batch again: strike 2, benched again
+        assert a2["batch"] == a1["batch"] and pool.strikes("a") == 2
+        other = pool.call(_items(1), job="order-eval-other")
+        await asyncio.sleep(0)
+        a3 = pool.claim("a")
+        assert a3["job"] == "order-eval-other"
+        await pool.expire(a3)                              # another batch: strike 3
+        other.cancel()
+        await asyncio.sleep(0)
+        await _lose(pool, "b")
+        with pytest.raises(BatchParked):
+            await _ended(poison)
+        assert pool.strikes("a") == 1                      # the poison's two strikes back, not the other's
+        pool.dispatcher._expired[a2["lease_id"]].full_length = False
+        with pytest.raises(LeaseRefused):
+            await pool.answer("a", a2)                     # a late answer has no strike left to take back
+        assert pool.strikes("a") == 1
+    _run(go)
+
+
 # -- leaving the close two periods after the receipt, at q < 1 -----------------
 
 
@@ -754,6 +1127,9 @@ def test_a_parked_record_leaves_the_close_and_its_siblings_two_periods_after_its
 
 
 def test_the_give_up_counts_from_the_receipt_so_a_restart_does_not_start_it_again():
+    """A record parked with its batch leaves the close once it parked again alone (its first retry, which decides
+    any record batched with the culprit); the give-up instant itself counts from the receipt, so a restart long after
+    it starts no new wait of two periods."""
     async def go():
         p = _ids(True, 1)[0]
         records = _Records({p: _record(p, 4, received_at=T0)})
@@ -762,42 +1138,80 @@ def test_the_give_up_counts_from_the_receipt_so_a_restart_does_not_start_it_agai
         auditor = _sampled_auditor(records, clock, remote)
         await auditor.judge_many([p])
         assert auditor.parked_ids == {p}
+        assert auditor.oldest_pending_received_at() == T0      # parked with its batch: held until it is retried alone
+        clock.now += RETRY
+        await auditor.judge_many([p])
+        assert remote.calls[-1] == [4]                         # alone, and parked again
         assert auditor.oldest_pending_received_at() is None    # left out at once: its two periods are over
     _run(go)
 
 
-def test_past_the_give_up_the_parked_operators_verdicts_of_its_period_wait_for_its_decision():
-    """The stake guarantee (owner, 2026-11-26): once a parked record no longer holds its period's close, its operator's
-    verdicts of that period stay unsettled until it is decided, so its failure could still forfeit them; every other
-    operator is paid on time. What is held is paid late, within what is left of the period's budget."""
+def test_a_record_no_executor_can_read_leaves_the_close_two_periods_after_its_receipt():
+    """Its own fault, alone in its park from the start: it leaves the close two periods after its receipt, to the second
+    (the owner's two periods), whenever it was parked."""
+    async def go():
+        pool = _Pool()
+        records = _Records({"p": _record("p", 4, tokens=65_600, received_at=T0)})
+        clock = _Clock(T0 + 20)
+        auditor = eval_auditor(job_id=JOB, records=records, tokenizer=_Tokenizer(), proof=PROOF, vocab_size=100,
+                               remote=pool.dispatcher.view(*MODEL, PROOF, JOB), clock=clock)
+        auditor._seeded = True
+        await _ended(auditor.judge_many(["p"]))
+        assert auditor.parked_ids == {"p"} and pool.dispatcher.pending() == 0
+        assert GIVE_UP == 2 * cp.PERIOD_SECONDS
+        clock.now = T0 + 2 * cp.PERIOD_SECONDS - 1
+        assert auditor.oldest_pending_received_at() == T0
+        clock.now = T0 + 2 * cp.PERIOD_SECONDS + 1
+        assert auditor.oldest_pending_received_at() is None
+    _run(go)
+
+
+class _Archives:
+    def __init__(self):
+        self.docs = {}
+
+    async def write(self, task_id, work, entry, document):
+        self.docs[(work, entry)] = document
+
+    async def read(self, task_id, work, entry):
+        return self.docs.get((work, entry))
+
+    async def list(self, task_id):
+        return sorted(self.docs)
+
+
+@pytest.mark.parametrize("parked_passes", [True, False])
+def test_past_the_give_up_the_parked_operators_forfeitable_verdicts_wait_for_its_decision(parked_passes):
+    """The stake guarantee (owner, 2026-11-26): once a parked record no longer holds its period's close, the verdicts of
+    its operator received in its period up to its own receipt (what its failure can forfeit) stay unsettled until it is
+    decided; every other verdict is paid on time. If it fails, they are forfeited, never paid. If it passes, they are
+    paid late as any late verdict, and only the parked record's own late verdict is kept within the cap."""
     from reliquary.validator.corpus_period_settlement import CorpusPeriodSettler
 
     async def go():
-        p = _ids(True, 1)[0]
-        z = _ids(True, 1, start=3000)[0]                   # an audited pass of p's operator, before p, same period
-        o = _ids(True, 1, start=6000)[0]                   # another operator's audited pass, same period
-        assert cp.period_of(T0 - 30) == cp.period_of(T0)
-        records = _Records({p: _record(p, 4, received_at=T0), z: _record(z, 5, received_at=T0 - 30),
-                            o: _record(o, 6, received_at=T0 - 20, hotkey="5Other")})
-        clock, remote = _Clock(T0 + 20), _Remote()
+        p = _ids(True, 1)[0]                               # drawn, parked with its batch: hotkey 5Hot2, operator cold
+        z = _ids(True, 1, start=3000)[0]                   # an audited pass of the same operator, before p
+        w = _ids(True, 1, start=4000)[0]                   # one after p: p's failure cannot forfeit it
+        o = _ids(True, 1, start=6000)[0]                   # another operator's
+        assert cp.period_of(T0 - 30) == cp.period_of(T0 + 30)
+        records = _Records({p: _record(p, 4, hotkey="5Hot2", received_at=T0), z: _record(z, 5, received_at=T0 - 30),
+                            w: _record(w, 7, received_at=T0 + 30), o: _record(o, 6, hotkey="5Other",
+                                                                             received_at=T0 - 20)})
+        clock, remote = _Clock(T0 + 40), _Remote()
         remote.lost.add(4)
-        auditor = _sampled_auditor(records, clock, remote)
-        auditor._miner_states.states["5Other"] = MinerState(audited_passed=100)
-        await auditor.judge_many([z, o, p])
-        assert set(records.verdicts) == {z, o} and auditor.parked_ids == {p}
-
-        class Archives:
-            def __init__(self):
-                self.docs = {}
-
-            async def write(self, task_id, work, entry, document):
-                self.docs[(work, entry)] = document
-
-            async def read(self, task_id, work, entry):
-                return self.docs.get((work, entry))
-
-            async def list(self, task_id):
-                return sorted(self.docs)
+        sampled = MinerState(audited_passed=100)
+        auditor = eval_auditor(job_id=JOB, records=records, tokenizer=_Tokenizer(), proof=PROOF, vocab_size=100,
+                               params=AuditParams(q=Q, hold_seconds=HOLD, ban_after_failures=10),
+                               miner_states=_States({HK: sampled, "5Hot2": sampled, "5Other": sampled}),
+                               beacon=lambda r: RAND, round_at=lambda t: int(t // 3) + 1, clock=clock,
+                               accept_slack_seconds=0.0, remote=remote,
+                               operator_of=lambda hotkey: "cold" if hotkey in (HK, "5Hot2") else None)
+        auditor.stake_at_receipt = False
+        auditor._seeded = True
+        await auditor.judge_many([z, w, o, p])
+        assert set(records.verdicts) == {z, w, o} and auditor.parked_ids == {p}
+        clock.now += RETRY
+        await auditor.judge_many([p])                      # tried alone, parked again
 
         state = {}
 
@@ -810,24 +1224,106 @@ def test_past_the_give_up_the_parked_operators_verdicts_of_its_period_wait_for_i
             return dict(state), "etag"
 
         records.write_settlement, records.read_settlement = write_settlement, read_settlement
-        archives = Archives()
-        hold = getattr(auditor, "settle_hold", None)
+        archives = _Archives()
+        hooks = {name: getattr(auditor, attribute) for name, attribute in
+                 (("hold", "settle_hold"), ("capped", "settle_capped")) if hasattr(auditor, attribute)}
         settler = CorpusPeriodSettler(task_id=JOB, job_id=JOB, cap=1.0, records=records, archives=archives,
-                                      oldest_pending=auditor.oldest_pending_received_at, clock=clock,
-                                      max_price=1e-3, **({"hold": hold} if hold is not None else {}))
+                                      oldest_pending=auditor.oldest_pending_received_at, clock=clock, **hooks)
         clock.now = T0 + GIVE_UP + 1 + cp.PERIOD_SECONDS
         await settler.settle_once()
-        assert o in state["settled"] and z not in state["settled"]
-        paid = {hk for doc in archives.docs.values() for hk in doc["rewards_by_hotkey"]}
-        assert paid == {"5Other"}
-        remote.lost.clear()                                # p decided at last: it passes
+        assert {o, w} <= set(state["settled"]) and z not in state["settled"]
+        assert {hk for doc in archives.docs.values() for hk in doc["rewards_by_hotkey"]} == {"5Other", HK}
+        on_time = sum(doc["rewards_by_hotkey"].get(HK, 0.0) for doc in archives.docs.values())
+        if not parked_passes:
+            remote.lost.clear()
+            remote.failing.add(4)                          # p decided at last: it fails, and its failure is confirmed
+        else:
+            remote.lost.clear()
         clock.now += 10 * RETRY
         await auditor.judge_many([p])
         assert p in records.verdicts and auditor.parked_ids == set()
         await settler.settle_once()
-        assert z in state["settled"] and p in state["settled"]
-        late = [doc for doc in archives.docs.values() if HK in doc["rewards_by_hotkey"]]
-        assert late and late[0]["rewards_by_hotkey"][HK] > 0  # a priced period: paid within its budget
+        assert {z, p} <= set(state["settled"])
+        late = sum(doc["rewards_by_hotkey"].get(HK, 0.0) for doc in archives.docs.values()) - on_time
+        if parked_passes:
+            assert late > 0                                # z, held back, is paid late as any late verdict
+            assert not any("5Hot2" in doc["rewards_by_hotkey"] for doc in archives.docs.values())  # p: the cap is paid
+        else:
+            assert z in records.voided and records.voided[z]["reason"] == "forfeited"
+            assert late == 0                               # forfeited by p's failure, never paid
+    _run(go)
+
+
+def test_what_is_held_is_its_operators_verdicts_received_before_it_in_its_period_and_only_at_q_below_one():
+    async def go():
+        p = _ids(True, 1)[0]
+        records = _Records({p: _record(p, 4, received_at=T0)})
+        clock, remote = _Clock(T0 + 20), _Remote()
+        remote.lost.add(4)
+        auditor = _sampled_auditor(records, clock, remote)
+        await auditor.judge_many([p])
+        clock.now += RETRY
+        await auditor.judge_many([p])                      # alone, parked again
+        clock.now = T0 + GIVE_UP + 1
+        period = cp.period_of(T0)
+        verdicts = {"before": (HK, period, T0 - 30), "after": (HK, period, T0 + 30),
+                    "later_period": (HK, period + 1, T0 + cp.PERIOD_SECONDS), "other": ("5Other", period, T0 - 30)}
+        assert auditor.settle_hold(verdicts, cp.period_of) == {"before"}
+        assert auditor.settle_capped([p, "before"]) == {p}
+        q_one = _order_auditor(_Records({"r": _record("r", 4, received_at=T0)}), clock, remote)
+        clock.now = T0 + 20
+        await q_one.judge_many(["r"])
+        clock.now += RETRY
+        await q_one.judge_many(["r"])
+        clock.now = T0 + GIVE_UP + 1
+        assert q_one.oldest_pending_received_at() is None
+        assert q_one.settle_hold({"z": ("5Hot", period, T0 - 30)}, cp.period_of) == set()   # q = 1: no forfeit
+    _run(go)
+
+
+def test_a_parked_record_cooling_past_its_give_up_holds_no_sibling():
+    async def go():
+        p = _ids(True, 1)[0]
+        x = _ids(False, 1, start=7000)[0]
+        steady = _ids(False, 2, start=5000)
+        records = _Records({p: _record(p, 4, received_at=T0), x: _record(x, 5, received_at=T0 + 10),
+                            **{sid: _record(sid, 6, received_at=T0 + 500) for sid in steady}})
+        clock, remote = _Clock(T0 + 20), _Remote()
+        remote.lost.add(4)
+        auditor = _sampled_auditor(records, clock, remote)
+        await auditor.judge_many([p, x])
+        assert auditor.parked_ids == {p}
+        clock.now = T0 + GIVE_UP - 100                     # tried again just before its give-up, parked again
+        auditor._park_state[p].retry_at = clock.now
+        await auditor.judge_many([p])
+        assert auditor._park_state[p].retry_at > T0 + GIVE_UP + 1 and x not in records.verdicts
+        clock.now = T0 + GIVE_UP + 1                       # cooling, past its give-up
+        later = _ids(False, 2, start=9000)
+        for sid in later:
+            records.submissions[sid] = _record(sid, 7, received_at=clock.now - 500)
+        await auditor.judge_many([p, x, *steady, *later])
+        assert x in records.verdicts and records.verdicts[x]["passed"], "a left-out record still held its sibling"
+    _run(go)
+
+
+def test_an_orders_settler_asks_its_auditor_what_to_hold_and_what_to_keep_within_the_cap():
+    """``wire_order_judge`` wires both owner decisions into the order's settler; the corpus control's has neither."""
+    from reliquary.validator.eval_control import wire_order_judge
+
+    async def go():
+        job = SimpleNamespace(job_id="order-gen-x", episode=None, prompt_source="x",
+                              sampling=SimpleNamespace(draw=None), checkpoint_repo=MODEL[0],
+                              checkpoint_revision=MODEL[1])
+        w = SimpleNamespace(entry=SimpleNamespace(task_id="order-gen-x", params={"cap": 0.1}), cap=0.1, job=job,
+                            tokenizer=_Tokenizer(), proof=PROOF, vocab_size=100,
+                            stats=SimpleNamespace(observe=lambda *a, **k: None))
+        wire_order_judge(w, records=_Records({}), job_store=None, remote=_Remote(), params=AuditParams(q=0.5),
+                         miner_states=None, beacon=None, round_at=None)
+        asked = []
+        w.auditor.settle_hold = lambda verdicts, period_of: asked.append("hold") or {"z"}
+        w.auditor.settle_capped = lambda ids: asked.append("capped") or {"p"}
+        assert w.settler._hold({}, cp.period_of) == {"z"} and w.settler._capped(["p"]) == {"p"}
+        assert asked == ["hold", "capped"]
     _run(go)
 
 
