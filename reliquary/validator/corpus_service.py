@@ -87,6 +87,9 @@ CURSOR_PATH = "/corpus/cursor/{hotkey}"
 JOBS_PATH = "/corpus/jobs"
 # A served job's state in `JOBS_PATH`'s ``orders``.
 ORDER_OPEN, ORDER_STARTING, ORDER_PAUSED, ORDER_DRAINING = "open", "starting", "paused", "draining"
+# A job the registry lists that this process is still wiring (`CorpusJobRoutes.restoring`): a miner keeps what it
+# mines on it and starts nothing new there.
+ORDER_RESTORING = "restoring"
 JOB_SCOPED_PATH = "/corpus/jobs/{job_id}/job"
 CURSOR_SCOPED_PATH = "/corpus/jobs/{job_id}/cursor/{hotkey}"
 # Check before generating: where a hotkey's walk stands and whether that prompt
@@ -1048,6 +1051,16 @@ async def record_prompt_failures(store: Any, job: JobSpec,
         return outcomes
     raise CorpusStoreConflict(f"job {job.job_id!r}: {len(failures)} failure(s), the first "
                               f"{failures[0][1][:12]}, kept losing their ledger race")
+
+
+async def recorded_failure_ids(store: Any, job: JobSpec) -> set[str]:
+    """The submission id prefixes (the first 12 hex, as ``SlotLedger`` keys a failure) the job's ledger records
+    as failed, on any prompt."""
+    from reliquary.corpus.slots import _failure_id
+
+    snapshot, _ = await store.read_ledgers(job.job_id)
+    slots = (await asyncio.to_thread(rebuild_ledgers, job, snapshot)).slots
+    return {_failure_id(entry) for entries in slots.failed_snapshot().values() for entry in entries}
 
 
 def draw_failure_slot(record: Mapping[str, Any]) -> dict[str, Any]:
@@ -3070,10 +3083,30 @@ class CorpusJobRoutes:
         # The ss58 address signed-sandbox session requests are signed for, when this app serves sessions:
         # `JOBS_PATH` tells miners, so they need no ``--validator-hotkey``.
         self.sandbox_hotkey: str | None = None
+        # Jobs the registry lists as served here but not wired yet (a restart re-wiring them, a hot add in
+        # progress), and `booting`: the registry not read yet, so any unknown job may be one. A miner asking
+        # for one hears 503 `job_not_ready` and retries; a 404 would stop it and cancel its running episodes.
+        # `orders` lists the restoring ones, `JOBS_PATH` answers 503 while booting with nothing wired; the job set
+        # bounds both (`corpus_hot_jobs.RESTORE_ATTEMPTS`, `RESTORE_SECONDS`).
+        self.restoring: set[str] = set()
+        self.booting = False
+
+    def not_ready(self, job_id: Any) -> bool:
+        """The job is not served yet but may be soon (`restoring`, `booting`)."""
+        return (isinstance(job_id, str) and job_id not in self.routers and job_id not in self.retired
+                and (self.booting or job_id in self.restoring))
+
+    def unserved(self, job_id: Any) -> HTTPException:
+        """What a miner hears for a job without a router: retry later, or not served here."""
+        if self.not_ready(job_id):
+            return HTTPException(status_code=503, detail=JOB_NOT_READY,
+                                 headers={"Retry-After": str(NOT_READY_RETRY_SECONDS)})
+        return HTTPException(status_code=404, detail="corpus_job_not_served")
 
     def add(self, job_id: str, router: APIRouter, *, contract: Any = None,
             prompt_source: str | None = None, spec: Any = None) -> None:
         self.routers[job_id] = router
+        self.restoring.discard(job_id)
         self.contracts[job_id] = contract
         if spec is not None:
             self.specs[job_id] = spec
@@ -3167,7 +3200,9 @@ class CorpusJobRoutes:
         return ORDER_OPEN
 
     def orders(self) -> list[dict]:
-        """Every served job, open or not, with what a miner needs to choose one (`JOBS_PATH`)."""
+        """Every served job, open or not, with what a miner needs to choose one (`JOBS_PATH`), then the jobs still
+        being wired (`restoring`): an order follower stops the miner of an order missing from two reads in a row,
+        and a restart's wiring lasts longer than that."""
         listed = []
         for job_id in sorted(self.routers):
             spec = self.specs.get(job_id)
@@ -3190,6 +3225,8 @@ class CorpusJobRoutes:
                 if auction is not None:
                     entry["auction"] = auction
             listed.append(entry)
+        listed += [{"job_id": job_id, "state": ORDER_RESTORING}
+                   for job_id in sorted(self.restoring) if self.not_ready(job_id)]
         return listed
 
     def admission_pending(self, job_id: str) -> bool:
@@ -3216,7 +3253,7 @@ class CorpusJobRoutes:
             raise HTTPException(status_code=409, detail="job_paused")
         router = self.routers.get(job_id)
         if router is None:
-            raise HTTPException(status_code=404, detail="corpus_job_not_served")
+            raise self.unserved(job_id)
         self.in_flight[job_id] += 1
         try:
             yield router
@@ -3225,6 +3262,10 @@ class CorpusJobRoutes:
 
 
 JOB_RETIRED = "job_retired"
+JOB_NOT_READY = "job_not_ready"
+# `JOBS_PATH` before the registry is first read (`CorpusJobRoutes.booting`).
+ORDERS_NOT_READY = "orders_not_ready"
+NOT_READY_RETRY_SECONDS = 10
 SUBMIT_SCOPED_PATH = "/corpus/jobs/{job_id}/submit"
 
 
@@ -3260,7 +3301,7 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter] | CorpusJobRoutes,
             return served
         if job_id in routes.retired:
             raise HTTPException(status_code=410, detail=JOB_RETIRED)
-        raise HTTPException(status_code=404, detail="corpus_job_not_served")
+        raise routes.unserved(job_id)
 
     def _admitting(job_id: str) -> APIRouter:
         # Before any store is touched: a retired job admits nothing more.
@@ -3279,6 +3320,12 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter] | CorpusJobRoutes,
 
     @router.get(JOBS_PATH)
     async def corpus_jobs() -> dict:
+        if routes.booting and not routes.routers:
+            # The registry not read yet and nothing wired (the order control's start): the list would miss every
+            # order about to be wired, and an order follower counts such a read against the order it mines; a
+            # failed read it retries. A validator that wired jobs before serving (the corpus validator) lists them.
+            raise HTTPException(status_code=503, detail=ORDERS_NOT_READY,
+                                headers={"Retry-After": str(NOT_READY_RETRY_SECONDS)})
         # ``jobs``: the ids open to mine now (older miners read it); ``orders``: every served job and its state.
         listing = {"jobs": routes.open_jobs(), "orders": routes.orders()}
         if routes.sandbox_hotkey:

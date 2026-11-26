@@ -122,6 +122,11 @@ WINDOW_EPSILON_SECONDS = 1e-3
 BEACON_GRACE_SECONDS = 2.0
 # Verdicts a failure reconcile reads at once: read one by one, 10k verdicts took ~10 minutes (2026-11-11).
 RECONCILE_READS = 16
+# Ids a failure reconcile or a slot reopen schedules at once, each slice read whole before the next: a start's
+# reconcile or a large forfeit never holds a task, or a record, per failure (read all at once, a 7,000-record
+# forfeit of ~3,200-token records would hold ~0.85 GiB of decoded records: measured in a synthetic benchmark
+# (fake store, synthetic records), 2026-11-25).
+RECONCILE_SLICE_IDS = 2048
 # How long after its receipt a sampled record's draw round is out (the round after receipt's next, two drand
 # periods, plus BEACON_GRACE_SECONDS) and the undecidable retry has come back to it (`audit_backlog`).
 DRAW_WAIT_SECONDS = 12.0
@@ -508,7 +513,9 @@ class CorpusAuditor:
           less the slack;
         - found by a listing and never readable: it holds every period open for
           ``UNKNOWN_ARRIVAL_GIVE_UP_SECONDS``, then is logged and left out, so one
-          corrupt record cannot freeze a task's pay for ever.
+          corrupt record cannot freeze a task's pay for ever;
+        - an order's record parked past its give-up (`_left_out_of_close`): left out
+          the same way, for the same reason.
 
         Raises ``LookupError`` before the seed, or while the feed's coverage is
         unreadable: until then an unknown backlog may hold anything."""
@@ -520,7 +527,7 @@ class CorpusAuditor:
         oldest = None if covered == math.inf else covered - self._accept_slack
         now = self._clock()
         for sid in dict.fromkeys((*self._meta, *self._unreadable, *self._queued)):
-            if sid in self._judged:
+            if sid in self._judged or self._left_out_of_close(sid, now):
                 continue
             if sid in self._meta:
                 at = self._meta[sid][1]
@@ -538,6 +545,26 @@ class CorpusAuditor:
                 at = -math.inf
             oldest = at if oldest is None else min(oldest, at)
         return oldest
+
+    # -- an order's parked records (`eval_control`): none here ---------------
+
+    def _is_parked(self, submission_id: str) -> bool:
+        """Whether a pending record is parked: an audit no executor could return. Never sent ahead."""
+        return False
+
+    def _parked_wait(self, submission_id: str, now: float) -> float | None:
+        """While a parked record is not due to be tried again, the next instant it changes: tried again, or let go of
+        its period's close (None: due, or not parked). Until then no pass audits it, and as a sibling it holds its
+        operator's unaudited passes received within their hold of it, as an undecided record does."""
+        return None
+
+    def _left_out_of_close(self, submission_id: str, now: float) -> bool:
+        """Whether an undecided record no longer holds its period's close, nor its operator's unaudited passes as a
+        sibling (a parked record past its give-up)."""
+        return False
+
+    def _note_held(self, submission_id: str, parked) -> None:
+        """``submission_id`` waits for these parked siblings: judged again once one is decided (none here)."""
 
     def audits_pending(self) -> int | None:
         """Pending records that may still need a GPU audit: every one not decided yet, and every one waiting out
@@ -977,7 +1004,9 @@ class CorpusAuditor:
         - left unaudited and undrawn: it lies inside each one's hold, so none is paid before it is decided and,
           drawn or slow, audited (the sibling guards);
         - an audited pass: the period settles only once nothing received in it is undecided, so not before
-          its verdict, which a failure writes after the forfeit.
+          its verdict, which a failure writes after the forfeit. An order's parked record left out of the close
+          (`_left_out_of_close`) keeps that guarantee for its operator: the settler holds the operator's verdicts of
+          its period until it is decided (`EvalAuditor.settle_hold`).
 
         One period: its records are paid at one rate (a capped period scales them all alike). Cheating on it
         then costs at least q · (that count) of its pay: at least its pay from 1/q on.
@@ -1366,20 +1395,25 @@ class CorpusAuditor:
                                  submission_id[:12])
 
     async def _failure_entries(self, submission_ids: Sequence[str], *, draw: bool) -> list[tuple]:
-        """What ``record_prompt_failures`` takes for these submissions (one no longer stored is skipped)."""
+        """What ``record_prompt_failures`` takes for these submissions, in their order (one no longer stored is
+        skipped). A record is dropped as soon as its entry is taken, so at most READ_CONCURRENCY (64) are held, and
+        RECONCILE_SLICE_IDS ids are scheduled at a time: only the entries, ~200 bytes each, outlive their reads."""
         from reliquary.validator.corpus_service import draw_failure_slot
 
         gate = asyncio.Semaphore(READ_CONCURRENCY)
 
-        async def read(submission_id):
+        async def entry(submission_id):
             async with gate:
-                return submission_id, await self._records.read_submission(self._job_id, submission_id)
+                record = await self._records.read_submission(self._job_id, submission_id)
+            if record is None:
+                return None
+            slot = draw_failure_slot(record) if draw else {}
+            return int(record["prompt_index"]), submission_id, slot.get("slot"), slot.get("hotkey")
 
-        entries = []
-        for submission_id, record in await gather_owned(read(sid) for sid in submission_ids):
-            if record is not None:
-                slot = draw_failure_slot(record) if draw else {}
-                entries.append((int(record["prompt_index"]), submission_id, slot.get("slot"), slot.get("hotkey")))
+        ids, entries = list(submission_ids), []
+        for start in range(0, len(ids), RECONCILE_SLICE_IDS):
+            found = await gather_owned(entry(sid) for sid in ids[start:start + RECONCILE_SLICE_IDS])
+            entries.extend(item for item in found if item is not None)
         return entries
 
     async def _reopen_slots(self, submission_ids: Sequence[str]) -> None:
@@ -1412,12 +1446,13 @@ class CorpusAuditor:
 
     async def reconcile_failures(self) -> int:
         """Every failed or voided sample of a forced-draw job recorded in the ledger: a stop between a verdict and
-        its ledger write would leave its prompt full without it."""
+        its ledger write would leave its prompt full without it. Only those the ledger may lack are read
+        (``unrecorded_failures``)."""
         if self._slot_store is None:
             return 0
-        ids = list(await self._records.list_verdict_ids(self._job_id))
-        failed = await failed_verdicts(self._records, self._job_id, ids)
-        await self._reopen_slots(failed)
+        failed, unrecorded = await unrecorded_failures(self._records, self._job_id, self._slot_store,
+                                                       self._draw_job)
+        await self._reopen_slots(unrecorded)
         return len(failed)
 
     # Verdict writes of this auditor in flight at once, over every concurrent
@@ -1553,7 +1588,8 @@ class CorpusAuditor:
             for submission_id in sids:
                 if (submission_id in self._judged or submission_id in self._ahead
                         or submission_id in self._ahead_flight or submission_id not in self._meta
-                        or submission_id in getattr(self, "_in_pass", ())):
+                        or submission_id in getattr(self, "_in_pass", ()) or self._is_parked(submission_id)):
+                    # A parked record is tried again by its pass alone, after its cool-down (`_parked_wait`).
                     continue
                 hotkey, received_at, _ = self._meta[submission_id]
                 if q < 1.0:
@@ -1652,6 +1688,10 @@ class CorpusAuditor:
         for submission_id, outcome in zip(ids, outcomes):
             if isinstance(outcome, dict):
                 self._validator_errors = 0
+            elif getattr(outcome, "undecided", False):
+                # An order's parked record (`eval_control._Parked`): neither the miner's fault nor ours. Pending, it
+                # counts nowhere towards a halt; whoever parked it logged it.
+                continue
             else:
                 # Ours, not the miner's: leave it pending for the next rescan.
                 self._validator_errors += 1
@@ -2166,6 +2206,12 @@ class CorpusAuditor:
         for submission_id in submission_ids:
             # This pass's word on when to judge it again replaces an earlier one.
             self._next_due.pop(submission_id, None)
+        # A parked record cooling down is not tried in this pass, nor in its backward audit: judged again once due.
+        cooling = {sid: at for sid in submission_ids if (at := self._parked_wait(sid, now)) is not None}
+        if cooling:
+            self._next_due.update(cooling)
+            self._choices["parked_cooling"] += len(cooling)
+            submission_ids = [sid for sid in submission_ids if sid not in cooling]
         read: dict[str, dict] = {}
         read.update(await self._read_all(
             [sid for sid in submission_ids if sid not in self._meta]))
@@ -2179,6 +2225,8 @@ class CorpusAuditor:
         await self._learn_shortest(known, states, now)
 
         audit_ids, draws, unaudited, voided = [], {}, [], []
+        # Per operator, (receipt, when it next changes, id) of its parked siblings cooling down (`_parked_wait`).
+        parked_siblings: dict[str, list[tuple[float, float, str]]] = {}
         # Per operator (`_operator`: the hotkey alone unless its coldkey is known), arrival times of records whose
         # draw round is not out yet. Every guard below that keeps a record unpaid until the records that could
         # catch it are decided spans its operator, as its stake does (`_stake_of`).
@@ -2225,12 +2273,13 @@ class CorpusAuditor:
             # A sibling known undrawn decides "wait" or "pass_unaudited" here:
             # its hotkey's state and recent count are X's, its draw is fixed.
             # Siblings are the operator's records, whichever of its hotkeys.
+            # A parked record past its give-up is no sibling any more (`_left_out_of_close`).
             candidates = {}
             for operator in {self._operator(self._meta[sid][0]) for sid, _ in unaudited}:
                 candidates[operator] = sorted(
                     (self._meta[sid][1], sid) for member in self._members.get(operator, ())
                     for sid in self._unjudged.get(member, ())
-                    if sid not in in_pass and sid not in self._undrawn)
+                    if sid not in in_pass and sid not in self._undrawn and not self._left_out_of_close(sid, now))
             # The oldest payable records first, while their siblings fit the
             # pass; the others wait for the next passes (nothing is paid early).
             hold_end: dict[str, float] = {}
@@ -2275,6 +2324,12 @@ class CorpusAuditor:
             reused: list[tuple[str, dict | None]] = []
             for operator, sids in siblings.items():
                 for sid in sids:
+                    at = self._parked_wait(sid, now)
+                    if at is not None:
+                        # Parked, cooling down: undecided until it is tried again (or let go of the close).
+                        self._choices["sibling_parked"] += 1
+                        parked_siblings.setdefault(operator, []).append((self._meta[sid][1], at, sid))
+                        continue
                     with self._timed("decide"):
                         choice, draw = await self._decide(sid, now, states[self._meta[sid][0]])
                     self._choices["sibling_" + choice] += 1
@@ -2355,6 +2410,14 @@ class CorpusAuditor:
                     for t in undecided.get(operator, ())):
                 self._next_due[submission_id] = self._retry_at(hotkey, now)
                 continue
+            parked_until = [(at, sid) for t, at, sid in parked_siblings.get(operator, ())
+                            if t <= received_at + self._params.hold_seconds]
+            if parked_until:
+                # A parked sibling could still catch it: judged again when that sibling is tried or let go, or as soon
+                # as it is decided (`_note_held`).
+                self._next_due[submission_id] = max(now, min(at for at, _ in parked_until))
+                self._note_held(submission_id, [sid for _, sid in parked_until])
+                continue
             paid = {"passed": True, "audited": False, "reason": None, **_WORST_ZERO}
             if forfeits(states[hotkey], received_at):
                 paid = dict(_FORFEITED)
@@ -2377,8 +2440,9 @@ class CorpusAuditor:
                     results, failed = await self._audit_records(
                         [sid for sid, _ in pairs], [r for _, r in pairs], draws,
                         deferred=self._deferred)
-                errored |= {self._operator(r["hotkey"]) for (_, r), result in zip(pairs, results)
-                            if result is None}
+                # A parked record past its give-up holds nobody's pass, even when it parks again here.
+                errored |= {self._operator(r["hotkey"]) for (sid, r), result in zip(pairs, results)
+                            if result is None and not self._left_out_of_close(sid, now)}
         finally:
             landed = await alongside
         failed_operators = {self._operator(hotkey) for hotkey in failed}
@@ -2653,7 +2717,9 @@ class CorpusAuditor:
 
 
 async def failed_verdicts(records, job_id: str, ids: list[str]) -> list[str]:
-    """The ids among ``ids`` whose verdict failed or whose record was voided, read RECONCILE_READS at a time."""
+    """The ids among ``ids`` whose verdict failed or whose record was voided, in their order: read RECONCILE_READS
+    at a time, RECONCILE_SLICE_IDS scheduled at once. A task per id held ~83-143 MiB for ~59k verdicts with read
+    latency, by Python version, measured in a synthetic benchmark (fake store, synthetic records)."""
     lister = getattr(records, "list_voided_ids", None)
     voided = set(await lister(job_id)) if lister is not None else set()
     gate = asyncio.Semaphore(RECONCILE_READS)
@@ -2663,8 +2729,37 @@ async def failed_verdicts(records, job_id: str, ids: list[str]) -> list[str]:
             verdict = await records.read_verdict(job_id, submission_id)
         return bool(verdict) and (not verdict.get("passed") or submission_id in voided)
 
-    outcomes = await asyncio.gather(*(failed(sid) for sid in ids))
-    return [sid for sid, out in zip(ids, outcomes) if out]
+    found = []
+    for start in range(0, len(ids), RECONCILE_SLICE_IDS):
+        part = ids[start:start + RECONCILE_SLICE_IDS]
+        outcomes = await asyncio.gather(*(failed(sid) for sid in part))
+        found.extend(sid for sid, out in zip(part, outcomes) if out)
+    return found
+
+
+async def unrecorded_failures(records, job_id: str, store, job) -> tuple[list[str], list[str]]:
+    """Every failed or voided id of the job (``failed_verdicts`` of all its verdicts), and, in the same order, those
+    its ledger may not record yet: the only ones a reconcile reads, so a judge start does not read every failed
+    record of every open order again.
+
+    A failure is recorded only after its verdict is written, at its own record's prompt, under its id's first 12 hex,
+    and no write of a running validator drops one. With the ledger read before the verdicts are listed, a recorded
+    prefix that a single listed verdict carries is that submission's own failure, which ``record_prompt_failures``
+    would leave as it is. A prefix two listed verdicts share is read (the ledger tells failures apart by prefix
+    within one prompt only), and so is every failure when ``store`` is None or the ledger cannot be read."""
+    recorded: set[str] = set()
+    if store is not None and job is not None:
+        from reliquary.validator.corpus_service import recorded_failure_ids
+
+        try:
+            recorded = await recorded_failure_ids(store, job)
+        except Exception:
+            logger.warning("corpus job %s: ledger unread before the failure reconcile; every failure is read",
+                           job_id, exc_info=True)
+    ids = list(await records.list_verdict_ids(job_id))
+    failed = await failed_verdicts(records, job_id, ids)
+    listed = Counter(sid[:12] for sid in ids)
+    return failed, [sid for sid in failed if sid[:12] not in recorded or listed[sid[:12]] > 1]
 
 
 def _finite(value):

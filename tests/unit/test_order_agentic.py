@@ -379,6 +379,44 @@ def test_an_episode_order_waits_for_its_audit_after_its_gateway(admin, swe_set, 
     asyncio.run(go())
 
 
+def test_a_restarted_controls_episode_order_is_not_ready_for_session_opens(admin, swe_set, qwen35,  # noqa: F811
+                                                                           tmp_path, monkeypatch):
+    # Before the registry is read, and while a listed order is not wired yet, an open is refused for a retry
+    # (`job_not_ready`, 503): `job_not_served` (404) counts toward the miner's `validator_unavailable` halt.
+    pytest.importorskip("reliquary_sandbox.attest")
+    from reliquary.protocol.sandbox_session import JOB_SCOPED_PREFIX
+
+    assert admin("POST", "/admin/v1/jobs", _order()).status_code == 201
+    services = _order_services(tmp_path, JOB_SCOPED_PREFIX)
+    app, job_set = _control(admin, tmp_path, monkeypatch, services)
+    job_id = "order-eval-swe1"
+
+    async def refusal(job):
+        terms = await services.issuer._engagements["corpus"].terms(
+            "5Hot", {"kind": "corpus", "job_id": job, "prompt_index": 0})
+        return getattr(terms, "reason", None)
+
+    async def go():
+        assert await refusal(job_id) == "job_not_ready"
+        wire = job_set._wire
+
+        async def r2_timeout(*args):
+            raise OSError("r2 timeout")
+
+        job_set._wire = r2_timeout
+        await job_set.refresh()
+        assert await refusal(job_id) == "job_not_ready"
+        assert await refusal("order-eval-other") == "job_not_served"
+        job_set._wire = wire
+        await job_set.refresh()
+        assert job_id in job_set.served and not services.not_ready(job_id)
+        for tasks in job_set._tasks.values():
+            for task in tasks:
+                task.cancel()
+
+    asyncio.run(go())
+
+
 def test_the_control_status_says_what_an_episode_orders_gateways_are_sized_from(admin, swe_set, qwen35,  # noqa: F811
                                                                                  tmp_path, monkeypatch):
     pytest.importorskip("reliquary_sandbox.attest")

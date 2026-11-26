@@ -226,6 +226,7 @@ def test_a_permanent_failure_stops_the_miner_after_k_consecutive():
     assert len(generator.prompts) == 1, "the retries resend the SAME body, no fresh generation per attempt"
     assert excinfo.value.counts == {"permanent_failure": 3}
     assert len(sleeps) == 2, "no backoff after the failure that crosses the threshold"
+    assert excinfo.value.failed_call, "a call that kept failing, not a refusal of the hotkey"
 
 
 class _FlakyGenerator:

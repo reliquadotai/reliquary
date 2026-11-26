@@ -72,7 +72,19 @@ class CorpusPeriodSettler:
 
     ``ready(ids)``: which of ``ids`` may be paid now
     (an episode job's grader answers the graded ones); the others are left
-    for a later call, never paid ungraded. None pays every verdict."""
+    for a later call, never paid ungraded. None pays every verdict.
+
+    ``hold({id: (hotkey, work period, received_at)}, period_of)``: verdicts of
+    closed periods to leave unsettled for now (an order's parked record past its
+    give-up holds its operator's verdicts it could forfeit: ``EvalAuditor.settle_hold``);
+    a later call settles them, as any late verdict.
+
+    ``capped({id: verdict}, period_of)``: which verdicts are paid within what is
+    left of their period's cap, never past it, when that period was settled
+    before without them (an order's parked records decided after they left the
+    close, and the verdicts their stake hold kept back: ``EvalAuditor.settle_capped``).
+    Any other late verdict is paid against its period's whole count, as before; a
+    verdict of a period settled for the first time is paid with its period."""
 
     def __init__(self, *, task_id, job_id, cap, records, archives,
                  oldest_pending: Callable[[], float | None],
@@ -80,8 +92,14 @@ class CorpusPeriodSettler:
                  slack_seconds: float = ADMISSION_SLACK_SECONDS, on_settled=None,
                  full_list_every_seconds: float | None = None, executor=None,
                  ready: Callable[[list[str]], Awaitable[set[str]]] | None = None,
-                 max_price: float | None = None, max_input_price: float | None = None) -> None:
+                 max_price: float | None = None, max_input_price: float | None = None,
+                 hold: Callable[[dict, Callable[[float], int]], set[str]] | None = None,
+                 capped: Callable[[dict, Callable[[float], int]], set[str]] | None = None) -> None:
         self._ready = ready
+        self._hold = hold
+        self._capped = capped
+        # Verdicts `hold` kept back once: released late, they are expected, and logged as such.
+        self._held_once: set[str] = set()
         # Pool share one verified token may pay at most; None: the cap alone.
         self._max_price = None if max_price is None else float(max_price)
         # Pool share one prompt token may pay, beside it; None: prompts unpaid.
@@ -384,17 +402,33 @@ class CorpusPeriodSettler:
         lister = getattr(self._records, "list_voided_ids", None)
         voided = set(await lister(self._job_id)) if lister is not None else set()
         self._count_open(new_ids, verdicts, voided, genesis)
+        held: set[str] = set()
+        if self._hold is not None:
+            # After the close bound and the reads, as `ready`: a hold lifted meanwhile only pays later.
+            held = self._hold({sid: (verdict.get("hotkey"), self._work_period(verdict, genesis),
+                                     verdict.get("received_at"))
+                               for sid, verdict in verdicts.items() if verdict is not None},
+                              lambda at: cp.period_of(float(at), genesis))
+            self._held_once |= held
         by_period: dict[int, list[str]] = defaultdict(list)
         for sid in new_ids:
             verdict = verdicts.get(sid)
             if verdict is None:
                 continue  # listed before it was readable: next call
             period = self._work_period(verdict, genesis)
-            if period <= closed:
+            if period <= closed and sid not in held:
                 by_period[period].append(sid)
+        # Capped only in a period settled before this call (without them); in a period settled for the first time they
+        # are paid with it.
+        paid_before = {int(period) for period, tokens in (state.get("period_tokens") or {}).items() if tokens}
+        capped = (self._capped({sid: verdicts[sid] for period, ids in by_period.items() if period in paid_before
+                                for sid in ids}, lambda at: cp.period_of(float(at), genesis))
+                  if self._capped is not None and paid_before & set(by_period) else set())
+        # A period's capped verdicts are settled apart, after its others: the cap they are paid within counts them.
+        batches = sorted({(period, sid in capped) for period, ids in by_period.items() for sid in ids})
         last = None
-        for period in sorted(by_period):
-            ids = by_period[period]
+        for period, within_cap in batches:
+            ids = [sid for sid in by_period[period] if (sid in capped) == within_cap]
             batch = [verdicts[sid] if sid not in voided else {**verdicts[sid], "passed": False}
                      for sid in ids]
             new_tokens = sum(int(v["token_count"]) for v in batch if v.get("passed"))
@@ -409,7 +443,12 @@ class CorpusPeriodSettler:
                 self._report(state, ids)
                 self.open_periods.pop(str(period), None)
                 continue
-            if earlier:
+            if earlier and (within_cap or all(sid in self._held_once for sid in ids)):
+                # An order's parked records decided after their period closed without them, and the verdicts their
+                # stake guarantee held back: expected.
+                logger.warning("corpus task %s: %d late verdict(s) for settled period %d (parked or held back)",
+                               self._task_id, len(ids), period)
+            elif earlier:
                 # A verdict for a period already paid: its close missed it (it
                 # should not). Paid against the period's whole token count, so the
                 # period pays slightly over its cap; loud, never silent.
@@ -426,6 +465,9 @@ class CorpusPeriodSettler:
                 else self._max_input_price)
             if self._max_price is None:
                 pool = self._cap * new_tokens / (earlier + new_tokens)
+                if within_cap:
+                    # A parked record decided late (owner, 2026-11-26): within what is left of the cap.
+                    pool = min(pool, max(0.0, self._cap - already))
             elif input_price is None:
                 # The whole period never pays past min(cap, price x its tokens),
                 # whatever was paid for it earlier.
@@ -444,8 +486,9 @@ class CorpusPeriodSettler:
                 budget = min(self._cap, earlier_value + new_value)
                 pool = max(0.0, budget - already)
             if pool <= 0:
-                logger.error("corpus task %s: period %d already paid its budget; %d late "
-                             "verdict(s) paid nothing", self._task_id, period, len(ids))
+                logger.log(logging.WARNING if within_cap else logging.ERROR,
+                           "corpus task %s: period %d already paid its budget; %d late verdict(s) paid nothing",
+                           self._task_id, period, len(ids))
                 state = {**state, "settled": await self._off(_union, state["settled"], ids),
                          "totals": totals}
                 etag = await self._records.write_settlement(self._job_id, state, etag)

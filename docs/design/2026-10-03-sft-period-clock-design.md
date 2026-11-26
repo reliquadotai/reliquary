@@ -287,11 +287,21 @@ time. Reassign once the tail has run out.
   never closes past its arrival feed's coverage less the slack, and closes nothing
   while that coverage is unreadable; an id found by a listing whose arrival stays
   unreadable holds periods open for two periods, then is left out with an error,
-  so one corrupt record cannot freeze a task's pay. An undecided submission older
-  than six periods is reported.
+  so one corrupt record cannot freeze a task's pay. An order's parked record (an
+  audit no executor can return, `eval_control`) is left out the same way two
+  periods after its receipt (one parked with other records' items, once its
+  first retry alone had its time too); at q < 1 its operator's verdicts received
+  in its period up to its receipt (what its stake counts) stay unsettled until it
+  is decided (the settler's `hold`), and it no longer holds its operator's
+  unaudited passes as a sibling. An undecided submission
+  older than six periods is reported.
 - **A late verdict** (one whose period was already settled, which the bounds above
   should prevent) is still paid against the period's whole token count, logged as
   an error: the period pays slightly over its cap rather than the worker nothing.
+  The verdicts an order's stake hold kept back are paid the same way. Only an
+  order's parked record decided after its period closed without it is paid within
+  what is left of its period's budget (the settler's `capped`, 2026-11-26), never
+  past its cap.
 - **The period origin is a protocol constant** (drand quicknet's genesis,
   1692803367): no weight-set depends on reaching a drand relay.
 - **Window and period pay of one task add up** in the weight setter; neither tail

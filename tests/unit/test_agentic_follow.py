@@ -210,6 +210,49 @@ def test_an_order_that_left_the_list_is_stopped_after_two_reads():
     assert children["a"].terminated
 
 
+def test_a_follower_keeps_its_child_while_a_restarted_control_wires_its_order_again(monkeypatch):
+    # A control restart (the 2026-11-24 switch) serves at once and wires its orders one by one for minutes, and a
+    # follower stops the child of an order missing from two reads in a row. The real list, read as a deployed
+    # follower reads it: 503 until the registry is read (its first read fails here), then the order `restoring`.
+    import asyncio
+
+    import httpx
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from reliquary.validator.corpus_service import build_corpus_jobs_router
+    from tests.unit.test_corpus_hot_jobs import _Harness, _hot_entry
+
+    control = _Harness([_hot_entry(job_id="swe")], wire_error=OSError("r2 timeout"))
+    control.registry_error = OSError("r2 timeout")
+    app = FastAPI()
+    app.include_router(build_corpus_jobs_router(control.routes, legacy=False))
+    monkeypatch.setattr(httpx, "Client", lambda base_url, timeout: TestClient(app, base_url=base_url))
+    list_jobs, _ = follow.http_listing("http://control")
+    follower = follow.AgenticFollower(
+        list_jobs=list_jobs, read_manifest=lambda job_id: _job(job_id), launch=lambda *a: FakeChild("new"),
+        fetch=lambda model: None, parse=lambda raw: raw, serve_refusal=lambda job: None, sleep=lambda s: None)
+    child = FakeChild("swe")
+    follower.running[0] = follow._Running("swe", 0, child, 0.0, None)     # mining it when the control restarted
+    stopped_at = None
+    for read in range(1, 13):
+        if read == 2:
+            asyncio.run(control.set.refresh())      # the registry read fails
+        if read == 3:
+            control.registry_error = None
+            asyncio.run(control.set.refresh())      # read; this pass does not wire the order yet
+        follower.step()
+        if child.terminated:
+            stopped_at = read
+            break
+    assert stopped_at is None, f"the follower stopped its child at read {stopped_at}"
+    assert control.routes.restoring == {"swe"}      # reads 3 to 12 listed it `restoring`
+    control.wire_error = None
+    asyncio.run(control.set.refresh())
+    follower.step()
+    assert not child.terminated and list(follower.running) == [0] and follower.running[0].child is child
+
+
 def test_a_failed_order_backs_off_doubling_whenever_it_failed():
     jobs = {j: _job(j) for j in ("bad", "good")}
     clock = Clock()

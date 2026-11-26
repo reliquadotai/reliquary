@@ -5,8 +5,12 @@
 # environment wheels from reliquary-environments). See docs/runbooks/order-control.md.
 #
 #   docker build -f docker/Dockerfile.order-control \
-#     --build-arg BASE_IMAGE=<the validator image, a -logic one> \
+#     --build-arg BASE_IMAGE=ghcr.io/reliquadotai/reliquary-validator@sha256:<digest> \
 #     --build-context envs=<directory holding exactly the four reviewed wheels> .
+#
+# BASE_IMAGE: a -logic validator image, pinned by digest, never by tag (latest moves
+# with main). Build once and push: check the pushed digest and switch to it, since the
+# pip installs below resolve dependencies at build time and a second build is another image.
 #
 # Wheels (distribution -> source):
 #   reliquary-logic                  -> reliquary_logic_v2
