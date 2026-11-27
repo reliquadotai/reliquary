@@ -157,17 +157,30 @@ async def test_with_no_tier_in_effect_the_vector_is_the_old_rules_bit_for_bit():
             assert [struct.pack("<d", got[u]) for u in got] == [struct.pack("<d", expected[u]) for u in expected]
 
 
-async def test_a_collector_without_a_uid_lets_its_part_burn(caplog):
-    vector = await _vector({"alice": 0.4}, hotkey=COLLECTOR, tiers=((1_000, 0.5),), meta=_meta(collector_uid=None))
-    assert vector == {10: 0.4, 42: pytest.approx(0.6)}
-    assert "has no UID" in caplog.text
+def _logged():
+    """The weight setter's error log, read directly: an import elsewhere (bittensor's
+    logging setup) can disable existing loggers, and then caplog sees nothing."""
+    return patch("reliquary.validator.weight_only.logger")
 
 
-async def test_a_collector_held_by_the_owners_coldkey_lets_its_part_burn(caplog):
-    vector = await _vector({"alice": 0.4}, hotkey=COLLECTOR, tiers=((1_000, 0.5),),
-                           meta=_meta(collector_cold=OWNER_COLD))
+def _errors(logger) -> str:
+    return " ".join(str(call.args[0]) % call.args[1:] for call in logger.error.call_args_list)
+
+
+async def test_a_collector_without_a_uid_lets_its_part_burn():
+    with _logged() as logger:
+        vector = await _vector({"alice": 0.4}, hotkey=COLLECTOR, tiers=((1_000, 0.5),),
+                               meta=_meta(collector_uid=None))
     assert vector == {10: 0.4, 42: pytest.approx(0.6)}
-    assert "subnet owner" in caplog.text
+    assert "has no UID" in _errors(logger)
+
+
+async def test_a_collector_held_by_the_owners_coldkey_lets_its_part_burn():
+    with _logged() as logger:
+        vector = await _vector({"alice": 0.4}, hotkey=COLLECTOR, tiers=((1_000, 0.5),),
+                               meta=_meta(collector_cold=OWNER_COLD))
+    assert vector == {10: 0.4, 42: pytest.approx(0.6)}
+    assert "subnet owner" in _errors(logger)
 
 
 async def test_the_owner_hotkey_itself_is_never_the_collector():
@@ -178,12 +191,12 @@ async def test_the_owner_hotkey_itself_is_never_the_collector():
         assert WeightOnlyValidator._resolve_payout(_meta(), {OWNER: 42}, 1_000) == (None, 0.0)
 
 
-async def test_a_snapshot_without_the_subnet_owner_fails_closed_as_without_a_collector(caplog):
+async def test_a_snapshot_without_the_subnet_owner_fails_closed_as_without_a_collector():
     # At the whole share, a collector is not paid on a snapshot that cannot show it is not the owner's: the share
     # takes the burn path, which refuses to guess, exactly as without a collector.
-    with pytest.raises(RuntimeError, match="subnet owner hotkey unavailable"):
+    with _logged() as logger, pytest.raises(RuntimeError, match="subnet owner hotkey unavailable"):
         await _vector({"alice": 0.4}, hotkey=COLLECTOR, tiers=((1_000, 1.0),), meta=_meta(owner_fields=False))
-    assert "does not name the subnet owner" in caplog.text
+    assert "does not name the subnet owner" in _errors(logger)
 
 
 async def test_with_the_whole_share_routed_the_owner_needs_no_uid():
