@@ -50,6 +50,7 @@ class FakeChain:
         self.blocks: dict[int, list[tuple[str, po.Inclusion]]] = {}
         self.submitted: list[po.SignedBatch] = []
         self.on_submit = on_submit
+        self.refuse: set[str] = set()
         self.calls: list[str] = []
 
     async def finalized_block(self):
@@ -78,6 +79,9 @@ class FakeChain:
 
     async def submit(self, signed):
         self.submitted.append(signed)
+        if self.refuse and any(t.coldkey in self.refuse for t in signed.payload):
+            self.land(signed, success=False)    # the chain refuses one destination: the whole batch_all reverts
+            return
         if self.on_submit == "raise_before":
             raise ConnectionError("dropped before the node had it")
         if self.on_submit in ("include", "fail", "raise_after_include"):
@@ -130,17 +134,25 @@ def _config(**overrides):
 
 
 def _pass(obligations, journal, chain, *, execute=True, signer=None, now=NOW, day=PASS_DAY, config=None,
-          collector=(PAID,), wait_seconds=600.0):
+          collector=(PAID,), wait_seconds=600.0, confirm="dry run"):
+    """One pass. Executing confirms, by default, the total a dry run just
+    printed: what an operator does."""
     clock = SimpleNamespace(t=0.0)
 
     async def sleep(seconds):
         clock.t += seconds
         chain.head += 5     # time passes on the chain too
 
-    return asyncio.run(po.run_pass(
-        obligations, journal=journal, chain=chain, config=config or _config(), collector_tasks=collector,
-        pass_day=day, terms=TERMS, now=now, execute=execute, signer=signer or (FakeSigner() if execute else None),
-        wait_seconds=wait_seconds, poll_seconds=12.0, clock=lambda: clock.t, sleep=sleep))
+    def run(execute, confirm_rao):
+        return asyncio.run(po.run_pass(
+            obligations, journal=journal, chain=chain, config=config or _config(), collector_tasks=collector,
+            pass_day=day, terms=TERMS, now=now, execute=execute,
+            signer=signer or (FakeSigner() if execute else None), confirm_rao=confirm_rao,
+            wait_seconds=wait_seconds, poll_seconds=12.0, clock=lambda: clock.t, sleep=sleep))
+
+    if execute and confirm == "dry run":
+        confirm = run(False, None)["planned"]["rao"]
+    return run(execute, confirm if execute else None)
 
 
 OWNERS = {"5A": "5ColdA", "5B": "5ColdB", "5C": "5ColdC"}
@@ -504,3 +516,182 @@ def test_events_are_normalized_to_ss58_accounts():
     assert normalized["attributes"][:3] == [ss58_encode(key, ss58_format=42),
                                             ss58_encode(bytes.fromhex("22" * 32), ss58_format=42), "5Already"]
     assert ss58(81) == 81
+
+
+# -- the owner's go, and transfers the chain refuses -------------------------------------------------------------------
+
+
+def test_executing_pays_only_the_total_a_confirmation_names(journal):
+    obligations = _ledger({PAID: {"5A": 0.01, "5B": 0.02}})
+    total = sum(o.amount_rao for o in obligations)
+    chain = FakeChain(stake_rao=10**12, owners=OWNERS)
+    for wrong in (None, total - 1, total + 1):
+        stopped = _pass(obligations, journal, chain, confirm=wrong)
+        assert stopped["stopped"] and f"--confirm-rao {total}" in stopped["stopped"]
+        assert chain.submitted == [] and journal.batches() == []
+    paid = _pass(obligations, journal, chain, confirm=total)
+    assert paid["paid"]["rao"] == total and paid["confirmed_rao"] == total
+
+
+def test_a_dry_run_shows_the_total_an_execution_will_ask_to_confirm(journal):
+    obligations = _ledger({PAID: {"5A": 0.01}})
+    chain = FakeChain(stake_rao=10**12, owners=OWNERS, on_submit="drop")
+    _pass(obligations, journal, chain, wait_seconds=1.0)
+    chain.head += 200          # the dropped batch's window is over: it will be released
+    preview = _pass(obligations, journal, chain, execute=False)
+    assert preview["recovered"][0]["state"] == po.BATCH_EXPIRED
+    assert preview["planned"]["rao"] == obligations[0].amount_rao and preview["in_flight_rao"] == 0
+    chain.on_submit = "include"
+    paid = _pass(obligations, journal, chain, confirm=preview["planned"]["rao"])
+    assert paid["paid"]["rao"] == obligations[0].amount_rao
+
+
+def test_a_refused_destination_is_retried_alone_then_held_for_a_person(journal):
+    obligations = _ledger({PAID: {"5A": 0.01, "5B": 0.02}})
+    chain = FakeChain(stake_rao=10**12, owners=OWNERS)
+    chain.refuse = {"5ColdB"}
+    first = _pass(obligations, journal, chain)
+    assert first["batches"][0]["state"] == po.BATCH_FAILED and len(first["batches"][0]["transfers"]) == 2
+    second = _pass(obligations, journal, chain)
+    # Each transfer that failed goes alone: 5A is paid, 5B fails again by itself.
+    assert sorted((len(b["transfers"]), b["state"]) for b in second["batches"]) == [
+        (1, po.BATCH_FAILED), (1, po.BATCH_FINALIZED)]
+    third = _pass(obligations, journal, chain)
+    assert third["batches"][0]["state"] == po.BATCH_FAILED
+    held = _pass(obligations, journal, chain)
+    b_ids = [o.obligation_id for o in obligations if o.hotkey == "5B"]
+    assert held["stuck"]["obligation_ids"] == b_ids and held["planned"]["transfers"] == 0
+    # A person fixes it (the swap announcement is gone) and clears it: paid once.
+    chain.refuse = set()
+    assert journal.clear_attempts(b_ids) == 1
+    paid = _pass(obligations, journal, chain)
+    assert paid["paid"]["transfers"] == 1
+    assert set(_states(journal, obligations).values()) == {ob.RECONCILED}
+
+
+def test_batches_put_retried_transfers_alone():
+    transfers = [po.Transfer(coldkey=c, amount_rao=1, obligation_ids=(c,)) for c in ("a", "b", "c", "d")]
+    assert [[t.coldkey for t in b] for b in po.batches_of(transfers, 2, alone={"b"})] == [["a", "c"], ["d"], ["b"]]
+
+
+# -- receipts, published -------------------------------------------------------------------------------------------------
+
+
+class _Bucket:
+    """An S3 client over a dict, honouring IfNoneMatch and IfMatch; nothing else."""
+
+    def __init__(self):
+        self.objects: dict[str, tuple[bytes, str]] = {}
+        self.puts = 0
+
+    def __getattr__(self, name):
+        raise AssertionError(f"the publisher called {name}")
+
+    async def get_object(self, Bucket, Key):
+        from botocore.exceptions import ClientError
+
+        if Key not in self.objects:
+            raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+        body, etag = self.objects[Key]
+
+        class _Body:
+            async def read(self, *_):
+                return body
+
+        return {"Body": _Body(), "ETag": etag}
+
+    async def put_object(self, Bucket, Key, Body, ContentType=None, IfNoneMatch=None, IfMatch=None):
+        from botocore.exceptions import ClientError
+
+        held = self.objects.get(Key)
+        if (IfNoneMatch == "*" and held is not None) or (IfMatch is not None and (held is None or held[1] != IfMatch)):
+            raise ClientError({"Error": {"Code": "PreconditionFailed"}}, "PutObject")
+        self.puts += 1
+        self.objects[Key] = (bytes(Body), f'"{self.puts}"')
+
+
+def _published(monkeypatch):
+    from contextlib import asynccontextmanager
+
+    from reliquary.infrastructure import storage
+
+    bucket = _Bucket()
+
+    @asynccontextmanager
+    async def client(**_):
+        yield bucket
+
+    monkeypatch.setattr(storage, "get_s3_client", client)
+    return bucket
+
+
+def test_executed_receipts_are_published_once_with_an_index_and_dry_runs_never(tmp_path, monkeypatch, journal):
+    from reliquary.ledger import receipts as rc
+
+    obligations = _ledger({PAID: {"5A": 0.01}})
+    chain = FakeChain(stake_rao=10**12, owners=OWNERS)
+    folder = tmp_path / "receipts"
+    dry = po.write_receipt(_pass(obligations, journal, chain, execute=False), folder)
+    paid = po.write_receipt(_pass(obligations, journal, chain), folder)
+    bucket = _published(monkeypatch)
+    plan = asyncio.run(rc.publish(folder.glob("*.json")))
+    assert {r["path"]: r["action"] for r in plan} == {str(dry): "not_executed", str(paid): "would_write"}
+    assert bucket.objects == {}
+    done = asyncio.run(rc.publish(folder.glob("*.json"), execute=True))
+    key = f"reliquary/public/payouts/transfers/2026-11-28/{paid.name}"
+    assert [r["action"] for r in done if r["path"] == str(paid)] == ["written"]
+    assert bucket.objects[key][0] == paid.read_bytes()
+    index = json.loads(bucket.objects[rc.INDEX_KEY][0])
+    assert [e["key"] for e in index["receipts"]] == [key] and index["receipts"][0]["rao"] == obligations[0].amount_rao
+    again = asyncio.run(rc.publish(folder.glob("*.json"), execute=True))
+    assert [r["action"] for r in again if r["path"] == str(paid)] == ["already_published"]
+    assert len(json.loads(bucket.objects[rc.INDEX_KEY][0])["receipts"]) == 1
+    paid.write_text(paid.read_text().replace('"pass_day"', '"pass_day" ', 1))
+    with pytest.raises(rc.ReceiptError):
+        asyncio.run(rc.publish([paid], execute=True))
+
+
+def test_the_index_keeps_every_receipt_newest_first():
+    from reliquary.ledger.receipts import merge_index
+
+    old = {"key": "k1", "pass_day": "2026-11-28", "as_of": 1.0}
+    new = {"key": "k2", "pass_day": "2026-11-29", "as_of": 2.0}
+    merged = merge_index(merge_index(None, [old]), [new, old])
+    assert [e["key"] for e in merged["receipts"]] == ["k2", "k1"]
+
+
+def test_ledger_pay_keeps_its_journal_and_receipts_in_one_documented_place(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from reliquary.ledger import cli
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    folder = tmp_path / "archives" / PAID
+    folder.mkdir(parents=True)
+    doc = {"task_id": PAID, "job_id": PAID, "work_period": WORK, "rewards_by_hotkey": {"5A": 0.01}, "cap": 0.5,
+           "budget": 0.5, "max_price_per_token": 1e-8, "settled_at": cp.period_end(WORK) + 600}
+    (folder / f"{WORK:010d}-{WORK + 1:010d}.json").write_text(json.dumps(doc))
+    chain = FakeChain(stake_rao=10**12, owners=OWNERS)
+
+    class _Subtensor:
+        async def close(self):
+            return None
+
+    async def fake_subtensor(network):
+        return _Subtensor()
+
+    async def fake_min(subtensor):
+        return 0
+
+    monkeypatch.setattr(cli, "_subtensor", fake_subtensor)
+    monkeypatch.setattr(cli, "_payout_chain", lambda subtensor, **kwargs: chain)
+    monkeypatch.setattr(cli, "_min_transfer_rao", fake_min)
+    result = CliRunner().invoke(cli.ledger_app, [
+        "pay", "--collector-coldkey", COLLECTOR, "--collector-hotkey", COLLECTOR_HOT,
+        "--archives", str(tmp_path / "archives"), "--prices", "none", "--rate", str(E),
+        "--assume-collector", PAID, "--as-of", "2026-11-28T12:05:00"])
+    assert result.exit_code == 0, result.output
+    assert list((tmp_path / "home/.reliquary/payout/receipts").glob("payout-2026-11-28-dry-run-*.json"))
+    refused = CliRunner().invoke(cli.ledger_app, ["pay", "--collector-coldkey", COLLECTOR, "--collector-hotkey",
+                                                  COLLECTOR_HOT, "--confirm-rao", "5"])
+    assert refused.exit_code != 0

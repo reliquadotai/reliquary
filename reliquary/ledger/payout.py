@@ -76,6 +76,11 @@ PAYOUT_RECEIPT_SCHEMA = "reliquary/payout-receipt/v1"
 DEFAULT_BATCH_SIZE = 32
 # Blocks a signed batch stays valid (a power of two, as mortal eras are).
 DEFAULT_ERA_PERIOD = 64
+# An obligation whose batches failed or expired this many times is held out of
+# every plan until a person looks: the chain may refuse its destination (a
+# coldkey reserved by a swap announcement, say), and one refused transfer
+# reverts a whole batch_all. A transfer that failed before goes alone.
+MAX_ATTEMPTS = 3
 MODE_DRY_RUN, MODE_EXECUTE = "dry-run", "execute"
 
 # A batch's states. ``prepared``: reserved, not signed yet (never sent); ``submitted``: its hash is kept and it
@@ -267,6 +272,19 @@ class Journal:
         marks = ",".join("?" * len(UNRESOLVED))
         return self.batches(f"state IN ({marks})", UNRESOLVED)
 
+    def clear_attempts(self, obligation_ids: Iterable[str]) -> int:
+        """A person's decision on obligations held out after ``MAX_ATTEMPTS``
+        failed attempts (the destination's problem fixed): plan them again.
+        Returns how many were due and cleared."""
+        ids = list(obligation_ids)
+        now = self.clock()
+        cleared = 0
+        with self._transaction() as db:
+            for obligation_id in ids:
+                cleared += db.execute("UPDATE payout_obligations SET attempts=0, updated_at=? "
+                                      "WHERE obligation_id=? AND state=?", (now, obligation_id, DUE)).rowcount
+        return cleared
+
     def foreign(self) -> list[dict]:
         """Batches whose nonce another extrinsic took: until a person settles
         each (``settle_foreign``), no pass sends anything."""
@@ -414,8 +432,13 @@ def plan_transfers(candidates: Sequence[tuple[Obligation, str]], *, available_ra
     return transfers, deferred, unfunded
 
 
-def batches_of(transfers: Sequence[Transfer], size: int) -> list[list[Transfer]]:
-    return [list(transfers[start:start + size]) for start in range(0, len(transfers), size)]
+def batches_of(transfers: Sequence[Transfer], size: int, *, alone: Collection[str] = ()) -> list[list[Transfer]]:
+    """``transfers`` in batches of at most ``size``; a transfer to a coldkey in
+    ``alone`` (one that failed before) in a batch of its own, so it cannot
+    revert the others."""
+    solo = [[t] for t in transfers if t.coldkey in alone]
+    rest = [t for t in transfers if t.coldkey not in alone]
+    return [list(rest[start:start + size]) for start in range(0, len(rest), size)] + solo
 
 
 def reconcile_events(transfers: Sequence[Mapping], inclusion: Inclusion, *, collector_coldkey: str,
@@ -526,11 +549,14 @@ async def destinations(obligations: Sequence[Obligation], chain: PayoutChain,
 
 async def run_pass(obligations: Iterable[Obligation], *, journal: Journal, chain: PayoutChain, config: PayoutConfig,
                    collector_tasks: Collection[str], pass_day: date, terms: PayTerms, now: float,
-                   execute: bool = False, signer: Signer | None = None, wait_seconds: float = 600.0,
-                   poll_seconds: float = 12.0, clock=time.time, sleep=asyncio.sleep) -> dict:
+                   execute: bool = False, signer: Signer | None = None, confirm_rao: int | None = None,
+                   wait_seconds: float = 600.0, poll_seconds: float = 12.0, clock=time.time,
+                   sleep=asyncio.sleep) -> dict:
     """One pass: settle what is unknown, then plan, then (``execute``) pay.
     Returns the receipt. A dry run writes nothing to the journal and signs
-    nothing."""
+    nothing. Executing pays only when ``confirm_rao`` names the pass's total
+    exactly (the owner's go, read off a dry run); otherwise it stops before
+    reserving anything, and says the total."""
     if execute:
         if signer is None:
             raise PayoutError("executing a pass needs a signer")
@@ -544,8 +570,11 @@ async def run_pass(obligations: Iterable[Obligation], *, journal: Journal, chain
                      "pass_day": pass_day.isoformat(), "pass_at": at, "as_of": float(now), **config.to_dict(),
                      "recovered": [], "batches": [], "stopped": None}
 
-    # 1. What is not known yet, from the chain, before anything new is sent.
+    # 1. What is not known yet, from the chain, before anything new is sent. A dry run settles nothing, but
+    # plans as if it had (``would``), so the total it shows is the one an execution would ask to confirm.
     pending = 0
+    would: dict[str, str] = {}
+    would_rao = 0
     for batch in journal.unresolved():
         state, inclusion, detail = await resolve_batch(batch, chain)
         if state == BATCH_PENDING:
@@ -555,6 +584,9 @@ async def run_pass(obligations: Iterable[Obligation], *, journal: Journal, chain
             receipt["recovered"].append(_settle(journal, batch, state, inclusion, detail, config))
         else:
             receipt["recovered"].append(_batch_receipt(batch, state, inclusion, f"(would settle) {detail}"))
+            if state in (BATCH_FINALIZED, BATCH_FAILED, BATCH_EXPIRED):
+                would[batch["batch_id"]] = state
+                would_rao += sum(int(t["amount_rao"]) for t in batch["transfers"])
         if state == BATCH_FOREIGN:
             receipt["stopped"] = detail
     waiting = [b["batch_id"] for b in journal.foreign()]
@@ -566,11 +598,24 @@ async def run_pass(obligations: Iterable[Obligation], *, journal: Journal, chain
     native = [o for o in due if o.task_id not in collector_tasks]
     mine = [o for o in due if o.task_id in collector_tasks]
     held = journal.rows(o.obligation_id for o in mine)
-    open_ = [o for o in mine if held.get(o.obligation_id, {}).get("state", DUE) == DUE]
+
+    def state_of(obligation_id: str) -> str:
+        row = held.get(obligation_id)
+        if row is None:
+            return DUE
+        settled = would.get(row["batch_id"])
+        if settled == BATCH_FINALIZED:
+            return FINALIZED
+        return DUE if settled in (BATCH_FAILED, BATCH_EXPIRED) else row["state"]
+
+    open_ = [o for o in mine if state_of(o.obligation_id) == DUE]
+    attempts = {o.obligation_id: int(held.get(o.obligation_id, {}).get("attempts") or 0) for o in open_}
+    stuck = [o for o in open_ if attempts[o.obligation_id] >= MAX_ATTEMPTS]
+    open_ = [o for o in open_ if attempts[o.obligation_id] < MAX_ATTEMPTS]
     found, ownerless = await destinations(open_, chain, journal)
     head = await chain.finalized_block()
     stake = await chain.collector_stake_rao(head)
-    in_flight = journal.in_flight_rao()
+    in_flight = journal.in_flight_rao() - would_rao
     available = max(0, stake - in_flight - config.reserve_rao)
     by_id = {o.obligation_id: o for o in open_}
     transfers, deferred, unfunded = plan_transfers(
@@ -582,9 +627,10 @@ async def run_pass(obligations: Iterable[Obligation], *, journal: Journal, chain
         "due": _count(due), "native_rail": _count(native), "already_past_due": _count(
             [o for o in mine if o.obligation_id not in by_id]),
         "deferred_below_minimum": _count(deferred), "unfunded": _count(unfunded), "ownerless": _count(ownerless),
+        "stuck": {**_count(stuck), "obligation_ids": [o.obligation_id for o in stuck]},
         "planned": {"transfers": len(transfers), "rao": sum(t.amount_rao for t in transfers),
                     "obligations": sum(len(t.obligation_ids) for t in transfers)},
-        "transfers": [t.to_dict() for t in transfers]})
+        "transfers": [t.to_dict() for t in transfers], "confirmed_rao": confirm_rao})
     if receipt["stopped"] is not None:
         return _close(receipt)
     if pending:
@@ -593,10 +639,17 @@ async def run_pass(obligations: Iterable[Obligation], *, journal: Journal, chain
         return _close(receipt)
     if not execute:
         return _close(receipt)
+    planned = receipt["planned"]["rao"]
+    if planned and confirm_rao != planned:
+        receipt["stopped"] = (f"this pass would pay {planned} rao ({planned / RAO_PER_ALPHA:.9f} alpha) in "
+                              f"{len(transfers)} transfer(s): confirm that exact total with --confirm-rao {planned}")
+        return _close(receipt)
 
     # 3. Pay: one batch at a time, each final before the next takes the following nonce.
     coldkeys = {oid: t.coldkey for t in transfers for oid in t.obligation_ids}
-    for group in batches_of(transfers, config.batch_size):
+    retried = {oid for oid, count in attempts.items() if count > 0}
+    alone = {t.coldkey for t in transfers if retried.intersection(t.obligation_ids)}
+    for group in batches_of(transfers, config.batch_size, alone=alone):
         batch_id = f"{pass_day.isoformat()}-{uuid.uuid4().hex[:12]}"
         journal.reserve(batch_id, pass_day, group, by_id, coldkeys)
         tip = await chain.finalized_block()
@@ -666,6 +719,7 @@ __all__ = [
     "BATCH_SUBMITTED",
     "Inclusion",
     "Journal",
+    "MAX_ATTEMPTS",
     "MODE_DRY_RUN",
     "MODE_EXECUTE",
     "PAYOUT_RECEIPT_SCHEMA",

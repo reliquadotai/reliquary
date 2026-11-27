@@ -29,6 +29,9 @@ ledger_app = typer.Typer(
 )
 
 FIRST_SEEN_FILE = "pending_first_seen.json"
+# Where the payer keeps its one journal and its receipts on the machine it runs on (the owner's, for the pilot).
+DEFAULT_JOURNAL = "~/.reliquary/payout/journal.sqlite"
+DEFAULT_RECEIPTS = "~/.reliquary/payout/receipts"
 
 
 @ledger_app.callback()
@@ -231,8 +234,9 @@ def pay_command(
                                                                            "which holds the stake paid out"),
     collector_hotkey: str = typer.Option(..., "--collector-hotkey", help="the collector's hotkey (SS58): the "
                                                                          "stake moves on it"),
-    journal: Path = typer.Option(..., "--journal", help="the payer's journal (SQLite), one payer at a time"),
-    receipts: Path = typer.Option(..., "--receipts", help="directory the pass's receipt is written to"),
+    journal: Path = typer.Option(DEFAULT_JOURNAL, "--journal", help="the payer's one journal (SQLite); keep it, "
+                                                                    "and back it up: it is what was paid"),
+    receipts: Path = typer.Option(DEFAULT_RECEIPTS, "--receipts", help="directory each pass's receipt is written to"),
     pay_day: str = typer.Option(None, "--pay-day", help="UTC day of the pass; default: the last pass at or "
                                                         "before --as-of"),
     as_of: str = typer.Option(None, "--as-of", help="ISO time; default: now"),
@@ -257,6 +261,8 @@ def pay_command(
                                                                              "were on the collector rail"),
     execute: bool = typer.Option(False, "--execute", help="sign and send (default: a dry run that signs "
                                                           "nothing and writes only its receipt)"),
+    confirm_rao: int = typer.Option(None, "--confirm-rao", help="with --execute: the pass's total in rao, as the "
+                                                                "dry run printed it; any other total sends nothing"),
     wallet_name: str = typer.Option(None, "--wallet-name", help="with --execute: the collector's wallet"),
     wallet_path: str = typer.Option(None, "--wallet-path", help="with --execute: where the wallet lives"),
     wait_seconds: float = typer.Option(600.0, "--wait-seconds", help="how long to wait for a batch to be final"),
@@ -275,6 +281,8 @@ def pay_command(
         raise typer.BadParameter("--assume-collector is for a dry run only")
     if execute and not wallet_name:
         raise typer.BadParameter("--execute needs --wallet-name (the collector's coldkey signs)")
+    if confirm_rao is not None and not execute:
+        raise typer.BadParameter("--confirm-rao goes with --execute")
     if prices not in ("registry", "api", "none"):
         raise typer.BadParameter(f"--prices is 'registry', 'api' or 'none', got {prices!r}")
     now = _parse_instant(as_of)
@@ -292,8 +300,9 @@ def pay_command(
     receipt, path = asyncio.run(collect_payout(
         now=now, pay_day=day, terms=terms, archives=archives, prices=prices, api=api, rate=rate, fixed_rate=fixed,
         budgets=_parse_budgets(order_budget), history_days=history_days, network=network, netuid=netuid,
-        collector_coldkey=collector_coldkey, collector_hotkey=collector_hotkey, journal_path=journal,
-        receipts=receipts, batch_size=batch_size, era_period=era_period,
+        collector_coldkey=collector_coldkey, collector_hotkey=collector_hotkey,
+        journal_path=journal.expanduser(), receipts=receipts.expanduser(), batch_size=batch_size,
+        era_period=era_period, confirm_rao=confirm_rao,
         reserve_rao=math.floor(reserve * RAO_PER_ALPHA),
         min_transfer_rao=None if min_transfer is None else math.floor(min_transfer * RAO_PER_ALPHA),
         assume_collector=assume_collector, execute=execute, wallet_name=wallet_name, wallet_path=wallet_path,
@@ -308,6 +317,7 @@ async def collect_payout(*, now: float, pay_day: date, terms, archives: str, pri
                          rate: str, fixed_rate: float | None, budgets: dict[str, int], history_days: int,
                          network: str, netuid: int, collector_coldkey: str, collector_hotkey: str,
                          journal_path: Path, receipts: Path, batch_size: int, era_period: int, reserve_rao: int,
+                         confirm_rao: int | None = None,
                          min_transfer_rao: int | None, assume_collector: list[str], execute: bool,
                          wallet_name: str | None, wallet_path: str | None, wait_seconds: float):
     """Build the ledger (read-only), then run one pass; returns (receipt, receipt path)."""
@@ -362,7 +372,8 @@ async def collect_payout(*, now: float, pay_day: date, terms, archives: str, pri
                                  collector_hotkey=collector_hotkey) if execute else None)
         receipt = await run_pass(ledger.obligations, journal=journal, chain=chain, config=config,
                                  collector_tasks=collector_tasks, pass_day=pay_day, terms=terms, now=now,
-                                 execute=execute, signer=signer, wait_seconds=wait_seconds)
+                                 execute=execute, signer=signer, confirm_rao=confirm_rao,
+                                 wait_seconds=wait_seconds)
     finally:
         if journal is not None:
             journal.close()
@@ -374,6 +385,25 @@ async def collect_payout(*, now: float, pay_day: date, terms, archives: str, pri
                           "assumed_collector_tasks": sorted(set(assume_collector)),
                           "ledger_anomalies": len(ledger.anomalies)}
     return receipt, write_receipt(receipt, receipts)
+
+
+@ledger_app.command("publish")
+def publish_command(
+    receipts: Path = typer.Option(DEFAULT_RECEIPTS, "--receipts", help="directory of the receipts to publish"),
+    bucket: str = typer.Option(None, "--bucket", help="the bucket (default: R2_BUCKET_ID)"),
+    execute: bool = typer.Option(False, "--execute", help="write them (default: list what would be written)"),
+) -> None:
+    """Publish executed passes' receipts as public JSON in the bucket, each once, with an index.
+
+    A dry run by default. Dry-run receipts are never published."""
+    from reliquary.ledger.receipts import publish
+
+    paths = sorted(receipts.expanduser().glob("*.json"))
+    results = asyncio.run(publish(paths, execute=execute, bucket=bucket))
+    for result in results:
+        typer.echo(f"{result['action']:<18} {result.get('key') or result['path']}")
+    if not execute and any(r["action"] == "would_write" for r in results):
+        typer.echo("dry run: nothing written (add --execute to publish)")
 
 
 def render_payout(receipt) -> str:
@@ -389,7 +419,8 @@ def render_payout(receipt) -> str:
                  f"never paid here: {receipt['native_rail']['obligations']} ({alpha(receipt['native_rail']['rao'])})")
     lines.append(f"  planned {receipt['planned']['transfers']} transfer(s), {alpha(receipt['planned']['rao'])} alpha; "
                  f"deferred under the minimum {receipt['deferred_below_minimum']['obligations']}, unfunded "
-                 f"{receipt['unfunded']['obligations']}, ownerless {receipt['ownerless']['obligations']}")
+                 f"{receipt['unfunded']['obligations']}, ownerless {receipt['ownerless']['obligations']}, "
+                 f"held out after failed attempts {receipt['stuck']['obligations']}")
     for batch in receipt["recovered"] + receipt["batches"]:
         lines.append(f"  batch {batch['batch_id']} {batch['state']} nonce {batch['nonce']} "
                      f"block {batch['block_number']}: {batch['detail']}")
