@@ -117,12 +117,27 @@ async def test_nothing_unpaid_routes_nothing():
 def test_the_settings_refuse_what_is_not_a_hotkey_and_a_fraction():
     from reliquary.constants import payout_settings
 
-    assert payout_settings(None, None) == (None, 0.0)
-    assert payout_settings("", " ") == (None, 0.0)
-    assert payout_settings(COLLECTOR, "0.01") == (COLLECTOR, 0.01)
-    assert payout_settings(f" {COLLECTOR} ", "1") == (COLLECTOR, 1.0)
-    assert payout_settings(COLLECTOR, None) == (COLLECTOR, 0.0)
-    for hotkey, fraction in ((None, "0.5"), (COLLECTOR, "1.5"), (COLLECTOR, "-0.1"), (COLLECTOR, "nan"),
-                             (COLLECTOR, "half"), ("not-an-address", "0.1"), ("5" * 10, "0.1")):
+    assert payout_settings(None, 0.0) == (None, 0.0)
+    assert payout_settings(COLLECTOR, 0.01) == (COLLECTOR, 0.01)
+    assert payout_settings(COLLECTOR, 1) == (COLLECTOR, 1.0)
+    assert payout_settings(COLLECTOR, 0.0) == (COLLECTOR, 0.0)
+    for hotkey, fraction in ((None, 0.5), (COLLECTOR, 1.5), (COLLECTOR, -0.1), (COLLECTOR, float("nan")),
+                             (COLLECTOR, "0.1"), (COLLECTOR, True), ("not-an-address", 0.1), ("5" * 10, 0.1),
+                             (b"5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY", 0.1)):
         with pytest.raises(ValueError):
             payout_settings(hotkey, fraction)
+
+
+def test_the_defaults_route_nothing_and_no_environment_changes_them(monkeypatch):
+    import subprocess
+    import sys
+
+    import reliquary.constants as C
+
+    assert (C.PAYOUT_HOTKEY, C.PAYOUT_FRACTION) == (None, 0.0)
+    # A validator's environment cannot make it route differently from the others.
+    env = {"RELIQUARY_PAYOUT_HOTKEY": COLLECTOR, "RELIQUARY_PAYOUT_FRACTION": "1"}
+    out = subprocess.run([sys.executable, "-c", "import reliquary.constants as C; "
+                          "print(C.PAYOUT_HOTKEY, C.PAYOUT_FRACTION)"],
+                         capture_output=True, text=True, env={**__import__("os").environ, **env}, check=True)
+    assert out.stdout.split()[-2:] == ["None", "0.0"]
