@@ -101,7 +101,7 @@ class FakeChain:
         self.submitted.append(signed)
         if self.on_submit == "reject":
             raise po.PoolRejected("Invalid Transaction")    # the node's pool refused it: never imported
-        if self.refuse and any(t.coldkey in self.refuse for t in signed.payload):
+        if self.refuse and isinstance(signed.payload, list) and any(t.coldkey in self.refuse for t in signed.payload):
             self.land(signed, success=False)    # the chain refuses one destination: the whole batch_all reverts
             return
         if self.on_submit == "raise_before":
@@ -114,6 +114,18 @@ class FakeChain:
     def land(self, signed, *, success=True, events=None, outcome="from success"):
         self.head += 3
         self.nonce = max(self.nonce, signed.nonce + 1)
+        if isinstance(signed.payload, dict):        # a burn_alpha of the collector's stake
+            burned = min(signed.payload["burn_rao"], self.stake) if success else 0
+            events = events if events is not None else (
+                ([{"module": "SubtensorModule", "event": "AlphaBurned",
+                   "attributes": [COLLECTOR, COLLECTOR_HOT, burned, 81]}] if success else [])
+                + [{"module": "System", "event": "ExtrinsicSuccess" if success else "ExtrinsicFailed",
+                    "attributes": {}}])
+            self.stake -= burned
+            self.blocks.setdefault(self.head, []).append(
+                (signed.extrinsic_hash, po.Inclusion(block_number=self.head, block_hash=f"0x{self.head:064x}",
+                                                     success=success, events=tuple(events), fee_rao=90_000)))
+            return
         transfers = signed.payload
         if events is None:
             events = ([{"module": "SubtensorModule", "event": "StakeTransferred",
@@ -151,6 +163,13 @@ class FakeSigner:
         body = json.dumps([[t.coldkey, t.amount_rao, list(t.obligation_ids)] for t in transfers] + [nonce, era_block])
         signed = po.SignedBatch(extrinsic_hash="0x" + hashlib.sha256(body.encode()).hexdigest(), nonce=nonce,
                                 era_block=era_block, era_period=era_period, payload=list(transfers))
+        self.signed.append(signed)
+        return signed
+
+    async def sign_burn(self, amount_rao, *, nonce, era_block, era_period):
+        body = json.dumps(["burn", amount_rao, nonce, era_block])
+        signed = po.SignedBatch(extrinsic_hash="0x" + hashlib.sha256(body.encode()).hexdigest(), nonce=nonce,
+                                era_block=era_block, era_period=era_period, payload={"burn_rao": amount_rao})
         self.signed.append(signed)
         return signed
 

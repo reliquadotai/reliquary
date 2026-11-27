@@ -66,6 +66,9 @@ failed on chain ``MAX_ATTEMPTS`` times (the chain refuses it; ``clear_held``
 once fixed). A coldkey whose transfer failed before goes in a batch of its
 own, so it cannot revert others.
 
+A surplus burn (``reliquary.ledger.surplus``) is one more kind of batch in
+the same journal: it takes the collector's nonces, and gets the same care.
+
 Receipts: every pass returns one (a dry run included), written by the caller
 for publication: the plan and its digest, each batch (nonce, extrinsic hash,
 block, events, fee in TAO), the collector's stake before and after, and the
@@ -171,7 +174,16 @@ CREATE TABLE IF NOT EXISTS payout_decisions(
 # them gets them all in one transaction (a read-only journal: in its in-memory snapshot).
 _ADDED_COLUMNS = (
     ("payout_batches", "receipted", "INTEGER NOT NULL DEFAULT 0"),
+    ("payout_batches", "kind", "TEXT NOT NULL DEFAULT 'transfers'"),
+    ("payout_batches", "burn_rao", "INTEGER"),
 )
+# A batch's kind: transfers to miners (``transfers``), or one ``burn_alpha`` of the collector's surplus
+# (``burn``, ``reliquary.ledger.surplus``). Both take the collector's nonces, so both share one journal.
+KIND_TRANSFERS, KIND_BURN = "transfers", "burn"
+# A burn whose fate a person must read may have burned: its amount stays spoken for.
+BURN_IN_FLIGHT = (BATCH_PREPARED, BATCH_SUBMITTED, BATCH_UNKNOWN, BATCH_FOREIGN)
+# What counts against a day's burn cap: every burn that burned, or may have.
+BURN_COUNTED = (*BURN_IN_FLIGHT, BATCH_FINALIZED, BATCH_MISMATCH)
 
 
 class PayoutError(RuntimeError):
@@ -323,6 +335,7 @@ class Signer(Protocol):
     async def sign(self, transfers: Sequence[Transfer], *, nonce: int, era_block: int,
                    era_period: int) -> SignedBatch: ...
 
+    async def sign_burn(self, amount_rao: int, *, nonce: int, era_block: int, era_period: int) -> SignedBatch: ...
     async def declared_weight(self, transfers: Sequence[Transfer], *, nonce: int, era_block: int,
                               era_period: int) -> tuple[int, int | None]: ...
 
@@ -485,10 +498,39 @@ class Journal:
                 for row in self.db.execute("SELECT obligation_id, task_id, work_period, hotkey, coldkey, amount_rao, "
                                            "attempts FROM payout_obligations WHERE state=?", (DUE,))}
 
+    def paid_tasks(self) -> set[str]:
+        """Every task the journal holds an obligation of."""
+        return {str(row[0]) for row in self.db.execute("SELECT DISTINCT task_id FROM payout_obligations")}
+
     def in_flight_rao(self) -> int:
+        """Transfers reserved or sent, and burns that may still burn: stake
+        already spoken for."""
         marks = ",".join("?" * len(IN_FLIGHT))
-        return int(self.db.execute(f"SELECT COALESCE(SUM(amount_rao), 0) FROM payout_obligations "
-                                   f"WHERE state IN ({marks})", IN_FLIGHT).fetchone()[0])
+        transfers = int(self.db.execute(f"SELECT COALESCE(SUM(amount_rao), 0) FROM payout_obligations "
+                                        f"WHERE state IN ({marks})", IN_FLIGHT).fetchone()[0])
+        burning = ",".join("?" * len(BURN_IN_FLIGHT))
+        burns = int(self.db.execute(f"SELECT COALESCE(SUM(burn_rao), 0) FROM payout_batches WHERE kind=? "
+                                    f"AND state IN ({burning})", (KIND_BURN, *BURN_IN_FLIGHT)).fetchone()[0])
+        return transfers + burns
+
+    def burned_on(self, day: date) -> int:
+        """The rao asked of every burn reserved on UTC ``day`` that burned or
+        may have: what counts against that day's cap."""
+        marks = ",".join("?" * len(BURN_COUNTED))
+        return int(self.db.execute(f"SELECT COALESCE(SUM(burn_rao), 0) FROM payout_batches WHERE kind=? AND "
+                                   f"pass_day=? AND state IN ({marks})",
+                                   (KIND_BURN, day.isoformat(), *BURN_COUNTED)).fetchone()[0])
+
+    def reserve_burn(self, batch_id: str, day: date, amount_rao: int) -> None:
+        """A burn of ``amount_rao`` of the collector's stake, prepared (not
+        signed yet), counted against UTC ``day``'s cap."""
+        if isinstance(amount_rao, bool) or not isinstance(amount_rao, int) or amount_rao <= 0:
+            raise PayoutError(f"a burn needs a positive whole amount of rao, got {amount_rao!r}")
+        now = self.clock()
+        with self._transaction() as db:
+            db.execute("INSERT INTO payout_batches(batch_id, pass_day, state, transfers, created_at, updated_at, kind, "
+                       "burn_rao) VALUES(?,?,?,?,?,?,?,?)",
+                       (batch_id, day.isoformat(), BATCH_PREPARED, "[]", now, now, KIND_BURN, amount_rao))
 
     def coldkey_attempts(self) -> dict[str, int]:
         """Each coldkey with a due obligation whose transfer failed on chain,
@@ -583,7 +625,7 @@ class Journal:
     def batches(self, where: str = "1", args: Sequence = ()) -> list[dict]:
         columns = ("batch_id", "pass_day", "state", "transfers", "nonce", "era_block", "era_period",
                    "extrinsic_hash", "block_number", "block_hash", "fee_rao", "events", "detail", "created_at",
-                   "receipted")
+                   "receipted", "kind", "burn_rao")
         out = []
         for row in self.db.execute(f"SELECT {', '.join(columns)} FROM payout_batches WHERE {where} "
                                    f"ORDER BY created_at, batch_id", tuple(args)):
@@ -787,6 +829,46 @@ def reconcile_events(transfers: Sequence[Mapping], inclusion: Inclusion, *, coll
     return True, f"{sum(got.values())} StakeTransferred event(s), one per transfer"
 
 
+def reconcile_burn(batch: Mapping, inclusion: Inclusion, *, collector_coldkey: str, collector_hotkey: str,
+                   netuid: int) -> tuple[bool, str]:
+    """Whether a burn's events hold one ``AlphaBurned`` of the collector's stake
+    on its hotkey and subnet, of at most the amount asked (the chain burns
+    what is there, at most). Its fields are (coldkey, hotkey, amount, netuid)."""
+    burned = [e for e in inclusion.events
+              if e.get("module") == "SubtensorModule" and e.get("event") == "AlphaBurned"]
+    if len(burned) != 1:
+        return False, f"{len(burned)} AlphaBurned event(s), one expected"
+    fields = _event_fields(burned[0], ("coldkey", "hotkey", "amount", "netuid"))
+    if fields is None:
+        return False, f"an AlphaBurned event could not be read: {burned[0].get('attributes')!r}"
+    coldkey, hotkey, amount, subnet = fields
+    if str(coldkey) != collector_coldkey or str(hotkey) != collector_hotkey:
+        return False, f"the AlphaBurned event is not the collector's: {fields!r}"
+    try:
+        amount, subnet = int(amount), int(subnet)
+    except (TypeError, ValueError):
+        return False, f"the AlphaBurned amount or subnet could not be read: {fields!r}"
+    asked = int(batch.get("burn_rao") or 0)
+    if subnet != int(netuid) or amount > asked:
+        return False, f"AlphaBurned {amount} rao on subnet {subnet}: not at most the {asked} asked on {netuid}"
+    return True, f"AlphaBurned {amount} rao of the {asked} asked"
+
+
+def burned_rao(batch: Mapping) -> int:
+    """What a final burn burned: its reconciled ``AlphaBurned`` amount, else 0
+    (a burn the chain's events do not show is never counted as burned)."""
+    if batch.get("state") != BATCH_FINALIZED:
+        return 0
+    for event in batch.get("events") or []:
+        if event.get("module") == "SubtensorModule" and event.get("event") == "AlphaBurned":
+            fields = _event_fields(event, ("coldkey", "hotkey", "amount", "netuid"))
+            try:
+                return int(fields[2]) if fields else 0
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
 def moved_stake(inclusion: Inclusion) -> bool:
     """Whether a batch's events show the collector's stake moving."""
     return any(e.get("module") == "SubtensorModule" and e.get("event") in ("StakeTransferred", "AlphaBurned")
@@ -839,12 +921,17 @@ def _settle(journal: Journal, batch: Mapping, state: str, inclusion: Inclusion |
             config: PayoutConfig) -> dict:
     """Write a resolution down; what the receipt says of it."""
     if state == BATCH_FINALIZED:
-        reconciled, why = reconcile_events(batch["transfers"], inclusion, collector_coldkey=config.collector_coldkey,
-                                           collector_hotkey=config.collector_hotkey, netuid=config.netuid)
+        if batch.get("kind") == KIND_BURN:
+            reconciled, why = reconcile_burn(batch, inclusion, collector_coldkey=config.collector_coldkey,
+                                             collector_hotkey=config.collector_hotkey, netuid=config.netuid)
+        else:
+            reconciled, why = reconcile_events(batch["transfers"], inclusion,
+                                               collector_coldkey=config.collector_coldkey,
+                                               collector_hotkey=config.collector_hotkey, netuid=config.netuid)
         detail = f"{detail}; {why}"
         if not reconciled:
             state = BATCH_MISMATCH
-            detail = f"{detail}: paid, not as planned; a person must check where the stake went"
+            detail = f"{detail}: landed, not as planned; a person must check where the stake went"
         journal.mark_paid(batch["batch_id"], inclusion, reconciled=reconciled, detail=detail)
     elif state in (BATCH_FAILED, BATCH_EXPIRED):
         journal.mark_released(batch["batch_id"], state, detail, inclusion)
@@ -856,7 +943,8 @@ def _settle(journal: Journal, batch: Mapping, state: str, inclusion: Inclusion |
 
 
 def _batch_receipt(batch: Mapping, state: str, inclusion: Inclusion | None, detail: str) -> dict:
-    return {"batch_id": batch["batch_id"], "state": state, "nonce": batch.get("nonce"),
+    return {"batch_id": batch["batch_id"], "kind": batch.get("kind") or KIND_TRANSFERS,
+            "burn_rao": batch.get("burn_rao"), "state": state, "nonce": batch.get("nonce"),
             "extrinsic_hash": batch.get("extrinsic_hash"), "era_block": batch.get("era_block"),
             "era_period": batch.get("era_period"),
             "block_number": None if inclusion is None else inclusion.block_number,
@@ -868,7 +956,8 @@ def _batch_receipt(batch: Mapping, state: str, inclusion: Inclusion | None, deta
 
 def _row_receipt(row: Mapping) -> dict:
     """A journal batch as a receipt lists it."""
-    return {"batch_id": row["batch_id"], "state": row["state"], "nonce": row.get("nonce"),
+    return {"batch_id": row["batch_id"], "kind": row.get("kind") or KIND_TRANSFERS, "burn_rao": row.get("burn_rao"),
+            "state": row["state"], "nonce": row.get("nonce"),
             "extrinsic_hash": row.get("extrinsic_hash"), "era_block": row.get("era_block"),
             "era_period": row.get("era_period"), "block_number": row.get("block_number"),
             "block_hash": row.get("block_hash"), "fee_tao_rao": row.get("fee_rao"), "events": row.get("events"),
@@ -934,12 +1023,12 @@ async def run_pass(obligations: Iterable[Obligation], *, journal: Journal, execu
 
 async def recover(journal: Journal, chain: PayoutChain, config: PayoutConfig, receipt: dict, *,
                   execute: bool) -> tuple[int, int]:
-    """Every batch whose fate is unknown, from the chain, before anything new
-    is sent; each listed in ``receipt["recovered"]``. A dry run settles them in
-    the journal's snapshot, so what it plans next is what an execution would.
-    Returns (pending, unreadable): batches still in their window (nothing new
-    may be sent) and batches the chain could not tell (nothing is settled or
-    sent)."""
+    """Every batch (transfers or burn) whose fate is unknown, from the chain,
+    before anything new is sent; each listed in ``receipt["recovered"]``. A
+    dry run settles them in the journal's snapshot, so what it plans next is
+    what an execution would. Returns (pending, unreadable): batches still in
+    their window (nothing new may be sent) and batches the chain could not
+    tell (nothing is settled or sent)."""
     pending = unreadable = 0
     for batch in journal.unresolved():
         state, inclusion, detail = await resolve_batch(batch, chain)
@@ -1220,18 +1309,27 @@ def _listed(obligations: Sequence[Obligation]) -> dict:
 
 
 def close_receipt(receipt: dict, stake_after: int | None = None) -> dict:
-    """Totals over every batch the receipt lists (each once), and the batches
-    it reports: those whose fate is known."""
+    """Totals over every batch the receipt lists, each once, of both kinds:
+    ``paid`` (transfers) and ``burned`` (burns, as their events show them);
+    the batches that landed not as planned; and the batches it reports (those
+    whose fate is known)."""
     listed: dict[str, dict] = {}
     for batch in receipt["unreported"] + receipt["recovered"] + receipt["batches"]:
         listed.setdefault(batch["batch_id"], batch)
-    paid = [b for b in listed.values() if b["state"] in PAID]
-    fee = sum(int(b.get("fee_tao_rao") or 0) for b in paid)
+    landed = [b for b in listed.values() if b["state"] in PAID]
+    paid = [b for b in landed if (b.get("kind") or KIND_TRANSFERS) == KIND_TRANSFERS]
+    burns = [b for b in landed if b.get("kind") == KIND_BURN]
+
+    def fees(batches) -> dict:
+        total = sum(int(b.get("fee_tao_rao") or 0) for b in batches)
+        return {"fee_tao_rao": total, "fee_tao": total / RAO_PER_ALPHA}
+
     receipt["paid"] = {"batches": len(paid), "transfers": sum(len(b["transfers"]) for b in paid),
-                       "rao": sum(int(t["amount_rao"]) for b in paid for t in b["transfers"]),
-                       "fee_tao_rao": fee, "fee_tao": fee / RAO_PER_ALPHA}
+                       "rao": sum(int(t["amount_rao"]) for b in paid for t in b["transfers"]), **fees(paid)}
     receipt["paid"]["alpha"] = receipt["paid"]["rao"] / RAO_PER_ALPHA
-    receipt["landed_not_as_planned"] = sorted(b["batch_id"] for b in paid if b["state"] == BATCH_MISMATCH)
+    receipt["burned"] = {"burns": len(burns), "rao": sum(burned_rao(b) for b in burns), **fees(burns)}
+    receipt["burned"]["alpha"] = receipt["burned"]["rao"] / RAO_PER_ALPHA
+    receipt["landed_not_as_planned"] = sorted(b["batch_id"] for b in landed if b["state"] == BATCH_MISMATCH)
     receipt["collector_stake_after_rao"] = stake_after
     receipt["reported_batch_ids"] = sorted(batch_id for batch_id, b in listed.items()
                                            if b["state"] not in (BATCH_PENDING, BATCH_UNREADABLE, *UNRESOLVED))
@@ -1242,10 +1340,10 @@ _close = close_receipt
 
 
 def incomplete_receipt(journal: Journal, *, config: PayoutConfig, pass_day: date, now: float, execute: bool,
-                       error: BaseException) -> dict:
+                       error: BaseException, schema: str = PAYOUT_RECEIPT_SCHEMA) -> dict:
     """What a pass that raised leaves: every batch the journal knows the fate
     of and no receipt lists yet, marked incomplete."""
-    receipt = {"schema": PAYOUT_RECEIPT_SCHEMA, "mode": MODE_EXECUTE if execute else MODE_DRY_RUN,
+    receipt = {"schema": schema, "mode": MODE_EXECUTE if execute else MODE_DRY_RUN,
                "pass_day": pass_day.isoformat(), "as_of": float(now), **config.to_dict(), "incomplete": True,
                "stopped": f"the pass raised {error!r}; the batches the journal settled are listed",
                "unreported": [_row_receipt(b) for b in journal.unreported()], "recovered": [], "batches": [],
@@ -1253,17 +1351,17 @@ def incomplete_receipt(journal: Journal, *, config: PayoutConfig, pass_day: date
     return _close(receipt)
 
 
-def write_receipt(receipt: Mapping, directory: str | Path) -> Path:
-    """The receipt as ``<directory>/payout-<pass day>-<mode>-<time>.json``,
+def write_receipt(receipt: Mapping, directory: str | Path, *, prefix: str = "payout") -> Path:
+    """The receipt as ``<directory>/<prefix>-<pass day>-<mode>-<time>.json``,
     never overwriting one."""
     folder = Path(directory)
     folder.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(float(receipt["as_of"])))
-    path = folder / f"payout-{receipt['pass_day']}-{receipt['mode']}-{stamp}.json"
+    path = folder / f"{prefix}-{receipt['pass_day']}-{receipt['mode']}-{stamp}.json"
     serial = 1
     while path.exists():
         serial += 1
-        path = folder / f"payout-{receipt['pass_day']}-{receipt['mode']}-{stamp}-{serial}.json"
+        path = folder / f"{prefix}-{receipt['pass_day']}-{receipt['mode']}-{stamp}-{serial}.json"
     path.write_text(json.dumps(receipt, indent=1, sort_keys=True, default=str) + "\n")
     return path
 
@@ -1283,6 +1381,8 @@ __all__ = [
     "ChainReadError",
     "Inclusion",
     "Journal",
+    "KIND_BURN",
+    "KIND_TRANSFERS",
     "MAX_ATTEMPTS",
     "MODE_DRY_RUN",
     "MODE_EXECUTE",
@@ -1298,6 +1398,7 @@ __all__ = [
     "Transfer",
     "alpha_worth",
     "batches_of",
+    "burned_rao",
     "check_collector",
     "check_journal",
     "close_receipt",
@@ -1307,6 +1408,7 @@ __all__ = [
     "incomplete_receipt",
     "plan_digest",
     "plan_transfers",
+    "reconcile_burn",
     "reconcile_events",
     "recover",
     "resolve_batch",
