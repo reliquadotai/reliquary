@@ -78,6 +78,21 @@ def _bucket_row(key: str, modified, prefix: str, parse_key) -> tuple[str, int, i
     return task, parsed[0], parsed[1], None if modified is None else float(modified.timestamp())
 
 
+def selected(task: str, work: int, entry: int, *, work_from: int, work_to: int | None = None,
+             entry_from: int | None = None, full_tasks: Iterable[str] = ()) -> bool:
+    """Whether to read an archive: every archive of a task in ``full_tasks`` (its
+    whole history: what is still owed never drops out of view); else one whose
+    work is in [work_from, work_to], or that entered from ``entry_from`` on (a
+    late part of older work, settled recently; ``entry_from`` defaults to
+    ``work_from``)."""
+    if task in set(full_tasks):
+        return True
+    if work >= work_from and (work_to is None or work <= work_to):
+        return True
+    entry_from = work_from if entry_from is None else entry_from
+    return work_to is None and entry >= entry_from
+
+
 class BucketArchives:
     """The period archives in the bucket, read-only."""
 
@@ -85,16 +100,17 @@ class BucketArchives:
         self._concurrency = concurrency
         self._client_kwargs = client_kwargs
 
-    async def refs(self, *, work_from: int, work_to: int | None = None,
-                   tasks: Iterable[str] | None = None) -> list[ArchiveRef]:
-        """The archives of work periods in [work_from, work_to] (all later ones
-        when ``work_to`` is None), of ``tasks`` or of every task."""
+    async def refs(self, *, work_from: int, work_to: int | None = None, tasks: Iterable[str] | None = None,
+                   entry_from: int | None = None, full_tasks: Iterable[str] = ()) -> list[ArchiveRef]:
+        """The archives ``selected`` keeps, of ``tasks`` or of every task."""
         from reliquary.infrastructure.corpus_period_store import read_period_archive
 
         wanted = None if tasks is None else {str(task) for task in tasks}
+        full = {str(task) for task in full_tasks}
         listed = [row for row in await list_bucket_archives(**self._client_kwargs)
-                  if row[1] >= work_from and (work_to is None or row[1] <= work_to)
-                  and (wanted is None or row[0] in wanted)]
+                  if (wanted is None or row[0] in wanted)
+                  and selected(row[0], row[1], row[2], work_from=work_from, work_to=work_to,
+                               entry_from=entry_from, full_tasks=full)]
         gate = asyncio.Semaphore(self._concurrency)
 
         async def one(task, work, entry, modified):
@@ -117,11 +133,12 @@ class DirectoryArchives:
     def __init__(self, root: str | os.PathLike) -> None:
         self._root = Path(root)
 
-    async def refs(self, *, work_from: int, work_to: int | None = None,
-                   tasks: Iterable[str] | None = None) -> list[ArchiveRef]:
+    async def refs(self, *, work_from: int, work_to: int | None = None, tasks: Iterable[str] | None = None,
+                   entry_from: int | None = None, full_tasks: Iterable[str] = ()) -> list[ArchiveRef]:
         from reliquary.infrastructure.corpus_period_store import parse_key
 
         wanted = None if tasks is None else {str(task) for task in tasks}
+        full = {str(task) for task in full_tasks}
         out = []
         for path in sorted(self._root.glob("*/*.json*")):
             task = path.parent.name
@@ -129,7 +146,8 @@ class DirectoryArchives:
             if parsed is None or (wanted is not None and task not in wanted):
                 continue
             work, entry = parsed
-            if work < work_from or (work_to is not None and work > work_to):
+            if not selected(task, work, entry, work_from=work_from, work_to=work_to, entry_from=entry_from,
+                            full_tasks=full):
                 continue
             raw = path.read_bytes()
             doc = json.loads(gzip.decompress(raw) if path.name.endswith(".gz") else raw)
@@ -396,4 +414,5 @@ __all__ = [
     "read_epoch_pays",
     "read_registry_ceilings",
     "registry_ceilings",
+    "selected",
 ]

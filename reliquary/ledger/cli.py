@@ -41,10 +41,22 @@ def _ledger() -> None:
 
 def _parse_clock(value: str) -> int:
     hours, _, minutes = value.partition(":")
-    seconds = int(hours) * 3600 + int(minutes or 0) * 60
+    try:
+        seconds = int(hours) * 3600 + int(minutes or 0) * 60
+    except ValueError as exc:
+        raise typer.BadParameter(f"not a time of day (HH:MM): {value!r}") from exc
     if not 0 <= seconds < 86_400:
         raise typer.BadParameter(f"not a time of day: {value!r}")
     return seconds
+
+
+def _parse_fallbacks(value: str) -> tuple[str, ...]:
+    from reliquary.ledger.obligations import FALLBACKS
+
+    found = tuple(part.strip() for part in (value or "").split(",") if part.strip())
+    if any(f not in FALLBACKS for f in found):
+        raise typer.BadParameter(f"--fallback takes a list of {', '.join(FALLBACKS)}, got {value!r}")
+    return found
 
 
 def _parse_budgets(values: list[str]) -> dict[str, int]:
@@ -55,7 +67,10 @@ def _parse_budgets(values: list[str]) -> dict[str, int]:
         task, sep, alpha = value.partition("=")
         if not sep or not task:
             raise typer.BadParameter(f"--order-budget takes TASK=ALPHA, got {value!r}")
-        amount = float(alpha)
+        try:
+            amount = float(alpha)
+        except ValueError as exc:
+            raise typer.BadParameter(f"--order-budget takes TASK=ALPHA, got {value!r}") from exc
         if not math.isfinite(amount) or amount < 0:
             raise typer.BadParameter(f"an order budget must be a finite alpha amount >= 0, got {alpha!r}")
         budgets[task] = math.floor(amount * RAO_PER_ALPHA)
@@ -85,6 +100,11 @@ def report_command(
                                                                       "public routes"),
     rate: str = typer.Option("frozen", "--rate", help="'frozen' (each order's ceiling), 'chain' (the miners' "
                                                       "alpha per period now), or a number of alpha per period"),
+    fallback: str = typer.Option("", "--fallback", help="with --rate frozen: what an archive whose price matches "
+                                                        "no ceiling may be valued at (latest,chain), each labelled; "
+                                                        "default none: it is unvalued"),
+    collector_hotkey: str = typer.Option(None, "--collector-hotkey", help="the collector's hotkey: not a miner, "
+                                                                          "left out of the reconciliation"),
     lag_days: int = typer.Option(2, "--lag-days", help="an obligation of work day D is due on the pass of D+lag"),
     pay_at: str = typer.Option("12:00", "--pay-at", help="time of the daily pass, UTC (HH:MM)"),
     hold_hours: float = typer.Option(0.0, "--hold-hours", help="least time from settlement to due"),
@@ -127,6 +147,7 @@ def report_command(
     report, ledger = asyncio.run(collect_report(
         now=now, pay_day=day, terms=terms, archives=archives, prices=prices, api=api or DEFAULT_API,
         pending=pending, rate=rate, fixed_rate=fixed, budgets=_parse_budgets(order_budget),
+        fallbacks=_parse_fallbacks(fallback), collector_hotkey=collector_hotkey,
         history_days=history_days, chain=chain, network=network, netuid=netuid, window_days=window_days,
         lag_epochs=lag_epochs, tolerance=tolerance, min_alpha=min_alpha, first_seen=first_seen))
     if out is not None:
@@ -143,7 +164,8 @@ async def collect_report(*, now: float, pay_day: date, terms, archives: str, pri
                          pending: bool, rate: str, fixed_rate: float | None, budgets: dict[str, int],
                          history_days: int, chain: bool, network: str, netuid: int, window_days: int,
                          lag_epochs: int | None, tolerance: float, min_alpha: float,
-                         first_seen: dict[str, float]):
+                         first_seen: dict[str, float], fallbacks: tuple[str, ...] = (),
+                         collector_hotkey: str | None = None):
     """Read every input (read-only) and assemble the report; returns (report, ledger)."""
     from reliquary.ledger import sources
     from reliquary.ledger.obligations import (
@@ -161,10 +183,13 @@ async def collect_report(*, now: float, pay_day: date, terms, archives: str, pri
 
     first_work = cp.period_of(day_start(pay_day - timedelta(days=history_days)))
     source = sources.BucketArchives() if archives == "r2" else sources.DirectoryArchives(archives)
-    refs = [ref for ref in await source.refs(work_from=first_work)
+    # Recent work, work settled recently (late parts of older work), and the whole history of any order
+    # with a budget: a budget bounds an order only over all of it.
+    refs = [ref for ref in await source.refs(work_from=first_work, full_tasks=budgets)
             if ref.settled_at is None or ref.settled_at <= now]
     used = {"archives": archives if archives == "r2" else "directory", "archives_read": len(refs),
-            "first_work_period": first_work, "prices": prices}
+            "first_work_period": first_work, "history_days": history_days, "prices": prices,
+            "full_history_tasks": sorted(budgets)}
 
     ceilings, pay_ceilings, floored = {}, {}, []
     pending_items, pricing = [], {}
@@ -202,7 +227,9 @@ async def collect_report(*, now: float, pay_day: date, terms, archives: str, pri
         elif rate == "chain":
             policy = RatePolicy(mode=RATE_CHAIN, alpha_per_period=chain_rate)
         else:
-            policy = RatePolicy(mode=RATE_FROZEN, alpha_per_period=chain_rate)
+            if "chain" in fallbacks and chain_rate is None:
+                raise typer.BadParameter("--fallback chain needs the chain (drop --no-chain)")
+            policy = RatePolicy(mode=RATE_FROZEN, alpha_per_period=chain_rate, fallbacks=fallbacks)
         ledger = build_ledger(refs, ceilings=ceilings, rates=policy, terms=terms, pay_ceilings=pay_ceilings,
                               order_budgets_rao=budgets)
         reconciliation = None
@@ -216,8 +243,9 @@ async def collect_report(*, now: float, pay_day: date, terms, archives: str, pri
             used["chain"] = {"network": network, "netuid": netuid, **meta}
             lag = lag_epochs if lag_epochs is not None else (
                 meta["commit_reveal_period"] if meta["commit_reveal"] else 0)
-            reconciliation = reconcile(ledger.obligations, epochs, start=start, end=end, lag_epochs=lag,
-                                       tolerance=tolerance, min_alpha=min_alpha, earliest_entry=first_work)
+            reconciliation = reconcile(ledger.shares, epochs, start=start, end=end, lag_epochs=lag,
+                                       tolerance=tolerance, min_alpha=min_alpha, earliest_entry=first_work,
+                                       exclude_hotkeys=[collector_hotkey] if collector_hotkey else [])
     finally:
         if subtensor is not None:
             from reliquary.infrastructure.chain import close_subtensor

@@ -32,12 +32,18 @@ def iso(t: float | None) -> str | None:
 
 def daily_report(ledger: Ledger, *, now: float, pay_day: date, terms: PayTerms, rates: RatePolicy,
                  pending: Iterable[PendingWork] = (), reconciliation: Mapping | None = None,
-                 sources: Mapping | None = None, floored_tasks: Sequence[str] = ()) -> dict:
+                 sources: Mapping | None = None, floored_tasks: Sequence[str] = (),
+                 collector_tasks: Iterable[str] = ()) -> dict:
     """The report of the pass of ``pay_day`` as seen at ``now``: before the pass
-    it is a preview (more may settle in time to join it)."""
+    it is a preview (more may settle in time to join it). The weights pay the
+    obligations of native-rail tasks; only those of ``collector_tasks`` are a
+    payer's to pay, and the pass says which is which."""
+    collector = {str(task) for task in collector_tasks}
     visible = ledger.visible_at(now)
     at = pay_instant(pay_day, terms)
     in_pass = [o for o in visible if o.due_at == at]
+    by_rail = {"native": [o for o in in_pass if o.task_id not in collector],
+               "collector": [o for o in in_pass if o.task_id in collector]}
     owed = by_hotkey(in_pass)
     by_order: dict[str, int] = defaultdict(int)
     for obligation in in_pass:
@@ -65,9 +71,14 @@ def daily_report(ledger: Ledger, *, now: float, pay_day: date, terms: PayTerms, 
             "late_obligations": len(late),
             "by_hotkey": [{"hotkey": hotkey, "rao": rao, "alpha": rao / RAO_PER_ALPHA}
                           for hotkey, rao in sorted(owed.items(), key=lambda kv: (-kv[1], kv[0]))],
-            "by_order": [{"task_id": task, "rao": rao, "alpha": rao / RAO_PER_ALPHA}
+            "by_order": [{"task_id": task, "rail": "collector" if task in collector else "native", "rao": rao,
+                          "alpha": rao / RAO_PER_ALPHA}
                          for task, rao in sorted(by_order.items(), key=lambda kv: (-kv[1], kv[0]))],
+            "by_rail": {rail: {"obligations": len(rows), "rao": sum(o.amount_rao for o in rows),
+                               "paid_by": "the weights" if rail == "native" else "the collector (a payer)"}
+                        for rail, rows in by_rail.items()},
         },
+        "rate_sources": dict(sorted(Counter(o.rate_source for o in visible).items())),
         "states": states,
         "pending_audit": {
             "items": [p.to_dict(now, terms) for p in pending],
@@ -95,6 +106,9 @@ def render_text(report: Mapping, *, top: int = 15) -> str:
     pay = report["pass"]
     head = "PREVIEW of the pass" if pay["preview"] else "Pass"
     lines.append(f"{head} of {pay['day']} at {pay['at_utc']} (ledger only: nothing is paid here)")
+    rails = pay["by_rail"]
+    lines.append(f"  native rail (paid by the weights): {rails['native']['obligations']} obligations; collector "
+                 f"rail (the payer's to pay): {rails['collector']['obligations']} obligations")
     lines.append(f"  {pay['obligations']} obligations, {pay['hotkeys']} hotkeys, {pay['alpha']:.9f} alpha "
                  f"({pay['rao']} rao); work days {', '.join(pay['work_days']) or '-'}; "
                  f"{pay['late_obligations']} late")
@@ -114,6 +128,8 @@ def render_text(report: Mapping, *, top: int = 15) -> str:
                      + (f" submissions {item['submissions_awaiting']}" if item["submissions_awaiting"] else "")
                      + (f" held {item['held']}" if item["held"] else "")
                      + (" ESCALATE" if item["escalate"] else ""))
+    if report["rate_sources"]:
+        lines.append("Valued at: " + ", ".join(f"{source} {count}" for source, count in report["rate_sources"].items()))
     if report["anomalies"]:
         kinds = Counter(a["kind"] for a in report["anomalies"])
         lines.append("Anomalies: " + ", ".join(f"{kind} {count}" for kind, count in sorted(kinds.items())))
@@ -124,16 +140,16 @@ def render_text(report: Mapping, *, top: int = 15) -> str:
                      f"lag {window['lag_epochs']} epoch(s)"
                      + (" (HISTORY TOO SHORT)" if window["history_too_short"] else ""))
         gap = totals["gap"]
-        lines.append(f"  scheduled {totals['scheduled_alpha']:.6f} alpha, on-chain {totals['onchain_alpha']:.6f} "
+        lines.append(f"  expected {totals['expected_alpha']:.6f} alpha, on-chain {totals['onchain_alpha']:.6f} "
                      f"alpha, gap {'-' if gap is None else f'{gap:+.3%}'}; on-chain unscheduled "
                      f"{totals['onchain_unscheduled_alpha']:.6f}; owner burned {totals['owner_burned_alpha']:.3f}")
         lines.append(f"  criterion |gap| <= {crit['tolerance']:.1%}: {crit['hotkeys_within']}/{crit['hotkeys_checked']} "
                      f"hotkeys within -> {'PASS' if crit['pass'] else 'FAIL'}")
-        lines.append("  lag fit (summed |gap| / scheduled): " + ", ".join(
+        lines.append("  lag fit (summed |gap| / expected): " + ", ".join(
             f"{lag}: {'-' if value is None else f'{value:.3%}'}" for lag, value in recon["lag_fit"].items()))
         for row in recon["hotkeys"][:top]:
             gap = row["gap"]
-            lines.append(f"    {row['hotkey']}  scheduled {row['scheduled_alpha']:.6f}  on-chain "
+            lines.append(f"    {row['hotkey']}  expected {row['expected_alpha']:.6f}  on-chain "
                          f"{row['onchain_alpha']:.6f}  gap {'-' if gap is None else f'{gap:+.3%}'}")
     return "\n".join(lines)
 

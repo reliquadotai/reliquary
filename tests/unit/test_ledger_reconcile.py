@@ -1,6 +1,7 @@
-"""Ledger obligations against what the chain paid: the schedule is the weight
-setter's own replay, so a chain that paid the weights exactly reconciles to
-the rao, and a hotkey paid 2 % off fails the 1 % criterion."""
+"""Settled shares against what the chain paid: the schedule is the weight
+setter's own replay, valued at each epoch's own miner emission, so a chain
+that paid the weights exactly reconciles whatever the orders' rates, and a
+hotkey paid 2 % off fails the 1 % criterion."""
 
 from __future__ import annotations
 
@@ -67,16 +68,16 @@ def _native_weights(refs, period):
                                            period_caps=WeightOnlyValidator._period_caps_by_task(declared))
 
 
-def _epochs(refs, *, lag, first_period, count, offset=700.0, skew=None):
-    """Epochs whose pay is exactly the weights replayed ``lag`` epochs earlier, times E."""
+def _epochs(refs, *, lag, first_period, count, offset=700.0, skew=None, pot=E):
+    """Epochs whose pay is exactly the weights replayed ``lag`` epochs earlier, times the epoch's pot."""
     out = []
     for k in range(count):
         at = cp.period_end(first_period + k - 1, GENESIS) + offset
         period = rc.weight_period(at, lag_epochs=lag)
-        pay = {hk: w * E for hk, w in _native_weights(refs, period).items()}
+        pay = {hk: w * pot for hk, w in _native_weights(refs, period).items()}
         if skew:
             pay = {hk: v * skew.get(hk, 1.0) for hk, v in pay.items()}
-        out.append(rc.EpochPay(block=1000 + 360 * k, at=at, pay=pay))
+        out.append(rc.EpochPay(block=1000 + 360 * k, at=at, pay=pay, pot=pot))
     return out
 
 
@@ -86,16 +87,16 @@ def test_the_ema_factor_is_the_weight_setters_replay():
         assert rc.ema_factor(age) == pytest.approx(replayed.get("h", 0.0), abs=1e-9)
 
 
-def test_the_schedule_is_the_weight_setters_replay_in_obligation_alpha():
+def test_the_schedule_is_the_weight_setters_replay():
     refs = _refs()
     ledger = ob.build_ledger(refs, ceilings=CEILINGS)
+    epoch = rc.EpochPay(block=1, at=0.0, pay={}, pot=1.0)
     for period in (FIRST + 2, FIRST + 10, FIRST + 29, FIRST + 40):
         native = _native_weights(refs, period)
-        scheduled = rc.scheduled_alpha(ledger.obligations, [period])
-        assert set(scheduled) == set(native)
+        expected = rc.expected_alpha(ledger.shares, [epoch], [period])
+        assert set(expected) == set(native)
         for hotkey, weight in native.items():
-            # Obligations are rounded down to the rao: at most a rao below the share x E.
-            assert scheduled[hotkey] == pytest.approx(weight * E, abs=1e-8)
+            assert expected[hotkey] == pytest.approx(weight, abs=1e-12)
 
 
 def test_a_chain_paying_the_weights_exactly_reconciles_and_passes():
@@ -103,7 +104,7 @@ def test_a_chain_paying_the_weights_exactly_reconciles_and_passes():
     ledger = ob.build_ledger(refs, ceilings=CEILINGS)
     epochs = _epochs(refs, lag=1, first_period=FIRST + 26, count=30)
     start, end = epochs[0].at, epochs[-1].at + 1
-    result = rc.reconcile(ledger.obligations, epochs, start=start, end=end, lag_epochs=1,
+    result = rc.reconcile(ledger.shares, epochs, start=start, end=end, lag_epochs=1,
                           earliest_entry=FIRST + 1)
     assert result["criterion"]["pass"] is True
     assert result["criterion"]["hotkeys_checked"] == 3
@@ -118,7 +119,7 @@ def test_a_hotkey_paid_two_percent_short_fails_the_criterion_alone():
     refs = _refs()
     ledger = ob.build_ledger(refs, ceilings=CEILINGS)
     epochs = _epochs(refs, lag=1, first_period=FIRST + 26, count=30, skew={"5B": 0.98})
-    result = rc.reconcile(ledger.obligations, epochs, start=epochs[0].at, end=epochs[-1].at + 1, lag_epochs=1)
+    result = rc.reconcile(ledger.shares, epochs, start=epochs[0].at, end=epochs[-1].at + 1, lag_epochs=1)
     rows = {row["hotkey"]: row for row in result["hotkeys"]}
     assert rows["5B"]["within"] is False and rows["5B"]["gap"] == pytest.approx(-0.02, abs=1e-6)
     assert rows["5A"]["within"] is True and rows["5C"]["within"] is True
@@ -129,7 +130,7 @@ def test_the_wrong_lag_shows_as_a_gap_and_the_fit_names_the_right_one():
     refs = _refs()
     ledger = ob.build_ledger(refs, ceilings=CEILINGS)
     epochs = _epochs(refs, lag=2, first_period=FIRST + 26, count=30)
-    wrong = rc.reconcile(ledger.obligations, epochs, start=epochs[0].at, end=epochs[-1].at + 1, lag_epochs=0)
+    wrong = rc.reconcile(ledger.shares, epochs, start=epochs[0].at, end=epochs[-1].at + 1, lag_epochs=0)
     assert wrong["criterion"]["pass"] is False
     fit = wrong["lag_fit"]
     assert min(fit, key=lambda lag: fit[lag]) == "2"
@@ -140,7 +141,7 @@ def test_pay_no_obligation_explains_is_counted_apart_and_hotkeys_below_the_floor
     ledger = ob.build_ledger(refs, ceilings=CEILINGS)
     epochs = _epochs(refs, lag=1, first_period=FIRST + 26, count=10)
     epochs[3] = rc.EpochPay(block=epochs[3].block, at=epochs[3].at, pay={**epochs[3].pay, "5Stranger": 0.5})
-    result = rc.reconcile(ledger.obligations, epochs, start=epochs[0].at, end=epochs[-1].at + 1, lag_epochs=1,
+    result = rc.reconcile(ledger.shares, epochs, start=epochs[0].at, end=epochs[-1].at + 1, lag_epochs=1,
                           min_alpha=10**6)
     assert result["totals"]["onchain_unscheduled_alpha"] == pytest.approx(0.5)
     stranger = next(row for row in result["hotkeys"] if row["hotkey"] == "5Stranger")
@@ -152,9 +153,33 @@ def test_a_window_reaching_past_the_history_read_says_so():
     refs = _refs()
     ledger = ob.build_ledger(refs, ceilings=CEILINGS)
     epochs = _epochs(refs, lag=1, first_period=FIRST + 5, count=5)
-    result = rc.reconcile(ledger.obligations, epochs, start=epochs[0].at, end=epochs[-1].at + 1, lag_epochs=1,
+    result = rc.reconcile(ledger.shares, epochs, start=epochs[0].at, end=epochs[-1].at + 1, lag_epochs=1,
                           earliest_entry=FIRST + 1)
     assert result["window"]["history_too_short"] is True and result["criterion"]["pass"] is False
+
+
+def test_an_emission_drift_from_the_orders_frozen_rate_is_not_a_gap():
+    refs = _refs()
+    ledger = ob.build_ledger(refs, ceilings=CEILINGS)
+    # The chain's pot is 2.4 % under the rate the order froze: what it paid still matches what it settled.
+    epochs = _epochs(refs, lag=1, first_period=FIRST + 26, count=30, pot=E * 0.976)
+    result = rc.reconcile(ledger.shares, epochs, start=epochs[0].at, end=epochs[-1].at + 1, lag_epochs=1)
+    assert result["criterion"]["pass"] is True
+
+
+def test_collector_rail_tasks_and_the_collector_are_left_out():
+    refs = _refs()
+    ledger = ob.build_ledger(refs, ceilings=CEILINGS)
+    epochs = _epochs(refs, lag=1, first_period=FIRST + 26, count=10)
+    epochs[0] = rc.EpochPay(block=epochs[0].block, at=epochs[0].at, pay={**epochs[0].pay, "5Collector": 3.0},
+                            pot=epochs[0].pot)
+    result = rc.reconcile(ledger.shares, epochs, start=epochs[0].at, end=epochs[-1].at + 1, lag_epochs=1,
+                          exclude_tasks=[TASK], exclude_hotkeys=["5Collector"])
+    # The task the weights do not pay is expected nothing; the collector is not a miner.
+    assert all(row["expected_alpha"] == 0 for row in result["hotkeys"])
+    assert "5Collector" not in {row["hotkey"] for row in result["hotkeys"]}
+    assert result["totals"]["excluded_hotkeys_alpha"] == {"5Collector": 3.0}
+    assert result["window"]["excluded_tasks"] == [TASK]
 
 
 def test_epochs_outside_the_window_are_left_out():

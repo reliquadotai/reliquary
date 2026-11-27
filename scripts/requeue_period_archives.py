@@ -48,6 +48,15 @@ def plan(listed: list[tuple[int, int]], due: int, *,
     return moves
 
 
+def moved_document(doc: dict, old: int, new: int) -> dict:
+    """The archive ``doc`` moved from entry ``old`` to ``new``: it names the one it
+    replaces, and keeps the entry it was first settled under
+    (``origin_entry_period``, through every move: the payout ledger keys its
+    obligation ids on it)."""
+    origin = doc.get("origin_entry_period", doc.get("replaces_entry_period", old))
+    return {**doc, "entry_period": new, "replaces_entry_period": old, "origin_entry_period": int(origin)}
+
+
 async def _stale(archives, task_id, listed) -> list[tuple[int, int]]:
     """Old archives left behind by an interrupted run: replaced, not deleted."""
     by_work: dict[int, list[int]] = {}
@@ -101,8 +110,7 @@ async def main() -> int:
         doc = await archives.read(args.task_id, work, old)
         if doc is None:
             raise RuntimeError(f"archive {work}-{old} vanished; run again")
-        await archives.write(args.task_id, work, new,
-                             {**doc, "entry_period": new, "replaces_entry_period": old})
+        await archives.write(args.task_id, work, new, moved_document(doc, old, new))
         await delete_period_archive(args.task_id, work, old)
         print(f"  moved {work}: {old} -> {new}")
     return 0
