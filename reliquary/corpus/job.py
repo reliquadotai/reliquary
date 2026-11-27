@@ -526,6 +526,8 @@ class JobSpec:
     # Its longest prompt, in tokens, when longer than a miner's default allowance (long context); None: the
     # default (``corpus_miner.PROMPT_ALLOWANCE_TOKENS``).
     max_prompt_tokens: int | None = None
+    # A live order requiring contract-aware lease admission; generic readers refuse it.
+    order_contract_version: int | None = None
 
     @property
     def prompt_end(self) -> int:
@@ -578,6 +580,7 @@ class JobSpec:
             ),
             "prompt_order": self.prompt_order,
             "deadline_round": self.deadline_round,
+            **({"order_contract_version": self.order_contract_version} if self.order_contract_version is not None else {}),
             **({"prompt_start": self.prompt_start} if self.prompt_start else {}),
             **({"seed": self.seed} if self.seed is not None else {}),
             **({"submit": self.submit} if self.submit is not None else {}),
@@ -1004,11 +1007,17 @@ def episode_contract(raw: Any, *, eval_job: bool) -> dict[str, Any]:
     return _parse_episode(raw, eval_job).to_contract()
 
 
-def parse_job(raw: Mapping[str, Any]) -> JobSpec:
+def parse_job(raw: Mapping[str, Any], *, allow_order_contract: bool = False) -> JobSpec:
     """Read one manifest, or refuse it naming exactly what is wrong."""
     if not isinstance(raw, Mapping):
         raise JobError("a job manifest must be an object")
     unknown = set(raw) - set(_JOB_FIELDS) - set(_OPTIONAL_JOB_FIELDS)
+    if "order_contract_version" in unknown:
+        if not allow_order_contract:
+            raise JobError("order_contract_version requires a contract-aware consumer")
+        if type(raw["order_contract_version"]) is not int or raw["order_contract_version"] != 1:
+            raise JobError("unsupported order_contract_version")
+        unknown.remove("order_contract_version")
     if unknown:
         raise JobError(f"unknown job fields: {sorted(unknown)}")
     missing = [f for f in _JOB_FIELDS if f not in raw]
@@ -1049,6 +1058,7 @@ def parse_job(raw: Mapping[str, Any]) -> JobSpec:
         renderer_id=_text(raw, "renderer_id"),
         eos_token_id=_non_negative_int(raw, "eos_token_id"),
         sampling=sampling,
+        order_contract_version=raw.get("order_contract_version"),
         slots_per_prompt=_positive_int(raw, "slots_per_prompt"),
         filter=_parse_filter(raw["filter"]),
         prompt_order=prompt_order,
@@ -1063,6 +1073,8 @@ def parse_job(raw: Mapping[str, Any]) -> JobSpec:
         episode=(_parse_episode(raw["episode"], is_eval_source(prompt_source))
                  if "episode" in raw else None),
     )
+    if job.order_contract_version is not None and (job.episode is not None or job.sampling.draw is None):
+        raise JobError("order_contract_version requires a single-turn forced-draw job")
     if job.episode is not None:
         _check_episode_job(job)
     if job.sampling.draw is not None:

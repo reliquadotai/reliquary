@@ -3019,6 +3019,46 @@ corpus_app = typer.Typer(name="corpus", help="Mine a corpus generation task")
 app.add_typer(corpus_app)
 
 
+@corpus_app.command("standing-offer")
+def corpus_standing_offer(
+    validator_url: str = typer.Option(..., help="Order control serving the market"),
+    market: str = typer.Option(..., help="Model market, for example MODEL|turn"),
+    micro_alpha_per_mtoken: int = typer.Option(..., min=0, max=10**15),
+    tokens_per_second: int = typer.Option(..., min=0, max=10**9),
+    slots: int = typer.Option(..., min=0, max=10_000),
+    sequence: int = typer.Option(..., min=0, help="Increase on each change. Retry the same offer with the same value."),
+    wallet_name: str = typer.Option(...),
+    hotkey: str = typer.Option(...),
+    wallet_path: str = typer.Option("", help="Optional wallet base path"),
+) -> None:
+    """Sign and send a private standing offer. Withdraw with zero slots and zero tokens per second."""
+    from urllib.parse import urlsplit
+
+    import httpx
+
+    from reliquary.protocol.corpus_submission import StandingOfferRequest
+    from reliquary.protocol.signatures import sign_corpus_lease
+
+    address = urlsplit(validator_url)
+    if not (address.scheme == "https" and address.hostname
+            or address.scheme == "http" and address.hostname in {"127.0.0.1", "::1", "localhost"}):
+        raise typer.BadParameter("Use an HTTPS order control or a local HTTP test server.")
+    if (slots == 0) != (tokens_per_second == 0):
+        raise typer.BadParameter("Withdrawal requires both zero slots and zero tokens per second.")
+    import bittensor as bt
+
+    wallet = bt.Wallet(name=wallet_name, hotkey=hotkey, **({"path": wallet_path} if wallet_path else {}))
+    body = StandingOfferRequest(market=market, miner_hotkey=wallet.hotkey.ss58_address,
+                                coldkey=wallet.coldkeypub.ss58_address, sequence=sequence,
+                                micro_alpha_per_mtoken=micro_alpha_per_mtoken,
+                                tokens_per_second=tokens_per_second, slots=slots, signature="unsigned")
+    body.signature = sign_corpus_lease(wallet, body)
+    response = httpx.put(validator_url.rstrip("/") + "/corpus/standing-offer",
+                         json=body.model_dump(), timeout=20)
+    response.raise_for_status()
+    typer.echo(response.text)
+
+
 def _served_orders(validator_url: str, *, strict: bool = False) -> list[dict] | None:
     """The orders a validator lists (``/corpus/jobs``, ``orders``), or None from one that does not. An
     unreadable list is None too, unless ``strict`` (the order loop retries it)."""

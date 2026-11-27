@@ -2578,6 +2578,15 @@ def wire_order_judge(w, *, records, job_store, remote, params, miner_states, bea
         # The stake guarantee past a parked record's give-up, and its late verdict paid within the cap.
         hold=lambda verdicts, period_of: w.auditor.settle_hold(verdicts, period_of),
         capped=lambda verdicts, period_of: w.auditor.settle_capped(verdicts, period_of))
+    if (getattr(entry, "params", None) or {}).get("order_contract", {}).get("mode") == "observation":
+        from reliquary.corpus.contract_observation import ContractObservation
+
+        try:
+            observation = ContractObservation.from_env()
+            if observation is not None:
+                w.settler.on_observed_archive = observation.recorder(entry)
+        except Exception:
+            logger.exception("could not attach the local archive observer to %s", entry.job_id)
     w.auditor = eval_auditor(
         job_id=job.job_id, records=records, tokenizer=w.tokenizer, proof=w.proof,
         params=params, miner_states=miner_states, beacon=beacon, round_at=round_at,
@@ -2605,7 +2614,8 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                        refresh_every_seconds: float = 60.0, qualification_store=None,
                        order_jobs=None, sandbox=None, sandbox_down: str | None = None,
                        model_dir_for=None, signed_wiring=None, suite_replayer_for=None,
-                       operator_of: Callable[[str], str | None] | None = None, order_judge=None):
+                       operator_of: Callable[[str], str | None] | None = None, order_judge=None,
+                       contract_observation=None, current_owners=None):
     """The app and the job set of the eval control. Each wired job gets its own
     tokenizer, renderer, router, auditor (an executor pair per batch) and
     settler; ``read_entries`` makes the set hot.
@@ -2826,6 +2836,12 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             routes.hold(str(job.job_id), lambda: why_held() is None, why=why_held)
         if (declared or {}).get("reuse_auditors_only") is True:
             dispatcher.reuse_only_jobs.add(job.job_id)
+        if contract_observation is not None and entry.params.get("order_contract"):
+            try:
+                owners = current_owners() if current_owners else None
+                await asyncio.to_thread(contract_observation.open, entry, owners)
+            except Exception:
+                logger.exception("could not observe opening of %s", job.job_id)
         served[job.job_id] = w
         return w
 
@@ -2912,7 +2928,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             return OTHER_MODEL, "not an order job"
         return None
 
-    def unwired(w) -> None:
+    async def unwired(w) -> None:
         """A drained job releases everything it held: its wiring, its pool view
         and listeners, its prompts, and its model's tokenizer once unused."""
         from reliquary.eval.prompt_source import (
@@ -2929,6 +2945,9 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         if not any((o.job.checkpoint_repo, o.job.checkpoint_revision) == key
                    for o in served.values()):
             tokenizers.pop(key, None)
+        if contract_observation is not None and w.entry.params.get("order_contract"):
+            await asyncio.to_thread(contract_observation.close, w.job.job_id, int(clock()),
+                                    job_set.finished.get(w.job.job_id, {}))
 
     async def guarded(w, coroutine):
         """One job's background work: a failure flags the job, never the process."""
@@ -2944,6 +2963,11 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
     routes = CorpusJobRoutes()
     app = FastAPI()
     app.include_router(build_corpus_jobs_router(routes, legacy=False))
+    if contract_observation is not None:
+        from reliquary.validator.standing_offers import standing_offers_router
+
+        app.include_router(standing_offers_router(contract_observation.book, contract_observation.markets,
+                                                 registration=registration, operator_of=operator_of, clock=clock))
     if sandbox is not None:
         routes.sandbox_hotkey = getattr(sandbox, "validator_hotkey", None)
         # Read by an open before any signed job is wired: a job about to be is `job_not_ready`, not unknown.
@@ -3238,6 +3262,13 @@ async def run_eval_control(*, netuid: int, http_host: str, http_port: int,
     order_judge = (OrderJudgeFront.from_env(
         dispatcher=dispatcher, coldkeys=registered.coldkeys if registered is not None else None)
         if order_judge_enabled() else None)
+    from reliquary.corpus.contract_observation import ContractObservation
+
+    try:
+        contract_observation = ContractObservation.from_env()
+    except Exception:
+        logger.exception("local contract observation is unavailable")
+        contract_observation = None
     app, job_set = build_eval_control(
         # Every order's auditors and the miners' intake share these connections (`ORDER_POOL_CONNECTIONS`).
         store=BucketJobStore(), records=BucketRecordStore(max_pool_connections=ORDER_POOL_CONNECTIONS),
@@ -3248,7 +3279,8 @@ async def run_eval_control(*, netuid: int, http_host: str, http_port: int,
         operator_of=registered.coldkey if registered is not None else None,
         settle_archives=archives, read_entries=read_entries,
         refresh_every_seconds=refresh_every_seconds or 60.0, sandbox=sandbox, sandbox_down=sandbox_down,
-        order_judge=order_judge)
+        order_judge=order_judge, contract_observation=contract_observation,
+        current_owners=registered.fresh_coldkeys if registered is not None else None)
 
     async def refresh_qualifications():
         while True:

@@ -276,7 +276,8 @@ def test_the_routing_document_names_both_prefixes():
     assert "^/corpus/jobs/order-(eval|gen)-" in text and "^/corpus/internal/eval-audit/" in text
 
 
-def test_a_drained_eval_job_is_unwired_and_releases_what_it_held(world, monkeypatch):
+@pytest.mark.parametrize("observe", [False, True])
+def test_a_drained_eval_job_is_unwired_and_releases_what_it_held(world, monkeypatch, observe):
     from dataclasses import replace
 
     from reliquary.infrastructure.corpus_job_store import BucketJobStore
@@ -288,7 +289,20 @@ def test_a_drained_eval_job_is_unwired_and_releases_what_it_held(world, monkeypa
         build_eval_control,
     )
 
-    registry, _ = world
+    registry, directory_path = world
+    observation = None
+    if observe:
+        from reliquary.corpus.contract_observation import ContractObservation
+
+        market = "customer/A|turn"
+        observation = ContractObservation(directory_path / "offers.db", [market])
+        observation.book.post_offer(market, "first", "owner", price_micro=3000, rate=2, slots=1, at=100)
+        entry = registry["entries"]["order-eval-a"]
+        settings = {"version": 1, "mode": "observation", "market": market, "opened_at": 101,
+                    "duration_s": 600, "target_rate": 2, "max_tokens": 1000, "budget_rao": 3000,
+                    "ceiling_micro": 3000, "new_rate_cap": 2, "audit_cost_micro": 0,
+                    "q_min": 0.01, "trust_tokens": 100, "evaluation": True}
+        registry["entries"]["order-eval-a"] = replace(entry, params={**entry.params, "order_contract": settings})
 
     async def idle(self):
         await asyncio.sleep(3600)
@@ -315,9 +329,13 @@ def test_a_drained_eval_job_is_unwired_and_releases_what_it_held(world, monkeypa
             store=BucketJobStore(), records=BucketRecordStore(), dispatcher=dispatcher,
             directory=EvalExecutorDirectory(list_documents=lambda: asyncio.sleep(0, [])),
             verify_signature=lambda request: True,
-            tokenizer_for=lambda repo, revision: (_Tokenizer(), 100), read_entries=read_entries)
+            tokenizer_for=lambda repo, revision: (_Tokenizer(), 100), read_entries=read_entries,
+            contract_observation=observation, current_owners=lambda: {"first": "owner"})
         await job_set.refresh()
         assert sorted(app.state.eval_served) == ["order-eval-a", "order-eval-b"]
+        if observe:
+            assert observation.book.contract("order-eval-a", "first")["price_micro"] == 3000
+            assert observation.book.order("order-eval-b") is None
         listeners = len(dispatcher._listeners)
         assert listeners == 2
         for job_id in ("order-eval-a", "order-eval-b"):
@@ -326,6 +344,8 @@ def test_a_drained_eval_job_is_unwired_and_releases_what_it_held(world, monkeypa
         await job_set.refresh()
         await job_set.refresh()
         assert job_set.served == {}
+        if observe:
+            assert observation.book.summary("order-eval-a")["min_micro"] == 3000
         assert app.state.eval_served == {} and app.state.eval_tokenizers == {}
         assert dispatcher._listeners == [] and ps._loaded == {}
         for tasks in job_set._tasks.values():

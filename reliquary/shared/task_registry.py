@@ -336,6 +336,19 @@ def validate_entry(entry: TaskEntry) -> None:
             raise RegistryError(f"{TAIL_CAP_PARAM} must be between 0.0 and 1.0, got {tail}")
     _validate_token_price(entry)
     _validate_pricing(entry)
+    if "order_contract" in entry.params:
+        from reliquary.corpus.contract_spec import PILOT_UNAVAILABLE, validate_spec
+
+        marker = entry.params["order_contract"]
+        try:
+            validate_spec(marker)
+        except (ValueError, TypeError) as exc:
+            raise RegistryError(f"task {entry.task_id!r}: {exc}") from exc
+        if (entry.mechanism != MECHANISM_CORPUS_GENERATION or not entry.job_id
+                or entry.params.get("settlement") != SETTLEMENT_PERIOD_EMA):
+            raise RegistryError("order_contract requires a corpus task settled by period")
+        if marker["mode"] == "pilot":
+            raise RegistryError(PILOT_UNAVAILABLE)
     _validate_rl_start_pool(entry, cap)
     floor = _number(entry.params["floor"], "floor")
     if floor > cap:
@@ -431,6 +444,15 @@ def add_task(
     entries: Mapping[str, TaskEntry], entry: TaskEntry
 ) -> dict[str, TaskEntry]:
     validate_entry(entry)
+    if "order_contract" in entry.params:
+        from reliquary.corpus.contract_spec import period_envelope
+
+        if entry.params.get("pricing") != "auction":
+            raise RegistryError("a new order_contract requires auction pricing")
+        budget, ceiling = period_envelope(entry.params)
+        marker = entry.params["order_contract"]
+        if marker["budget_rao"] > budget or marker["ceiling_micro"] > ceiling:
+            raise RegistryError("order_contract exceeds its opening cap or price")
     if entry.task_id in entries:
         raise RegistryError(f"task {entry.task_id!r} already exists")
     merged = {**entries, entry.task_id: entry}

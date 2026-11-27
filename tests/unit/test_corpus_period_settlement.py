@@ -69,6 +69,25 @@ def settler(records, archives, now, oldest=None, cap=0.1):
                                genesis=lambda: GENESIS, clock=lambda: now)
 
 
+def test_observation_sees_committed_archive_even_if_its_local_write_fails():
+    records, archives = Records(), Archives()
+    records.verdicts["one"] = verdict("one", "miner", 12, at(1))
+    run = settler(records, archives, at(4))
+    seen = []
+
+    def failed_disk(archive, ids, batch):
+        assert list(archives.docs.values()) == [archive]
+        assert records.state["settled"] == ["one"]
+        seen.append((ids, batch[0]["token_count"]))
+        raise OSError("local observation unavailable")
+
+    run.on_observed_archive = failed_disk
+    assert asyncio.run(run.settle_once()) == 1
+    assert seen == [(["one"], 12)]
+    assert asyncio.run(run.settle_once()) is None
+    assert len(archives.docs) == 1
+
+
 def test_each_closed_period_is_paid_its_own_cap_by_its_own_tokens():
     records, archives = Records(), Archives()
     records.verdicts = {

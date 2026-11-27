@@ -95,6 +95,11 @@ class RegisteredHotkeys:
         """Every hotkey's coldkey, as the last snapshot read them."""
         return dict(self._coldkeys)
 
+    def fresh_coldkeys(self) -> dict[str, str] | None:
+        if self._refreshed_at is None or self._clock() - self._refreshed_at > self._ttl:
+            return None
+        return self.coldkeys()
+
     async def refresh_forever(self) -> None:
         while True:
             ok = await self.refresh()

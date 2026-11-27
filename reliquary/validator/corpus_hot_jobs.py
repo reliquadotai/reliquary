@@ -11,6 +11,7 @@ an entry is logged once, never once per refresh.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import collections
 import logging
 import time
@@ -526,7 +527,9 @@ class CorpusJobSet:
         self._status_locks.pop(job_id, None)
         if self._on_unwired is not None:
             try:
-                self._on_unwired(wiring)
+                result = self._on_unwired(wiring)
+                if inspect.isawaitable(result):
+                    await result
             except Exception:
                 logger.exception("corpus job %s: releasing its wiring failed", job_id)
         logger.info("corpus job %s drained and unwired", job_id)

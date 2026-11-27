@@ -343,6 +343,21 @@ class CorpusAskRequest(BaseModel):
     swap: bool | None = None
 
 
+class StandingOfferRequest(BaseModel):
+    """A private offer for future orders on one market. Zero slots and rate withdraw it."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    market: str = Field(min_length=1, max_length=256, pattern=r"^[A-Za-z0-9_./|-]+$")
+    miner_hotkey: str = Field(min_length=1, max_length=64)
+    coldkey: str = Field(min_length=1, max_length=64)
+    sequence: int = Field(ge=0, le=2**63 - 1)
+    micro_alpha_per_mtoken: int = Field(ge=0, le=10**15)
+    tokens_per_second: int = Field(ge=0, le=10**9)
+    slots: int = Field(ge=0, le=10_000)
+    signature: str = Field(min_length=1, max_length=256)
+
+
 class CorpusAskResponse(BaseModel):
     """``accepted`` with the job's auction view in ``detail``; else ``reason``."""
 
