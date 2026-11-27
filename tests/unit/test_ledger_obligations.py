@@ -49,29 +49,30 @@ def _ledger(refs, **kwargs):
 # -- identity -----------------------------------------------------------------------------------------------------
 
 
-def test_the_id_is_a_hash_of_order_period_hotkey_and_unit_type():
-    first = ob.obligation_id(TASK, WORK, "5Hot", ob.UNIT_OUTPUT_TOKENS)
-    assert first == ob.obligation_id(TASK, WORK, "5Hot", ob.UNIT_OUTPUT_TOKENS)
+def test_the_id_is_a_hash_of_order_period_hotkey_unit_type_and_origin_entry():
+    first = ob.obligation_id(TASK, WORK, "5Hot", ob.UNIT_OUTPUT_TOKENS, WORK + 1)
+    assert first == ob.obligation_id(TASK, WORK, "5Hot", ob.UNIT_OUTPUT_TOKENS, WORK + 1)
     assert len(first) == 64 and int(first, 16) >= 0
-    others = {ob.obligation_id("order-other", WORK, "5Hot", ob.UNIT_OUTPUT_TOKENS),
-              ob.obligation_id(TASK, WORK + 1, "5Hot", ob.UNIT_OUTPUT_TOKENS),
-              ob.obligation_id(TASK, WORK, "5Other", ob.UNIT_OUTPUT_TOKENS),
-              ob.obligation_id(TASK, WORK, "5Hot", ob.UNIT_OUTPUT_AND_PROMPT_TOKENS),
-              ob.obligation_id(TASK, WORK, "5Hot", ob.UNIT_OUTPUT_TOKENS, part=1)}
+    others = {ob.obligation_id("order-other", WORK, "5Hot", ob.UNIT_OUTPUT_TOKENS, WORK + 1),
+              ob.obligation_id(TASK, WORK + 1, "5Hot", ob.UNIT_OUTPUT_TOKENS, WORK + 1),
+              ob.obligation_id(TASK, WORK, "5Other", ob.UNIT_OUTPUT_TOKENS, WORK + 1),
+              ob.obligation_id(TASK, WORK, "5Hot", ob.UNIT_OUTPUT_AND_PROMPT_TOKENS, WORK + 1),
+              ob.obligation_id(TASK, WORK, "5Hot", ob.UNIT_OUTPUT_TOKENS, WORK + 3)}
     assert first not in others and len(others) == 5
 
 
 def test_the_id_is_pinned():
     # A payer pays each id once: changing how ids are made would pay the same work again.
-    assert ob.obligation_id("order-gen-x", 23817, "5Abc", ob.UNIT_OUTPUT_TOKENS) == (
-        "a17a004607ef38c847b7db072293c5dca1403f612d0cf7ac140bccd83c609a04")
+    assert ob.obligation_id("order-gen-x", 23817, "5Abc", ob.UNIT_OUTPUT_TOKENS, 23818) == (
+        "809d92c9e4791bf5938beb2993441d70ed6fb78ef4b4c68b47a371e90236ccfc")
 
 
-def test_an_unknown_unit_type_or_part_is_refused():
+def test_an_unknown_unit_type_or_origin_is_refused():
     with pytest.raises(ValueError):
-        ob.obligation_id(TASK, WORK, "5Hot", "tokens")
-    with pytest.raises(ValueError):
-        ob.obligation_id(TASK, WORK, "5Hot", ob.UNIT_OUTPUT_TOKENS, part=-1)
+        ob.obligation_id(TASK, WORK, "5Hot", "tokens", WORK + 1)
+    for bad in (-1, True, 1.5):
+        with pytest.raises(ValueError):
+            ob.obligation_id(TASK, WORK, "5Hot", ob.UNIT_OUTPUT_TOKENS, bad)
 
 
 def test_the_ledger_is_idempotent():
@@ -185,6 +186,37 @@ def test_a_late_part_of_a_period_gets_only_what_its_budget_has_left():
     assert late_ids.isdisjoint({o.obligation_id for o in ledger.obligations if o.part == 0})
 
 
+def test_an_order_budget_is_spent_in_settlement_order_so_later_parts_never_reclaim_it():
+    share = 0.0025                     # 0.369 alpha at E
+    budget = math.floor(Fraction(share) * Fraction(E) * 10**9 * 5 / 2)     # two and a half periods
+    refs = [_ref(_doc({"5A": share}), work=WORK + i, entry=WORK + i + 1,
+                 settled_at=cp.period_end(WORK + i) + 600) for i in range(4)]
+    first = _ledger(refs, order_budgets_rao={TASK: budget})
+    paid = {o.work_period: o.amount_rao for o in first.obligations}
+    assert sum(paid.values()) <= budget and set(paid) == {WORK, WORK + 1, WORK + 2}
+    # A late part of the first period settles after all of them: it takes nothing from what was allocated.
+    late = _ref(_doc({"5B": share}, budget=1.0), work=WORK, entry=WORK + 9, settled_at=cp.period_end(WORK + 8))
+    again = _ledger(refs + [late], order_budgets_rao={TASK: budget})
+    assert {o.work_period: o.amount_rao for o in again.obligations if o.hotkey == "5A"} == paid
+    assert not [o for o in again.obligations if o.hotkey == "5B"]
+    assert {a["kind"] for a in again.anomalies} >= {"order_budget_spent"}
+
+
+def test_a_late_part_zeroed_by_the_spent_period_budget_says_so():
+    first = _ref(_doc({"5A": 0.05}, cap=0.05, price=None), entry=WORK + 1)
+    late = _ref(_doc({"5B": 0.01}, cap=0.05, price=None), entry=WORK + 3)
+    ledger = _ledger([first, late], rates=ob.RatePolicy(mode=ob.RATE_FIXED, alpha_per_period=E))
+    assert [o.hotkey for o in ledger.obligations] == ["5A"]
+    kinds = [a["kind"] for a in ledger.anomalies]
+    assert "period_budget_spent" in kinds and "under_one_rao" not in kinds
+
+
+def test_the_earn_instant_is_the_end_of_the_work_period_whatever_the_settlement_time():
+    for settled in (cp.period_end(WORK) + 60, cp.period_end(WORK) + 9 * 86_400):
+        (obligation,) = _ledger([_ref(_doc({"5A": 0.01}), settled_at=settled)]).obligations
+        assert obligation.earn_at == cp.period_end(WORK) and obligation.earned_at == settled
+
+
 def test_an_order_budget_stops_the_order_once_spent_period_by_period():
     budget_rao = ob.amount_rao(0.025, E)
     refs = [_ref(_doc({"5A": 0.01, "5B": 0.01}), work=WORK + i, entry=WORK + i + 1) for i in range(3)]
@@ -229,20 +261,39 @@ def test_units_are_known_only_where_the_archive_splits_by_tokens():
     assert _ledger([_ref(_doc({"5A": 0.02}))], ceilings={TASK: [unknown]}).obligations[0].units is None
 
 
-def test_the_rate_is_the_ceiling_the_archive_was_paid_under():
+def test_the_rate_is_the_ceiling_the_archive_was_paid_under_and_nothing_else_by_default():
     older = ob.Ceiling(miner_alpha_per_period=140.0, max_price_pool_share_per_token=PRICE / 2, set_at=1.0)
     newer = ob.Ceiling(miner_alpha_per_period=150.0, max_price_pool_share_per_token=PRICE, set_at=2.0)
     assert ob.resolve_rate(_doc({}, price=PRICE / 2), [older, newer], ob.RatePolicy()) == (140.0, ob.RATE_FROZEN)
     assert ob.resolve_rate(_doc({}, price=PRICE), [older, newer], ob.RatePolicy()) == (150.0, ob.RATE_FROZEN)
-    # A price no known ceiling had: the order's latest ceiling, said so.
-    assert ob.resolve_rate(_doc({}, price=PRICE * 3), [older, newer], ob.RatePolicy()) == (
+    # A price no known ceiling had: unvalued, unless the order's latest ceiling is opted into, and then said so.
+    assert ob.resolve_rate(_doc({}, price=PRICE * 3), [older, newer], ob.RatePolicy()) == (None, "unvalued")
+    assert ob.resolve_rate(_doc({}, price=PRICE * 3), [older, newer], ob.RatePolicy(fallbacks=("latest",))) == (
         150.0, ob.RATE_FROZEN_LATEST)
 
 
-def test_without_a_ceiling_the_chain_rate_is_used_and_said_so_or_nothing_is_valued():
+def test_a_re_priced_order_leaves_its_earlier_archives_unvalued_not_revalued():
+    repriced = ob.Ceiling(miner_alpha_per_period=4.8, max_price_pool_share_per_token=PRICE * 7)
+    strict = ob.build_ledger([_ref(_doc({"5A": 0.01}))], ceilings={TASK: [repriced]})
+    assert strict.obligations == () and [a["kind"] for a in strict.anomalies] == ["unvalued"]
+    # Its shares still count for the reconciliation, which needs no rate.
+    assert strict.shares == ((TASK, WORK + 1, "5A", 0.01),)
+    labelled = ob.build_ledger([_ref(_doc({"5A": 0.01}))], ceilings={TASK: [repriced]},
+                               rates=ob.RatePolicy(fallbacks=("latest",)))
+    assert labelled.obligations[0].rate_source == ob.RATE_FROZEN_LATEST
+    assert [a["kind"] for a in labelled.anomalies] == ["valued_by_fallback"]
+
+
+def test_without_a_ceiling_nothing_is_valued_unless_the_chain_rate_is_opted_into():
     rl = {"schema": ob.RL_ARCHIVE_SCHEMA, "mechanism": "rl-async", "rewards_by_hotkey": {"5A": 0.01},
           "cap": 0.1}
-    assert ob.resolve_rate(rl, [CEILING], ob.RatePolicy(alpha_per_period=147.0)) == (147.0, ob.RATE_CHAIN)
+    assert ob.resolve_rate(rl, [CEILING], ob.RatePolicy(alpha_per_period=147.0)) == (None, "unvalued")
+    assert ob.resolve_rate(rl, [CEILING], ob.RatePolicy(alpha_per_period=147.0, fallbacks=("chain",))) == (
+        147.0, ob.RATE_CHAIN)
+    with pytest.raises(ValueError):
+        ob.RatePolicy(fallbacks=("chain",))
+    with pytest.raises(ValueError):
+        ob.RatePolicy(fallbacks=("whatever",))
     ledger = ob.build_ledger([_ref(rl)], ceilings={})
     assert ledger.obligations == () and ledger.anomalies[0]["kind"] == "unvalued"
 
@@ -255,6 +306,24 @@ def test_the_chain_and_fixed_modes_need_a_rate():
 
 
 # -- parts: late verdicts and requeued archives -----------------------------------------------------------------------
+
+
+def test_an_earlier_part_absent_leaves_a_late_parts_ids_unchanged():
+    first = _ref(_doc({"5A": 0.03}, budget=0.03))
+    late = _ref(_doc({"5A": 0.01, "5B": 0.01}, budget=0.04), entry=WORK + 3)
+    both = {o.obligation_id for o in _ledger([first, late]).obligations if o.entry_period == WORK + 3}
+    alone = {o.obligation_id for o in _ledger([late]).obligations}
+    # The late part's ids never collide with part 0's, present or not: nothing is paid twice or skipped.
+    assert both == alone
+    assert alone.isdisjoint({o.obligation_id for o in _ledger([first]).obligations})
+
+
+def test_an_archive_requeued_twice_keeps_its_first_origin():
+    original = _ledger([_ref(_doc({"5A": 0.01}), entry=WORK + 9)])
+    twice = _ledger([_ref(_doc({"5A": 0.01}, replaces_entry_period=WORK + 5, origin_entry_period=WORK + 9),
+                          entry=WORK + 2)])
+    assert [o.obligation_id for o in twice.obligations] == [o.obligation_id for o in original.obligations]
+    assert twice.obligations[0].origin_entry == WORK + 9
 
 
 def test_a_requeued_archive_replaces_the_one_it_names_and_keeps_its_ids():
