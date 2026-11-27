@@ -4,9 +4,9 @@ Immutable values that all network participants must agree on.
 No os.getenv() overrides. Changes require coordinated deployment.
 """
 
+import hashlib as _hashlib
 import math as _math
 import os as _os
-import re as _re
 
 from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE
 from reliquary.environment.grader import (
@@ -729,34 +729,83 @@ if UID_BURN is not None and UID_BURN < 0:
 # the same metagraph snapshot as the owner's. With no UID there, the owner's
 # own hotkey, or one held by the subnet owner's coldkey (the chain keeps an
 # owner hotkey's incentive), its part burns: never a guessed UID.
-# PAYOUT_FRACTION (0 to 1) is the part of the unpaid share it receives; the
-# rest burns.
 #
-# Code, not environment: every validator with a permit must route alike, or
-# Yuma consensus clips the collector's weight. A release reaches every
-# validator running the image (watchtower, about 5 minutes); an environment
-# variable reaches only those whose operators set it. A tier (1 %, 10 %, 50 %,
-# 100 %) is a release that changes these two lines. None and 0, the defaults:
-# the unpaid share burns whole, as it always did.
+# PAYOUT_TIERS is the part of the unpaid share it receives, by chain block:
+# ((activation block, fraction), ...), blocks strictly increasing. The weights
+# set for an epoch route the fraction of the last tier whose activation block
+# is at or before the block that epoch ends at (its epoch id, the same for
+# every submission in it); before the first tier, none. The rest burns.
+#
+# Code only, never the environment: every validator with a permit must route
+# alike, or Yuma consensus clips the collector's weight. A tier is a release
+# that appends one (block, fraction) at least two tempos ahead, so every
+# validator holds it, the trainer restarted by hand included, before it takes
+# effect; they then all switch in the same epoch, whenever each restarted
+# (docs/runbooks/collector-payouts.md). None and (), the defaults: the unpaid
+# share burns whole, as it always did.
 PAYOUT_HOTKEY: str | None = None
-PAYOUT_FRACTION: float = 0.0
+PAYOUT_TIERS: tuple[tuple[int, float], ...] = ()
+
+_BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+_SS58_PREFIX = 42
 
 
-def payout_settings(hotkey: str | None, fraction: float) -> tuple[str | None, float]:
-    """``(PAYOUT_HOTKEY, PAYOUT_FRACTION)`` checked: a hotkey is None or an
-    SS58 address, a fraction a number in [0, 1], and above 0 only with a
-    hotkey. Anything else refuses to import."""
-    if hotkey is not None and (not isinstance(hotkey, str)
-                               or not _re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{46,48}", hotkey)):
-        raise ValueError(f"PAYOUT_HOTKEY={hotkey!r} is not an SS58 address")
-    if isinstance(fraction, bool) or not isinstance(fraction, (int, float)) or not 0.0 <= fraction <= 1.0:
-        raise ValueError(f"PAYOUT_FRACTION must be a number in [0.0, 1.0], got {fraction!r}")  # NaN fails too
-    if fraction > 0.0 and hotkey is None:
-        raise ValueError("PAYOUT_FRACTION is above 0 but PAYOUT_HOTKEY is None")
-    return hotkey, float(fraction)
+def is_ss58_account(address) -> bool:
+    """Whether ``address`` is an SS58 address (generic prefix 42) of a 32-byte
+    account with a valid checksum: base58, then blake2b-512 of ``SS58PRE`` and
+    the payload, whose first two bytes end the address."""
+    if not isinstance(address, str) or not address or any(c not in _BASE58 for c in address):
+        return False
+    number = 0
+    for c in address:
+        number = number * 58 + _BASE58.index(c)
+    raw = number.to_bytes((number.bit_length() + 7) // 8, "big")
+    raw = b"\0" * (len(address) - len(address.lstrip("1"))) + raw
+    if len(raw) != 35 or raw[0] != _SS58_PREFIX:
+        return False
+    return raw[33:] == _hashlib.blake2b(b"SS58PRE" + raw[:33], digest_size=64).digest()[:2]
 
 
-PAYOUT_HOTKEY, PAYOUT_FRACTION = payout_settings(PAYOUT_HOTKEY, PAYOUT_FRACTION)
+def payout_settings(hotkey: str | None, tiers) -> tuple[str | None, tuple[tuple[int, float], ...]]:
+    """``(PAYOUT_HOTKEY, PAYOUT_TIERS)`` checked: a hotkey is None or an SS58
+    account with a valid checksum; tiers are (block, fraction) pairs, blocks
+    whole, at least 0 and strictly increasing, fractions numbers in [0, 1], and
+    any fraction above 0 only with a hotkey. Anything else refuses to import."""
+    if hotkey is not None and not is_ss58_account(hotkey):
+        raise ValueError(f"PAYOUT_HOTKEY={hotkey!r} is not an SS58 address with a valid checksum")
+    if not isinstance(tiers, tuple):
+        raise ValueError(f"PAYOUT_TIERS must be a tuple of (block, fraction), got {tiers!r}")
+    checked: list[tuple[int, float]] = []
+    for tier in tiers:
+        if not isinstance(tier, tuple) or len(tier) != 2:
+            raise ValueError(f"a payout tier is (activation block, fraction), got {tier!r}")
+        block, fraction = tier
+        if isinstance(block, bool) or not isinstance(block, int) or block < 0:
+            raise ValueError(f"a payout tier's activation block must be a whole number >= 0, got {block!r}")
+        if isinstance(fraction, bool) or not isinstance(fraction, (int, float)) or not 0.0 <= fraction <= 1.0:
+            raise ValueError(f"a payout tier's fraction must be a number in [0.0, 1.0], got {fraction!r}")  # NaN too
+        if checked and block <= checked[-1][0]:
+            raise ValueError(f"payout tiers' activation blocks must increase, got {block} after {checked[-1][0]}")
+        if fraction > 0.0 and hotkey is None:
+            raise ValueError("a payout tier routes a fraction above 0 but PAYOUT_HOTKEY is None")
+        checked.append((block, float(fraction)))
+    return hotkey, tuple(checked)
+
+
+def payout_fraction(tiers, epoch_block: int | None) -> float:
+    """The collector's fraction for the weights set for the epoch that ends at
+    ``epoch_block``: the last tier at or before it; 0 before the first tier or
+    with no block."""
+    if epoch_block is None:
+        return 0.0
+    fraction = 0.0
+    for block, tier_fraction in tiers:
+        if block <= int(epoch_block):
+            fraction = tier_fraction
+    return fraction
+
+
+PAYOUT_HOTKEY, PAYOUT_TIERS = payout_settings(PAYOUT_HOTKEY, PAYOUT_TIERS)
 
 # ────────────────  CONTINUOUS VALIDATION  ────────────────
 

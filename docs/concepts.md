@@ -124,7 +124,7 @@ score_new = α × share_this_window + (1 − α) × score_old
 
 where `share_this_window` is the final per-hotkey share from fixed FIFO slots. Each selected group earns one uniform slot; there is no active same-prompt split. `alpha = EMA_ALPHA = 2 / (72 + 1) ~= 0.027`. With a 72-window history, this gives a roughly 25-window half-life. A miner that stops contributing loses half its score in about 25 windows. The EMA is replayed from R2 archives at startup, so loss of local disk does not lose scoring history.
 
-At each `set_weights` call the validator submits the current EMA values directly. The sum of all EMA scores is the smoothed fill rate; `burn = max(0, 1 − sum)` goes to the current subnet owner's UID, unless `RELIQUARY_UID_BURN` explicitly overrides it.
+At each `set_weights` call the validator submits the current EMA values directly. The sum of all EMA scores is the smoothed fill rate; `burn = max(0, 1 − sum)` goes to the current subnet owner's UID, unless `RELIQUARY_UID_BURN` explicitly overrides it. Once a collector tier is in effect, its fraction of that burn goes to the collector hotkey instead (`PAYOUT_HOTKEY` and `PAYOUT_TIERS` in `reliquary/constants.py`; see the validator guide).
 
 ### Checkpoint hash gate — miners always run the current model
 

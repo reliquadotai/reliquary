@@ -92,6 +92,26 @@ the subnet owner hotkey's current UID, resolved from the metagraph. Leave
 An ordinary validator's self-weight is masked by chain consensus and does not
 implement burn.
 
+### The collector and its tiers
+
+Part of the unused mass can go to a collector hotkey instead of the burn. The
+collector's hotkey (`PAYOUT_HOTKEY`) and its tiers (`PAYOUT_TIERS`: each a
+fraction of the unused mass and the chain block it takes effect from) are code
+constants in `reliquary/constants.py`; no environment variable sets them. The
+planned tiers are 1 %, 10 %, 50 % and 100 %.
+
+- Each tier ships in a release at least two tempos before its activation
+  block. Every validator holding the release switches in the same epoch, the
+  one its activation block falls in, whenever the validator restarted.
+- Stay on the current release while tiers roll out. A validator on an older
+  release routes differently from the others from the activation epoch on,
+  and Yuma consensus clips it. A validator without watchtower must be
+  restarted on the release before the activation block.
+- Leave `RELIQUARY_UID_BURN` unset during tiers: it moves the burned remainder
+  on one validator only, which the others then outvote.
+- The collector's hotkey and its policy (what it keeps, burns and pays) are
+  published before any tier above 1 %.
+
 ### What goes in `.env`
 
 The example file is annotated. The required keys:
