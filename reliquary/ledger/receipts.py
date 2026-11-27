@@ -21,12 +21,13 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 
 from reliquary.ledger.payout import MODE_EXECUTE, PAYOUT_RECEIPT_SCHEMA
+from reliquary.ledger.surplus import SURPLUS_RECEIPT_SCHEMA
 
 PUBLIC_PREFIX = "reliquary/public/payouts/"
 INDEX_KEY = f"{PUBLIC_PREFIX}index.json"
 INDEX_SCHEMA = "reliquary/payout-receipt-index/v1"
 # A receipt's schema, and the folder its kind is published under.
-RECEIPT_KINDS = {PAYOUT_RECEIPT_SCHEMA: "transfers"}
+RECEIPT_KINDS = {PAYOUT_RECEIPT_SCHEMA: "transfers", SURPLUS_RECEIPT_SCHEMA: "burns"}
 INDEX_ATTEMPTS = 5
 
 _ABSENT = {"NoSuchKey", "404", "NotFound"}
@@ -50,10 +51,11 @@ def receipt_key(receipt: Mapping, name: str) -> str:
 
 
 def index_entry(receipt: Mapping, key: str) -> dict:
-    paid = receipt.get("paid") or {}
-    return {"key": key, "schema": receipt.get("schema"), "pass_day": receipt.get("pass_day"),
-            "as_of": receipt.get("as_of"), "rao": paid.get("rao"), "transfers": paid.get("transfers"),
-            "stopped": receipt.get("stopped")}
+    """A receipt's line in the index: what it paid, or burned."""
+    done = receipt.get("paid") or receipt.get("burned") or {}
+    return {"key": key, "schema": receipt.get("schema"), "kind": RECEIPT_KINDS.get(receipt.get("schema")),
+            "pass_day": receipt.get("pass_day"), "as_of": receipt.get("as_of"), "rao": done.get("rao"),
+            "transfers": done.get("transfers"), "stopped": receipt.get("stopped")}
 
 
 def merge_index(index: Mapping | None, entries: Iterable[Mapping]) -> dict:

@@ -313,14 +313,13 @@ def pay_command(
         raise typer.Exit(code=3)
 
 
-async def collect_payout(*, now: float, pay_day: date, terms, archives: str, prices: str, api: str | None,
-                         rate: str, fixed_rate: float | None, budgets: dict[str, int], history_days: int,
-                         network: str, netuid: int, collector_coldkey: str, collector_hotkey: str,
-                         journal_path: Path, receipts: Path, batch_size: int, era_period: int, reserve_rao: int,
-                         confirm_rao: int | None = None,
-                         min_transfer_rao: int | None, assume_collector: list[str], execute: bool,
-                         wallet_name: str | None, wallet_path: str | None, wait_seconds: float):
-    """Build the ledger (read-only), then run one pass; returns (receipt, receipt path)."""
+async def _collector_ledger(*, now: float, pay_day: date, terms, archives: str, prices: str, api: str | None,
+                            rate: str, fixed_rate: float | None, budgets: dict[str, int], history_days: int,
+                            subtensor, netuid: int, assume_collector: list[str], need_all: bool = True):
+    """The obligations (read-only) and the collector-rail tasks, from the
+    archives and the registry; what was read. With ``need_all`` False and no
+    task on the collector rail, no archive is read: nothing is owed by
+    transfer."""
     from reliquary.ledger import sources
     from reliquary.ledger.obligations import (
         RATE_CHAIN,
@@ -330,36 +329,57 @@ async def collect_payout(*, now: float, pay_day: date, terms, archives: str, pri
         build_ledger,
         day_start,
     )
-    from reliquary.ledger.payout import Journal, PayoutConfig, run_pass, write_receipt
     from reliquary.validator import corpus_periods as cp
 
-    first_work = cp.period_of(day_start(pay_day - timedelta(days=history_days)))
-    source = sources.BucketArchives() if archives == "r2" else sources.DirectoryArchives(archives)
-    refs = [ref for ref in await source.refs(work_from=first_work)
-            if ref.settled_at is None or ref.settled_at <= now]
     ceilings, pay_ceilings, collector_tasks = {}, {}, []
     if prices == "registry":
         view = await sources.read_registry_ceilings()
         ceilings, pay_ceilings, collector_tasks = view.ceilings, view.pay_ceilings, list(view.collector_tasks)
-    elif prices == "api":
+    collector_tasks = sorted(set(collector_tasks) | set(assume_collector))
+    refs = []
+    first_work = cp.period_of(day_start(pay_day - timedelta(days=history_days)))
+    if need_all or collector_tasks:
+        source = sources.BucketArchives() if archives == "r2" else sources.DirectoryArchives(archives)
+        refs = [ref for ref in await source.refs(work_from=first_work)
+                if ref.settled_at is None or ref.settled_at <= now]
+    if prices == "api" and refs:
         jobs = {str(ref.document.get("job_id") or ref.task_id): ref.task_id for ref in refs}
         by_job = await asyncio.to_thread(sources.api_ceilings, api or sources.DEFAULT_API, list(jobs))
         ceilings = {jobs[job]: found for job, found in by_job.items()}
-    collector_tasks = sorted(set(collector_tasks) | set(assume_collector))
+    chain_rate = None
+    if refs and (rate == "chain" or fixed_rate is None):
+        chain_rate = await sources.chain_alpha_per_period(subtensor, netuid)
+    if fixed_rate is not None:
+        policy = RatePolicy(mode=RATE_FIXED, alpha_per_period=fixed_rate)
+    elif rate == "chain" and chain_rate is not None:
+        policy = RatePolicy(mode=RATE_CHAIN, alpha_per_period=chain_rate)
+    else:
+        policy = RatePolicy(mode=RATE_FROZEN, alpha_per_period=chain_rate)
+    ledger = build_ledger(refs, ceilings=ceilings, rates=policy, terms=terms, pay_ceilings=pay_ceilings,
+                          order_budgets_rao=budgets)
+    used = {"archives": archives if archives == "r2" else "directory", "archives_read": len(refs),
+            "prices": prices, "rate": policy.to_dict(), "collector_tasks": collector_tasks,
+            "assumed_collector_tasks": sorted(set(assume_collector)), "ledger_anomalies": len(ledger.anomalies)}
+    return ledger.obligations, collector_tasks, used
+
+
+async def collect_payout(*, now: float, pay_day: date, terms, archives: str, prices: str, api: str | None,
+                         rate: str, fixed_rate: float | None, budgets: dict[str, int], history_days: int,
+                         network: str, netuid: int, collector_coldkey: str, collector_hotkey: str,
+                         journal_path: Path, receipts: Path, batch_size: int, era_period: int, reserve_rao: int,
+                         confirm_rao: int | None = None,
+                         min_transfer_rao: int | None, assume_collector: list[str], execute: bool,
+                         wallet_name: str | None, wallet_path: str | None, wait_seconds: float):
+    """Build the ledger (read-only), then run one pass; returns (receipt, receipt path)."""
+    from reliquary.ledger.payout import Journal, PayoutConfig, run_pass, write_receipt
+
     subtensor = await _subtensor(network)
     journal = None
     try:
-        chain_rate = None
-        if rate == "chain" or fixed_rate is None:
-            chain_rate = await sources.chain_alpha_per_period(subtensor, netuid)
-        if fixed_rate is not None:
-            policy = RatePolicy(mode=RATE_FIXED, alpha_per_period=fixed_rate)
-        elif rate == "chain":
-            policy = RatePolicy(mode=RATE_CHAIN, alpha_per_period=chain_rate)
-        else:
-            policy = RatePolicy(mode=RATE_FROZEN, alpha_per_period=chain_rate)
-        ledger = build_ledger(refs, ceilings=ceilings, rates=policy, terms=terms, pay_ceilings=pay_ceilings,
-                              order_budgets_rao=budgets)
+        obligations, collector_tasks, used = await _collector_ledger(
+            now=now, pay_day=pay_day, terms=terms, archives=archives, prices=prices, api=api, rate=rate,
+            fixed_rate=fixed_rate, budgets=budgets, history_days=history_days, subtensor=subtensor, netuid=netuid,
+            assume_collector=assume_collector)
         config = PayoutConfig(
             netuid=netuid, collector_coldkey=collector_coldkey, collector_hotkey=collector_hotkey,
             min_transfer_rao=(min_transfer_rao if min_transfer_rao is not None
@@ -370,7 +390,7 @@ async def collect_payout(*, now: float, pay_day: date, terms, archives: str, pri
         journal = Journal(journal_path, read_only=not execute)
         signer = (_wallet_signer(subtensor, wallet_name=wallet_name, wallet_path=wallet_path, netuid=netuid,
                                  collector_hotkey=collector_hotkey) if execute else None)
-        receipt = await run_pass(ledger.obligations, journal=journal, chain=chain, config=config,
+        receipt = await run_pass(obligations, journal=journal, chain=chain, config=config,
                                  collector_tasks=collector_tasks, pass_day=pay_day, terms=terms, now=now,
                                  execute=execute, signer=signer, confirm_rao=confirm_rao,
                                  wait_seconds=wait_seconds)
@@ -380,11 +400,170 @@ async def collect_payout(*, now: float, pay_day: date, terms, archives: str, pri
         from reliquary.infrastructure.chain import close_subtensor
 
         await close_subtensor(subtensor)
-    receipt["sources"] = {"archives": archives if archives == "r2" else "directory", "archives_read": len(refs),
-                          "prices": prices, "rate": policy.to_dict(), "collector_tasks": collector_tasks,
-                          "assumed_collector_tasks": sorted(set(assume_collector)),
-                          "ledger_anomalies": len(ledger.anomalies)}
+    receipt["sources"] = used
     return receipt, write_receipt(receipt, receipts)
+
+
+@ledger_app.command("burn-surplus")
+def burn_surplus_command(
+    collector_coldkey: str = typer.Option(..., "--collector-coldkey", help="the collector's coldkey (SS58)"),
+    collector_hotkey: str = typer.Option(..., "--collector-hotkey", help="the collector's hotkey (SS58)"),
+    cap: float = typer.Option(None, "--cap", help="the most burned per UTC day, in alpha (needed to execute)"),
+    reserve: float = typer.Option(0.0, "--reserve", help="alpha of the collector's stake never burned"),
+    journal: Path = typer.Option(DEFAULT_JOURNAL, "--journal", help="the payer's one journal (shared with pay)"),
+    receipts: Path = typer.Option(DEFAULT_RECEIPTS, "--receipts", help="directory the receipt is written to"),
+    as_of: str = typer.Option(None, "--as-of", help="ISO time; default: now"),
+    archives: str = typer.Option("r2", "--archives", help="'r2' (read-only) or a local directory"),
+    prices: str = typer.Option("registry", "--prices", help="'registry' (needed to execute) or 'none'"),
+    rate: str = typer.Option("frozen", "--rate", help="'frozen', 'chain' or a number of alpha per period"),
+    history_days: int = typer.Option(16, "--history-days", help="work days read back for what is still owed"),
+    assume_collector: list[str] = typer.Option([], "--assume-collector", help="dry run only: count TASK as on "
+                                                                             "the collector rail"),
+    network: str = typer.Option("archive", "--network", help="the chain endpoint"),
+    netuid: int = typer.Option(81, "--netuid"),
+    era_period: int = typer.Option(64, "--era-period", help="blocks the signed burn stays valid (power of two)"),
+    execute: bool = typer.Option(False, "--execute", help="sign and send (default: a dry run)"),
+    confirm_rao: int = typer.Option(None, "--confirm-rao", help="with --execute: the amount in rao, as the dry "
+                                                                "run printed it; any other amount burns nothing"),
+    wallet_name: str = typer.Option(None, "--wallet-name", help="with --execute: the collector's wallet"),
+    wallet_path: str = typer.Option(None, "--wallet-path", help="with --execute: where the wallet lives"),
+    wait_seconds: float = typer.Option(600.0, "--wait-seconds", help="how long to wait for the burn to be final"),
+) -> None:
+    """Burn the collector's surplus (burn_alpha): its stake beyond what it owes and its reserve, up to a cap.
+
+    A dry run by default. Executing needs --cap, --confirm-rao naming the exact amount, and the collector's wallet."""
+    from reliquary.ledger.obligations import RAO_PER_ALPHA, PayTerms
+
+    if execute and (cap is None or prices != "registry" or assume_collector or not wallet_name):
+        raise typer.BadParameter("--execute needs --cap, --prices registry, the collector's --wallet-name, and no "
+                                 "--assume-collector")
+    if confirm_rao is not None and not execute:
+        raise typer.BadParameter("--confirm-rao goes with --execute")
+    for name, value in (("--cap", cap), ("--reserve", reserve)):
+        if value is not None and (not math.isfinite(value) or value < 0):
+            raise typer.BadParameter(f"{name} must be a finite alpha amount >= 0")
+    fixed = None
+    if rate not in ("frozen", "chain"):
+        try:
+            fixed = float(rate)
+        except ValueError as exc:
+            raise typer.BadParameter(f"--rate is 'frozen', 'chain' or a number, got {rate!r}") from exc
+    now = _parse_instant(as_of)
+    receipt, path = asyncio.run(collect_burn(
+        now=now, terms=PayTerms(), archives=archives, prices=prices, rate=rate, fixed_rate=fixed,
+        history_days=history_days, network=network, netuid=netuid, collector_coldkey=collector_coldkey,
+        collector_hotkey=collector_hotkey, journal_path=journal.expanduser(), receipts=receipts.expanduser(),
+        cap_rao=0 if cap is None else math.floor(cap * RAO_PER_ALPHA), reserve_rao=math.floor(reserve * RAO_PER_ALPHA),
+        era_period=era_period, assume_collector=assume_collector, execute=execute, confirm_rao=confirm_rao,
+        wallet_name=wallet_name, wallet_path=wallet_path, wait_seconds=wait_seconds))
+    typer.echo(render_burn(receipt, capped=cap is not None))
+    typer.echo(f"receipt: {path}")
+    if receipt.get("stopped"):
+        raise typer.Exit(code=3)
+
+
+async def collect_burn(*, now: float, terms, archives: str, prices: str, rate: str, fixed_rate: float | None,
+                       history_days: int, network: str, netuid: int, collector_coldkey: str, collector_hotkey: str,
+                       journal_path: Path, receipts: Path, cap_rao: int, reserve_rao: int, era_period: int,
+                       assume_collector: list[str], execute: bool, confirm_rao: int | None, wallet_name: str | None,
+                       wallet_path: str | None, wait_seconds: float):
+    """What the collector owes (read-only), then one surplus burn; returns (receipt, receipt path)."""
+    from reliquary.ledger.obligations import utc_day
+    from reliquary.ledger.payout import Journal, PayoutConfig, write_receipt
+    from reliquary.ledger.surplus import run_burn
+
+    day = utc_day(now)
+    subtensor = await _subtensor(network)
+    journal = None
+    try:
+        obligations, collector_tasks, used = await _collector_ledger(
+            now=now, pay_day=day, terms=terms, archives=archives, prices=prices, api=None, rate=rate,
+            fixed_rate=fixed_rate, budgets={}, history_days=history_days, subtensor=subtensor, netuid=netuid,
+            assume_collector=assume_collector, need_all=False)
+        config = PayoutConfig(netuid=netuid, collector_coldkey=collector_coldkey, collector_hotkey=collector_hotkey,
+                              min_transfer_rao=0, reserve_rao=reserve_rao, era_period=era_period)
+        chain = _payout_chain(subtensor, netuid=netuid, collector_coldkey=collector_coldkey,
+                              collector_hotkey=collector_hotkey)
+        journal = Journal(journal_path, read_only=not execute)
+        signer = (_wallet_signer(subtensor, wallet_name=wallet_name, wallet_path=wallet_path, netuid=netuid,
+                                 collector_hotkey=collector_hotkey) if execute else None)
+        receipt = await run_burn(obligations, journal=journal, chain=chain, config=config,
+                                 collector_tasks=collector_tasks, pass_day=day, now=now, cap_rao=cap_rao,
+                                 execute=execute, signer=signer, confirm_rao=confirm_rao, wait_seconds=wait_seconds)
+    finally:
+        if journal is not None:
+            journal.close()
+        from reliquary.infrastructure.chain import close_subtensor
+
+        await close_subtensor(subtensor)
+    receipt["sources"] = used
+    return receipt, write_receipt(receipt, receipts, prefix="burn")
+
+
+def render_burn(receipt, *, capped: bool) -> str:
+    from reliquary.ledger.obligations import RAO_PER_ALPHA
+
+    def alpha(rao) -> str:
+        return f"{int(rao) / RAO_PER_ALPHA:.9f}"
+
+    lines = [f"{receipt['mode'].upper()} surplus burn (collector {receipt['collector_coldkey']})",
+             f"  stake {alpha(receipt['collector_stake_rao'])} alpha at block {receipt['finalized_block']}: owed "
+             f"{alpha(receipt['owed_rao'])}, in flight {alpha(receipt['in_flight_rao'])}, reserve "
+             f"{alpha(receipt['reserve_rao'])}, surplus {alpha(receipt['surplus_rao'])}",
+             f"  already burned today {alpha(receipt['burned_today_rao'])}; this pass burns "
+             f"{alpha(receipt['planned_rao'])} alpha ({receipt['planned_rao']} rao)"
+             + ("" if capped else " -- no --cap given: nothing")]
+    for batch in receipt["recovered"] + receipt["batches"]:
+        lines.append(f"  {batch['kind']} {batch['batch_id']} {batch['state']} nonce {batch['nonce']} "
+                     f"block {batch['block_number']}: {batch['detail']}")
+    lines.append(f"  burned {alpha(receipt['burned']['rao'])} alpha")
+    if receipt.get("stopped"):
+        lines.append(f"  STOPPED: {receipt['stopped']}")
+    return "\n".join(lines)
+
+
+@ledger_app.command("collector-status")
+def collector_status_command(
+    collector_hotkey: str = typer.Option(..., "--collector-hotkey", help="the collector's hotkey (SS58)"),
+    collector_coldkey: str = typer.Option(None, "--collector-coldkey", help="its coldkey, to read its stake"),
+    before: float = typer.Option(None, "--before", help="MinerBurned (0 to 1) read before a tier release"),
+    fraction: float = typer.Option(None, "--fraction", help="the tier's fraction (0 to 1), with --before"),
+    network: str = typer.Option("finney", "--network"),
+    netuid: int = typer.Option(81, "--netuid"),
+) -> None:
+    """Read MinerBurned and the collector's UID, coldkey, incentive and stake from the chain. Read-only.
+
+    With --before and --fraction: whether MinerBurned fell as a tier release should make it fall."""
+    from reliquary.ledger import sources
+
+    if (before is None) != (fraction is None):
+        raise typer.BadParameter("--before and --fraction go together")
+
+    async def read():
+        subtensor = await _subtensor(network)
+        try:
+            return await sources.read_collector_status(subtensor, netuid, collector_hotkey=collector_hotkey,
+                                                       collector_coldkey=collector_coldkey)
+        finally:
+            from reliquary.infrastructure.chain import close_subtensor
+
+            await close_subtensor(subtensor)
+
+    status = asyncio.run(read())
+    typer.echo(f"block {status['block']} (last epoch {status['last_step']}): MinerBurned "
+               f"{status['miner_burned']:.4%}, stake transfers {'open' if status['transfer_toggle'] else 'CLOSED'}")
+    if status["uid"] is None:
+        typer.echo(f"collector {collector_hotkey}: NOT REGISTERED on netuid {netuid}")
+    else:
+        typer.echo(f"collector {collector_hotkey}: UID {status['uid']}, coldkey {status['coldkey']}"
+                   + (" (THE OWNER'S: the chain keeps its incentive)" if status["held_by_owner"] else "")
+                   + f", incentive {status['incentive']:.6f}, emission {status['emission_alpha']:.6f} alpha last epoch")
+    if status["stake_rao"] is not None:
+        typer.echo(f"collector stake: {status['stake_rao'] / 1e9:.9f} alpha")
+    if before is not None:
+        check = sources.tier_check(before, fraction, status["miner_burned"])
+        typer.echo(f"tier {fraction:.2%}: MinerBurned expected {check['expected']:.4%} (from {before:.4%}), now "
+                   f"{check['now']:.4%} -> {'AS EXPECTED' if check['within'] else 'NOT YET: read it again after the next tempo'}")
 
 
 @ledger_app.command("publish")
@@ -471,4 +650,4 @@ def _load_first_seen(path: Path | None) -> dict[str, float]:
     return {str(k): float(v) for k, v in json.loads(path.read_text()).items()}
 
 
-__all__ = ["collect_payout", "collect_report", "ledger_app", "render_payout"]
+__all__ = ["collect_burn", "collect_payout", "collect_report", "ledger_app", "render_burn", "render_payout"]

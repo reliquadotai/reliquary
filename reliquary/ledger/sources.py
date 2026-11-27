@@ -372,6 +372,50 @@ async def _retried(read, what: str, *, attempts: int = CHAIN_READ_ATTEMPTS,
             await asyncio.sleep(backoff * attempt)
 
 
+async def read_collector_status(subtensor, netuid: int, *, collector_hotkey: str,
+                                collector_coldkey: str | None = None) -> dict:
+    """What the chain says now of the subnet's burn and its collector,
+    read-only: ``MinerBurned`` (the share of the miners' incentive the owner's
+    hotkeys kept at the last tempo), whether stake transfers are open, and the
+    collector hotkey's UID, coldkey, incentive and emission at the last epoch,
+    with its stake when its coldkey is given."""
+    from bittensor.core.chain_data.metagraph_info import SelectiveMetagraphIndex as S
+
+    head = int(await _retried(subtensor.get_current_block, "the chain head"))
+    burned = await _retried(lambda: subtensor.query_subtensor("MinerBurned", params=[netuid], block=head),
+                            "MinerBurned")
+    value = getattr(burned, "value", burned)
+    bits = int(value["bits"]) if isinstance(value, Mapping) else int(value)
+    toggle = await _retried(lambda: subtensor.query_subtensor("TransferToggle", params=[netuid], block=head),
+                            "TransferToggle")
+    fields = [S.Hotkeys, S.Coldkeys, S.Incentives, S.Emission, S.OwnerHotkey, S.OwnerColdkey, S.LastStep]
+    info = await _retried(lambda: subtensor.get_metagraph_info(netuid, selected_indices=fields, block=head),
+                          f"metagraph of {netuid} at block {head}")
+    hotkeys = [str(h) for h in info.hotkeys]
+    uid = hotkeys.index(collector_hotkey) if collector_hotkey in hotkeys else None
+    coldkey = None if uid is None else str(info.coldkeys[uid])
+    stake = None
+    if collector_coldkey:
+        stake = int((await _retried(lambda: subtensor.get_stake(collector_coldkey, collector_hotkey, netuid,
+                                                                block=head), "the collector's stake")).rao)
+    return {"block": head, "netuid": int(netuid), "last_step": int(info.last_step),
+            "miner_burned": bits / 2**32, "transfer_toggle": bool(getattr(toggle, "value", toggle)),
+            "collector_hotkey": collector_hotkey, "uid": uid, "coldkey": coldkey,
+            "held_by_owner": None if coldkey is None else coldkey == str(info.owner_coldkey),
+            "incentive": None if uid is None else float(info.incentives[uid]),
+            "emission_alpha": None if uid is None else float(info.emission[uid]),
+            "stake_rao": stake, "owner_hotkey": str(info.owner_hotkey)}
+
+
+def tier_check(before: float, fraction: float, now: float, *, tolerance: float = 0.005) -> dict:
+    """After a tier routes ``fraction`` of the unpaid share to the collector,
+    ``MinerBurned`` should fall from ``before`` to about ``before x (1 -
+    fraction)`` at the next tempo, within ``tolerance`` (half a point)."""
+    expected = before * (1.0 - fraction)
+    return {"before": before, "fraction": fraction, "expected": expected, "now": now,
+            "within": abs(now - expected) <= tolerance, "tolerance": tolerance}
+
+
 async def chain_alpha_per_period(subtensor, netuid: int) -> float:
     """The miners' alpha per period now (``chain.miner_alpha_per_block`` x the
     blocks in a period), the rate of ``RatePolicy(mode="chain")``."""
@@ -394,6 +438,8 @@ __all__ = [
     "http_json",
     "list_bucket_archives",
     "read_epoch_pays",
+    "read_collector_status",
     "read_registry_ceilings",
     "registry_ceilings",
+    "tier_check",
 ]

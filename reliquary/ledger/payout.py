@@ -103,8 +103,12 @@ CREATE INDEX IF NOT EXISTS payout_obligations_batch ON payout_obligations(batch_
 CREATE TABLE IF NOT EXISTS payout_batches(
     batch_id TEXT PRIMARY KEY, pass_day TEXT NOT NULL, state TEXT NOT NULL, transfers TEXT NOT NULL,
     nonce INTEGER, era_block INTEGER, era_period INTEGER, extrinsic_hash TEXT, block_number INTEGER,
-    block_hash TEXT, fee_rao INTEGER, events TEXT, detail TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL);
+    block_hash TEXT, fee_rao INTEGER, events TEXT, detail TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'transfers', burn_rao INTEGER);
 """
+# A batch's kind: transfers to miners (``transfers``), or one ``burn_alpha`` of the collector's surplus
+# (``burn``, ``reliquary.ledger.surplus``). Both take the collector's nonces, so both share one journal.
+KIND_TRANSFERS, KIND_BURN = "transfers", "burn"
 
 
 class PayoutError(RuntimeError):
@@ -198,6 +202,8 @@ class Signer(Protocol):
     async def sign(self, transfers: Sequence[Transfer], *, nonce: int, era_block: int,
                    era_period: int) -> SignedBatch: ...
 
+    async def sign_burn(self, amount_rao: int, *, nonce: int, era_block: int, era_period: int) -> SignedBatch: ...
+
 
 # -- the journal ---------------------------------------------------------------------------------------------------
 
@@ -227,6 +233,10 @@ class Journal:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.executescript(_SCHEMA)
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(payout_batches)")}
+        if "kind" not in columns:
+            self.db.execute("ALTER TABLE payout_batches ADD COLUMN kind TEXT NOT NULL DEFAULT 'transfers'")
+            self.db.execute("ALTER TABLE payout_batches ADD COLUMN burn_rao INTEGER")
 
     def close(self) -> None:
         self.db.close()
@@ -260,9 +270,14 @@ class Journal:
         return out
 
     def in_flight_rao(self) -> int:
+        """Transfers reserved or sent, and burns not yet final: stake already spoken for."""
         marks = ",".join("?" * len(IN_FLIGHT))
-        return int(self.db.execute(f"SELECT COALESCE(SUM(amount_rao), 0) FROM payout_obligations "
-                                   f"WHERE state IN ({marks})", IN_FLIGHT).fetchone()[0])
+        transfers = int(self.db.execute(f"SELECT COALESCE(SUM(amount_rao), 0) FROM payout_obligations "
+                                        f"WHERE state IN ({marks})", IN_FLIGHT).fetchone()[0])
+        unresolved = ",".join("?" * len(UNRESOLVED))
+        burns = int(self.db.execute(f"SELECT COALESCE(SUM(burn_rao), 0) FROM payout_batches WHERE kind=? "
+                                    f"AND state IN ({unresolved})", (KIND_BURN, *UNRESOLVED)).fetchone()[0])
+        return transfers + burns
 
     def batch(self, batch_id: str) -> dict | None:
         found = self.batches(f"batch_id = ?", (batch_id,))
@@ -312,7 +327,8 @@ class Journal:
 
     def batches(self, where: str = "1", args: Sequence = ()) -> list[dict]:
         columns = ("batch_id", "pass_day", "state", "transfers", "nonce", "era_block", "era_period",
-                   "extrinsic_hash", "block_number", "block_hash", "fee_rao", "events", "detail", "created_at")
+                   "extrinsic_hash", "block_number", "block_hash", "fee_rao", "events", "detail", "created_at",
+                   "kind", "burn_rao")
         out = []
         for row in self.db.execute(f"SELECT {', '.join(columns)} FROM payout_batches WHERE {where} "
                                    f"ORDER BY created_at, batch_id", tuple(args)):
@@ -345,6 +361,25 @@ class Journal:
                        "VALUES(?,?,?,?,?,?)",
                        (batch_id, pass_day.isoformat(), BATCH_PREPARED,
                         json.dumps([t.to_dict() for t in transfers], sort_keys=True), now, now))
+
+    def burned_on(self, day: date, *, excluding: Collection[str] = ()) -> int:
+        """The rao asked of every burn of ``day`` that is final, or may still be:
+        what counts against that day's cap (``excluding`` the batches a dry run
+        would release)."""
+        rows = self.db.execute("SELECT batch_id, burn_rao FROM payout_batches WHERE kind=? AND pass_day=? AND state IN "
+                               "(?,?,?)", (KIND_BURN, day.isoformat(), BATCH_PREPARED, BATCH_SUBMITTED,
+                                           BATCH_FINALIZED)).fetchall()
+        return sum(int(rao or 0) for batch_id, rao in rows if batch_id not in set(excluding))
+
+    def reserve_burn(self, batch_id: str, pass_day: date, amount_rao: int) -> None:
+        """A burn of ``amount_rao`` of the collector's stake, prepared (not signed yet)."""
+        if isinstance(amount_rao, bool) or not isinstance(amount_rao, int) or amount_rao <= 0:
+            raise PayoutError(f"a burn needs a positive whole amount of rao, got {amount_rao!r}")
+        now = self.clock()
+        with self._transaction() as db:
+            db.execute("INSERT INTO payout_batches(batch_id, pass_day, state, transfers, created_at, updated_at, kind, "
+                       "burn_rao) VALUES(?,?,?,?,?,?,?,?)",
+                       (batch_id, pass_day.isoformat(), BATCH_PREPARED, "[]", now, now, KIND_BURN, amount_rao))
 
     def mark_submitted(self, batch_id: str, signed: SignedBatch) -> None:
         """Before the batch is sent: what will let a later pass find it."""
@@ -498,8 +533,9 @@ def _settle(journal: Journal, batch: Mapping, state: str, inclusion: Inclusion |
             config: PayoutConfig) -> dict:
     """Write a resolution down; what the receipt says of it."""
     if state == BATCH_FINALIZED:
-        reconciled, why = reconcile_events(batch["transfers"], inclusion, collector_coldkey=config.collector_coldkey,
-                                           collector_hotkey=config.collector_hotkey)
+        check = reconcile_burn if batch.get("kind") == KIND_BURN else reconcile_events
+        reconciled, why = check(batch["transfers"] if batch.get("kind") != KIND_BURN else batch, inclusion,
+                                collector_coldkey=config.collector_coldkey, collector_hotkey=config.collector_hotkey)
         journal.mark_paid(batch["batch_id"], inclusion, reconciled=reconciled, detail=f"{detail}; {why}")
         detail = f"{detail}; {why}"
     elif state in (BATCH_FAILED, BATCH_EXPIRED):
@@ -509,8 +545,38 @@ def _settle(journal: Journal, batch: Mapping, state: str, inclusion: Inclusion |
     return _batch_receipt(batch, state, inclusion, detail)
 
 
+def reconcile_burn(batch: Mapping, inclusion: Inclusion, *, collector_coldkey: str,
+                   collector_hotkey: str) -> tuple[bool, str]:
+    """Whether a burn's events hold one ``AlphaBurned`` of the collector's stake
+    on its hotkey, of at most the amount asked (the chain burns what is there,
+    at most). Its fields are (coldkey, hotkey, amount, netuid)."""
+    burned = [e for e in inclusion.events
+              if e.get("module") == "SubtensorModule" and e.get("event") == "AlphaBurned"]
+    if len(burned) != 1:
+        return False, f"{len(burned)} AlphaBurned event(s), one expected"
+    attributes = burned[0].get("attributes")
+    if isinstance(attributes, Mapping):
+        fields = [attributes.get(k) for k in ("coldkey", "hotkey", "amount")]
+    elif isinstance(attributes, (list, tuple)) and len(attributes) >= 3:
+        fields = list(attributes[:3])
+    else:
+        return False, f"an AlphaBurned event could not be read: {attributes!r}"
+    coldkey, hotkey, amount = fields
+    if str(coldkey) != collector_coldkey or str(hotkey) != collector_hotkey:
+        return False, f"the AlphaBurned event is not the collector's: {fields!r}"
+    try:
+        amount = int(amount)
+    except (TypeError, ValueError):
+        return False, f"the AlphaBurned amount could not be read: {amount!r}"
+    asked = int(batch.get("burn_rao") or 0)
+    if amount > asked:
+        return False, f"AlphaBurned {amount} rao, more than the {asked} asked"
+    return True, f"AlphaBurned {amount} rao of the {asked} asked"
+
+
 def _batch_receipt(batch: Mapping, state: str, inclusion: Inclusion | None, detail: str) -> dict:
-    return {"batch_id": batch["batch_id"], "state": state, "nonce": batch.get("nonce"),
+    return {"batch_id": batch["batch_id"], "kind": batch.get("kind", KIND_TRANSFERS), "burn_rao": batch.get("burn_rao"),
+            "state": state, "nonce": batch.get("nonce"),
             "extrinsic_hash": batch.get("extrinsic_hash"), "era_block": batch.get("era_block"),
             "era_period": batch.get("era_period"),
             "block_number": None if inclusion is None else inclusion.block_number,
@@ -518,6 +584,37 @@ def _batch_receipt(batch: Mapping, state: str, inclusion: Inclusion | None, deta
             "fee_rao": None if inclusion is None else inclusion.fee_rao,
             "events": None if inclusion is None else list(inclusion.events),
             "transfers": list(batch["transfers"]), "detail": detail}
+
+
+async def recover(journal: Journal, chain: PayoutChain, config: PayoutConfig, *, execute: bool) -> dict:
+    """Every batch (transfers or burn) whose fate is unknown, settled from the
+    chain; a dry run settles nothing, but says what it would (``would``: batch
+    id to state, ``would_rao``: the stake they hold in flight), so a plan can
+    be made as if it had and show the total an execution will ask to confirm.
+    ``pending``: batches still inside their window (nothing new may be sent);
+    ``stopped``: why nothing may be sent at all (a nonce lost to another
+    extrinsic, settled by hand or not)."""
+    out: dict = {"recovered": [], "pending": 0, "would": {}, "would_rao": 0, "stopped": None}
+    for batch in journal.unresolved():
+        state, inclusion, detail = await resolve_batch(batch, chain)
+        if state == BATCH_PENDING:
+            out["pending"] += 1
+            out["recovered"].append(_batch_receipt(batch, state, None, detail))
+        elif execute:
+            out["recovered"].append(_settle(journal, batch, state, inclusion, detail, config))
+        else:
+            out["recovered"].append(_batch_receipt(batch, state, inclusion, f"(would settle) {detail}"))
+            if state in (BATCH_FINALIZED, BATCH_FAILED, BATCH_EXPIRED):
+                out["would"][batch["batch_id"]] = state
+                out["would_rao"] += (sum(int(t["amount_rao"]) for t in batch["transfers"])
+                                     + int(batch.get("burn_rao") or 0))
+        if state == BATCH_FOREIGN:
+            out["stopped"] = detail
+    waiting = [b["batch_id"] for b in journal.foreign()]
+    if waiting and out["stopped"] is None:
+        out["stopped"] = (f"batch(es) {', '.join(waiting)} lost their nonce to another extrinsic: nothing is "
+                          "sent until each is settled by hand (Journal.settle_foreign)")
+    return out
 
 
 async def destinations(obligations: Sequence[Obligation], chain: PayoutChain,
@@ -570,29 +667,10 @@ async def run_pass(obligations: Iterable[Obligation], *, journal: Journal, chain
                      "pass_day": pass_day.isoformat(), "pass_at": at, "as_of": float(now), **config.to_dict(),
                      "recovered": [], "batches": [], "stopped": None}
 
-    # 1. What is not known yet, from the chain, before anything new is sent. A dry run settles nothing, but
-    # plans as if it had (``would``), so the total it shows is the one an execution would ask to confirm.
-    pending = 0
-    would: dict[str, str] = {}
-    would_rao = 0
-    for batch in journal.unresolved():
-        state, inclusion, detail = await resolve_batch(batch, chain)
-        if state == BATCH_PENDING:
-            pending += 1
-            receipt["recovered"].append(_batch_receipt(batch, state, None, detail))
-        elif execute:
-            receipt["recovered"].append(_settle(journal, batch, state, inclusion, detail, config))
-        else:
-            receipt["recovered"].append(_batch_receipt(batch, state, inclusion, f"(would settle) {detail}"))
-            if state in (BATCH_FINALIZED, BATCH_FAILED, BATCH_EXPIRED):
-                would[batch["batch_id"]] = state
-                would_rao += sum(int(t["amount_rao"]) for t in batch["transfers"])
-        if state == BATCH_FOREIGN:
-            receipt["stopped"] = detail
-    waiting = [b["batch_id"] for b in journal.foreign()]
-    if waiting and receipt["stopped"] is None:
-        receipt["stopped"] = (f"batch(es) {', '.join(waiting)} lost their nonce to another extrinsic: nothing is "
-                              "sent until each is settled by hand (Journal.settle_foreign)")
+    # 1. What is not known yet, from the chain, before anything new is sent.
+    known = await recover(journal, chain, config, execute=execute)
+    receipt["recovered"], receipt["stopped"] = known["recovered"], known["stopped"]
+    pending, would, would_rao = known["pending"], known["would"], known["would_rao"]
     # 2. What is due at this pass and the collector pays.
     due = [o for o in obligations if o.due_at <= at and state_at(o, now) == DUE]
     native = [o for o in due if o.task_id not in collector_tasks]
@@ -684,7 +762,8 @@ def _count(obligations: Sequence[Obligation]) -> dict:
 
 
 def _close(receipt: dict, stake_after: int | None = None) -> dict:
-    paid = [b for b in receipt["batches"] + receipt["recovered"] if b["state"] == BATCH_FINALIZED]
+    paid = [b for b in receipt["batches"] + receipt["recovered"]
+            if b["state"] == BATCH_FINALIZED and b.get("kind", KIND_TRANSFERS) == KIND_TRANSFERS]
     receipt["paid"] = {"batches": len(paid),
                        "transfers": sum(len(b["transfers"]) for b in paid),
                        "rao": sum(int(t["amount_rao"]) for b in paid for t in b["transfers"]),
@@ -694,17 +773,17 @@ def _close(receipt: dict, stake_after: int | None = None) -> dict:
     return receipt
 
 
-def write_receipt(receipt: Mapping, directory: str | Path) -> Path:
-    """The receipt as ``<directory>/payout-<pass day>-<mode>-<time>.json``,
+def write_receipt(receipt: Mapping, directory: str | Path, *, prefix: str = "payout") -> Path:
+    """The receipt as ``<directory>/<prefix>-<pass day>-<mode>-<time>.json``,
     never overwriting one."""
     folder = Path(directory)
     folder.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(float(receipt["as_of"])))
-    path = folder / f"payout-{receipt['pass_day']}-{receipt['mode']}-{stamp}.json"
+    path = folder / f"{prefix}-{receipt['pass_day']}-{receipt['mode']}-{stamp}.json"
     serial = 1
     while path.exists():
         serial += 1
-        path = folder / f"payout-{receipt['pass_day']}-{receipt['mode']}-{stamp}-{serial}.json"
+        path = folder / f"{prefix}-{receipt['pass_day']}-{receipt['mode']}-{stamp}-{serial}.json"
     path.write_text(json.dumps(receipt, indent=1, sort_keys=True, default=str) + "\n")
     return path
 
@@ -719,6 +798,8 @@ __all__ = [
     "BATCH_SUBMITTED",
     "Inclusion",
     "Journal",
+    "KIND_BURN",
+    "KIND_TRANSFERS",
     "MAX_ATTEMPTS",
     "MODE_DRY_RUN",
     "MODE_EXECUTE",
@@ -732,6 +813,8 @@ __all__ = [
     "batches_of",
     "destinations",
     "plan_transfers",
+    "recover",
+    "reconcile_burn",
     "reconcile_events",
     "resolve_batch",
     "run_pass",

@@ -5,10 +5,10 @@ owner, block times and a block's extrinsics and events (an archive node, for
 blocks days back), and sends a signed batch without waiting: the payer reads
 what became of it from the chain (``payout.resolve_batch``).
 
-``WalletSigner`` signs one ``Utility.batch_all`` of
-``SubtensorModule.transfer_stake`` calls with the collector's coldkey, at the
-nonce and the mortal era it is given. Only ``reliquary ledger pay --execute``
-builds one.
+``WalletSigner`` signs, with the collector's coldkey, at the nonce and the
+mortal era it is given: one ``Utility.batch_all`` of
+``SubtensorModule.transfer_stake`` calls (a payout), or one
+``SubtensorModule.burn_alpha`` (a surplus burn). Only ``--execute`` builds one.
 """
 
 from __future__ import annotations
@@ -155,6 +155,16 @@ class WalletSigner:
         batch = await self.subtensor.compose_call("Utility", "batch_all", {"calls": calls})
         extrinsic = await self.subtensor.substrate.create_signed_extrinsic(
             call=batch, keypair=self.wallet.coldkey, era={"period": int(era_period), "current": int(era_block)},
+            nonce=int(nonce))
+        return SignedBatch(extrinsic_hash=_hex(extrinsic.extrinsic_hash), nonce=int(nonce), era_block=int(era_block),
+                           era_period=int(era_period), payload=extrinsic)
+
+    async def sign_burn(self, amount_rao: int, *, nonce: int, era_block: int, era_period: int) -> SignedBatch:
+        """One ``SubtensorModule.burn_alpha`` of the collector's stake on its hotkey."""
+        call = await self.subtensor.compose_call("SubtensorModule", "burn_alpha", {
+            "hotkey": self.collector_hotkey, "amount": int(amount_rao), "netuid": self.netuid})
+        extrinsic = await self.subtensor.substrate.create_signed_extrinsic(
+            call=call, keypair=self.wallet.coldkey, era={"period": int(era_period), "current": int(era_block)},
             nonce=int(nonce))
         return SignedBatch(extrinsic_hash=_hex(extrinsic.extrinsic_hash), nonce=int(nonce), era_block=int(era_block),
                            era_period=int(era_period), payload=extrinsic)
