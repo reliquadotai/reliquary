@@ -18,7 +18,7 @@ Each settled period of a collector-rail order owes each hotkey one obligation pe
 - The work of UTC day D is paid at the pass of D+2, at 12:00 UTC. A period's day is the day it ended.
 - A period settled after that pass is paid at the first pass after it settles, however old its work.
 - A period that is not settled owes nothing yet. It waits for its audit and is never cancelled. Past 7 days, a person looks at it.
-- If one coldkey is owed less than the floor in a pass, the amount waits and adds up until a later pass. The floor is 0.01 alpha by default (the rao count of the chain's `NominatorMinRequiredStake`, read as alpha); each receipt records the floor used.
+- If one coldkey is owed less than the floor in a pass, the amount waits and adds up until a later pass. The floor is the chain's minimum stake, 0.002 TAO (`DefaultMinStake`), in alpha at the subnet's price at the pass, raised by 25 % for the price to move before the transfer lands. It is never below the chain's transfer minimum, 0.0001 TAO (`DefaultMinTransfer`): the chain refuses a transfer worth less. Each receipt records the floor, in alpha and in TAO, the price and where it was read.
 - If the collector's stake is short, the oldest obligations are paid first, and nothing younger is paid before them.
 
 ## How you receive it
