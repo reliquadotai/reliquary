@@ -22,7 +22,7 @@ import os
 import urllib.parse
 import urllib.request
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from reliquary.ledger.obligations import (
@@ -172,16 +172,21 @@ class RegistryView:
     pay_ceilings: dict[str, float]
     floored: list[str]
     collector_tasks: list[str]
+    # Each collector-rail task's first work period on the rail.
+    collector_from: dict[str, int] = field(default_factory=dict)
+    # Whether the registry object was there at all (absent reads as no task).
+    present: bool = True
 
 
 def registry_ceilings(declared: Mapping) -> RegistryView:
     """The ``RegistryView`` of the registry's entries."""
-    from reliquary.shared.task_registry import PAYOUT_RAIL_COLLECTOR, payout_rail
+    from reliquary.shared.task_registry import PAYOUT_RAIL_COLLECTOR, payout_rail, payout_rail_from
 
     ceilings: dict[str, list[Ceiling]] = {}
     pay_ceilings: dict[str, float] = {}
     floored: list[str] = []
     collector: list[str] = []
+    collector_from: dict[str, int] = {}
     for task_id, entry in (declared or {}).items():
         params = getattr(entry, "params", None)
         if not isinstance(params, Mapping) or not cp.is_period_task(entry):
@@ -197,8 +202,10 @@ def registry_ceilings(declared: Mapping) -> RegistryView:
             floored.append(str(task_id))
         if payout_rail(params) == PAYOUT_RAIL_COLLECTOR:
             collector.append(str(task_id))
+            collector_from[str(task_id)] = int(payout_rail_from(params))
     return RegistryView(ceilings=ceilings, pay_ceilings=pay_ceilings, floored=sorted(floored),
-                        collector_tasks=sorted(collector))
+                        collector_tasks=sorted(collector), collector_from=collector_from,
+                        present=bool(declared))
 
 
 async def read_registry_ceilings(**client_kwargs) -> RegistryView:

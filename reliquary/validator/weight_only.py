@@ -448,14 +448,15 @@ class WeightOnlyValidator:
         that one still be listed.
 
         A task paid by the collector (``payout_rail: collector``) gets no
-        weight: the payer pays its archives from the collector's stake, and its
-        share goes where every unpaid share goes."""
-        from reliquary.shared.task_registry import PAYOUT_RAIL_COLLECTOR, payout_rail
+        weight for its archives of work periods from ``payout_rail_from`` on:
+        the payer pays those from the collector's stake, and their share goes
+        where every unpaid share goes."""
+        from reliquary.shared.task_registry import payout_rail_from
         from reliquary.validator import corpus_periods as cp
 
-        tasks = sorted(str(t) for t, e in (declared or {}).items()
-                       if cp.is_period_task(e)
-                       and payout_rail(getattr(e, "params", None)) != PAYOUT_RAIL_COLLECTOR)
+        tasks = sorted(str(t) for t, e in (declared or {}).items() if cp.is_period_task(e))
+        collector_from = {str(t): payout_rail_from(getattr(e, "params", None))
+                          for t, e in (declared or {}).items() if cp.is_period_task(e)}
         if not tasks:
             return {}
         if archives is None:
@@ -471,8 +472,9 @@ class WeightOnlyValidator:
         weights: dict[str, dict[str, float]] = {}
         for task_id in tasks:
             listed = await archives.list(task_id)
+            start = collector_from.get(task_id)
             keys = [(work, entry) for work, entry in listed
-                    if 0 <= current - entry <= cp.REPLAY_DEPTH]
+                    if 0 <= current - entry <= cp.REPLAY_DEPTH and (start is None or work < start)]
             # A key that may have been replaced: an earlier entry of its work
             # period exists. Those earlier archives are read to find out.
             entries_of: dict[int, list[int]] = {}
