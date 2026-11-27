@@ -208,6 +208,8 @@ async def _burn(obligations, *, journal: Journal, chain: PayoutChain, config: Pa
         receipt["stopped"] = f"burn {batch_id} {entry['detail']}"
     elif entry["state"] in NEEDS_PERSON:
         receipt["stopped"] = entry["detail"]
+    elif entry.get("refused_by_pool"):
+        receipt["stopped"] = f"burn {batch_id} was {entry['detail']}: nothing was burned"
     return close_receipt(receipt, await stake_after(chain))
 
 

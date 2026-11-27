@@ -189,3 +189,84 @@ def test_the_signer_composes_one_batch_all_of_transfer_stake_at_the_nonce_and_er
                                                "origin_netuid": 81, "destination_netuid": 81, "alpha_amount": 20})]
     assert composed[2][:2] == ("Utility", "batch_all") and len(composed[2][2]["calls"]) == 2
     assert composed[3] == ("signed", ("Utility", "batch_all"), {"period": 64, "current": 1000}, 4)
+
+
+def test_the_alpha_price_is_the_chains_and_a_zero_price_is_refused():
+    class Subtensor(_Subtensor):
+        def __init__(self, substrate, rao):
+            super().__init__(substrate)
+            self.rao = rao
+
+        async def get_subnet_price(self, netuid, block_hash=None):
+            self.calls.append(("get_subnet_price", netuid, block_hash))
+            return SimpleNamespace(rao=self.rao)
+
+    chain = pc.SubtensorPayoutChain(Subtensor(_Substrate(), 5_000_000), netuid=81, collector_coldkey=COLLECTOR,
+                                    collector_hotkey=COLLECTOR_HOT)
+    assert asyncio.run(chain.alpha_price_rao(42)) == 5_000_000
+    assert chain.subtensor.calls == [("get_subnet_price", 81, f"0x{42:064x}")]
+    zero = pc.SubtensorPayoutChain(Subtensor(_Substrate(), 0), netuid=81, collector_coldkey=COLLECTOR,
+                                   collector_hotkey=COLLECTOR_HOT)
+    with pytest.raises(po.ChainReadError):
+        asyncio.run(zero.alpha_price_rao(42))
+
+
+def test_the_per_extrinsic_weight_limit_is_read_from_the_runtime():
+    class Substrate(_Substrate):
+        def __init__(self, value):
+            super().__init__()
+            self.value = value
+
+        async def get_constant(self, module, name, block_hash=None):
+            assert (module, name) == ("System", "BlockWeights")
+            return SimpleNamespace(value=self.value)
+
+    weights = {"per_class": {"normal": {"max_extrinsic": {"ref_time": 2_599_892_000_000, "proof_size": 5_000}}}}
+    assert asyncio.run(_chain(Substrate(weights)).max_extrinsic_weight()) == (2_599_892_000_000, 5_000)
+    assert asyncio.run(_chain(Substrate({"per_class": {}})).max_extrinsic_weight()) is None
+
+
+@pytest.mark.parametrize("message, refused", [
+    ("Invalid Transaction", True),
+    ("Unknown Transaction Validity", True),
+    ("Priority is too low: (10 vs 20)", True),
+    ("Immediately Dropped", True),
+    ("Transaction Already Imported", False),      # in the pool: its fate is the chain's to tell
+    ("Transaction is temporarily banned", False),
+])
+def test_a_submission_the_pool_refuses_raises_pool_rejected(message, refused):
+    from async_substrate_interface.errors import SubstrateRequestException
+
+    class Substrate(_Substrate):
+        async def submit_extrinsic(self, payload, wait_for_inclusion=False, wait_for_finalization=False):
+            raise SubstrateRequestException(message)
+
+    signed = po.SignedBatch(extrinsic_hash="0xab", nonce=0, era_block=1, era_period=64, payload=object())
+    expected = po.PoolRejected if refused else SubstrateRequestException
+    with pytest.raises(expected) as raised:
+        asyncio.run(_chain(Substrate()).submit(signed))
+    assert isinstance(raised.value, po.PoolRejected) is refused
+
+
+def test_the_signer_weighs_a_batch_with_the_public_key_only():
+    asked = {}
+
+    class Subtensor:
+        def __init__(self):
+            self.substrate = self
+
+        async def compose_call(self, module, function, params):
+            return (module, function, len(params.get("calls", [])))
+
+        async def get_payment_info(self, *, call, keypair, era, nonce):
+            asked.update(call=call, keypair=keypair, era=era, nonce=nonce)
+            return {"class": "normal", "partialFee": 10, "weight": {"ref_time": 183_420_000_000, "proof_size": 9_000}}
+
+    wallet = SimpleNamespace(coldkeypub=SimpleNamespace(ss58_address=COLLECTOR), coldkey="locked")
+    signer = pc.WalletSigner(Subtensor(), wallet, netuid=81, collector_hotkey=COLLECTOR_HOT)
+    transfers = [po.Transfer(coldkey="5A", amount_rao=10, obligation_ids=("x",)),
+                 po.Transfer(coldkey="5B", amount_rao=20, obligation_ids=("y",))]
+    assert asyncio.run(signer.declared_weight(transfers, nonce=4, era_block=1000, era_period=64)) == (
+        183_420_000_000, 9_000)
+    assert asked == {"call": ("Utility", "batch_all", 2), "keypair": wallet.coldkeypub,
+                     "era": {"period": 64, "current": 1000}, "nonce": 4}

@@ -93,8 +93,8 @@ Then:
 The defaults are the approved ones:
 - obligations due J+2 at 12:00 UTC, in alpha at each order's frozen rate, from the rail's first work period;
 - paid to the coldkey that owned the hotkey at the end of the work period;
-- minimum transfer, a dust floor: the rao count of the chain's `NominatorMinRequiredStake`, read as alpha (0.01 alpha on 2026-11-27), unless `--min-transfer` is given; each receipt records the floor and where it came from. The chain also refuses a transfer worth less than 0.0001 TAO (`DefaultMinTransfer`): such a transfer reverts its batch and is retried alone;
-- batches of 32;
+- the floor per destination: the chain's minimum stake, 0.002 TAO (`DefaultMinStake`), in alpha at the subnet's price at the pass (`SwapRuntimeApi.current_alpha_price`), raised by 25 % for the price to move before the transfer lands. `--min-transfer` may replace it, but no floor goes below the chain's transfer minimum, 0.0001 TAO (`DefaultMinTransfer`), at the same price and margin: the chain refuses a transfer worth less. Each receipt records the floor in alpha and in TAO, where it came from, the price and where it was read; the dry run prints them;
+- batches of at most 16 transfers, never more than 28 (the most a `batch_all` of `transfer_stake` fits at runtime spec 497; `--batch-size` above is refused). Each batch is also cut to what its declared weight lets through the runtime's per-extrinsic limit, read before signing;
 - reserve 0.
 
 ## When a command stops (exit code 3)
@@ -102,6 +102,7 @@ The defaults are the approved ones:
 It says why, and sends nothing:
 
 - **A batch or burn sent earlier may still land.** Wait, and run again later.
+- **The node refused a batch or burn into its pool** (for example, the collector has no TAO left for fees). It was never sent: its obligations are due again at once, and no attempt is counted. Fix the cause, then run again.
 - **The chain could not be read.** Run again; nothing was settled on the bad read.
 - **The collector's nonce is not the one the journal expects.** The collector's key signed something the journal did not (or the journal is not the one that paid). Find what took the nonce, read-only:
   ```

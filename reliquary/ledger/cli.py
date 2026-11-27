@@ -39,7 +39,6 @@ DEFAULT_JOURNAL = "~/.reliquary/payout/journal.sqlite"
 DEFAULT_RECEIPTS = "~/.reliquary/payout/receipts"
 # The approved terms of a pass (J+2, 12:00 UTC, no extra hold): the only ones an execution pays at.
 APPROVED_TERMS = {"lag_days": 2, "pay_at": "12:00", "hold_hours": 0.0}
-MIN_TRANSFER_SOURCE_CHAIN = "the rao count of the chain's NominatorMinRequiredStake, read as alpha"
 
 
 @ledger_app.callback()
@@ -295,8 +294,14 @@ def pay_command(
                                                              "are read at the blocks obligations were earned in)"),
     netuid: int = typer.Option(81, "--netuid"),
     min_transfer: float = typer.Option(None, "--min-transfer", help="alpha a destination must be owed in all to "
-                                                                    f"be paid; default: {MIN_TRANSFER_SOURCE_CHAIN}"),
-    batch_size: int = typer.Option(32, "--batch-size", help="transfers per batch_all"),
+                                                                    "be paid; default: the chain's minimum stake "
+                                                                    "(DefaultMinStake, 0.002 TAO) in alpha at the "
+                                                                    "subnet price, +25 %. Never below the chain's "
+                                                                    "transfer minimum (DefaultMinTransfer, 0.0001 TAO) "
+                                                                    "at that price"),
+    batch_size: int = typer.Option(16, "--batch-size", help="transfers per batch_all, at most 28 (runtime spec 497); "
+                                                            "a batch is also cut to the runtime's per-extrinsic "
+                                                            "weight"),
     reserve: float = typer.Option(0.0, "--reserve", help="alpha of the collector's stake never paid out"),
     era_period: int = typer.Option(64, "--era-period", help="blocks a signed batch stays valid (power of two)"),
     assume_collector: list[str] = typer.Option([], "--assume-collector", help="dry run only: plan TASK as if it "
@@ -346,6 +351,11 @@ def pay_command(
     now = _parse_instant(as_of)
     terms = PayTerms(lag_days=lag_days, pay_at_seconds=_parse_clock(pay_at), hold_seconds=hold_hours * 3600)
     day = date.fromisoformat(pay_day) if pay_day else pass_day(now, terms)
+    from reliquary.ledger.payout import MAX_BATCH_SIZE
+
+    if not 1 <= batch_size <= MAX_BATCH_SIZE:
+        raise typer.BadParameter(f"--batch-size is from 1 to {MAX_BATCH_SIZE}: a batch_all of more transfer_stake "
+                                 f"calls exceeds the runtime's per-extrinsic weight (spec 497)")
     for name, value in (("--min-transfer", min_transfer), ("--reserve", reserve)):
         if value is not None and (not math.isfinite(value) or value < 0):
             raise typer.BadParameter(f"{name} must be a finite alpha amount >= 0")
@@ -384,10 +394,6 @@ async def collect_payout(*, now: float, pay_day: date, terms, archives: str, pri
     subtensor = await _subtensor(network)
     journal = None
     try:
-        if min_transfer_rao is None:
-            min_transfer_rao, min_source = await _min_transfer_rao(subtensor), MIN_TRANSFER_SOURCE_CHAIN
-        else:
-            min_source = "--min-transfer"
         config = PayoutConfig(netuid=netuid, collector_coldkey=collector_coldkey, collector_hotkey=collector_hotkey,
                               min_transfer_rao=min_transfer_rao, batch_size=batch_size, reserve_rao=reserve_rao,
                               era_period=era_period)
@@ -409,7 +415,6 @@ async def collect_payout(*, now: float, pay_day: date, terms, archives: str, pri
                 write_receipt(partial, receipts)
                 journal.mark_receipted(partial["reported_batch_ids"])
             raise
-        receipt["min_transfer_source"] = min_source
         receipt["sources"] = {**used, "as_of_supplied": as_of_supplied, "journal": str(journal_path)}
         path = write_receipt(receipt, receipts)
         if execute:
@@ -857,8 +862,10 @@ def render_payout(receipt) -> str:
         lines.append(f"  stake {alpha(receipt['collector_stake_rao'])} alpha at block {receipt['finalized_block']}, "
                      f"in flight {alpha(receipt['in_flight_rao'])}, available {alpha(receipt['available_rao'])}; "
                      f"nonce {nonce.get('chain')} on chain, {nonce.get('journal')} expected by the journal")
-        lines.append(f"  floor {alpha(receipt['min_transfer_rao'])} alpha per destination "
-                     f"({receipt.get('min_transfer_source', 'given')}), batches of {receipt['batch_size']}")
+        lines.append(f"  floor {alpha(receipt['min_transfer_rao'])} alpha per destination = "
+                     f"{receipt['min_transfer_tao']:.9f} TAO at {receipt['alpha_price_tao']:.9f} TAO per alpha "
+                     f"({receipt['min_transfer_source']}; price: {receipt['alpha_price_source']}); batches of at "
+                     f"most {receipt['batch_size']}")
         lines.append(f"  due {receipt['due']['obligations']} ({alpha(receipt['due']['rao'])} alpha); paid by the "
                      f"weights, never here: {receipt['native_rail']['obligations']} "
                      f"({alpha(receipt['native_rail']['rao'])})")
@@ -903,10 +910,6 @@ def _wallet_signer(subtensor, *, wallet_name: str, wallet_path: str | None, netu
 
     wallet = bt.Wallet(name=wallet_name, path=wallet_path) if wallet_path else bt.Wallet(name=wallet_name)
     return WalletSigner(subtensor, wallet, netuid=netuid, collector_hotkey=collector_hotkey)
-
-
-async def _min_transfer_rao(subtensor) -> int:
-    return int((await asyncio.wait_for(subtensor.get_minimum_required_stake(), timeout=120.0)).rao)
 
 
 def _with_first_seen(item, first_seen: dict[str, float]):

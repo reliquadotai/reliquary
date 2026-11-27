@@ -13,9 +13,17 @@ How: one ``transfer_stake`` per destination coldkey, the coldkey that owned
 the hotkey at the end of the obligation's work period (noted in the journal
 when first reserved, and kept for retries); it moves the collector's alpha
 stake on its own hotkey to that coldkey, on the same subnet. At most
-``batch_size`` of them go in one ``Utility.batch_all`` (all or nothing). A
-destination owed less than ``min_transfer_rao`` in all waits for a later pass:
-its obligations stay due and add up.
+``batch_size`` of them (16 by default, never more than ``MAX_BATCH_SIZE``) go
+in one ``Utility.batch_all`` (all or nothing), fewer when the batch's declared
+weight would not fit the runtime's per-extrinsic limit. A node that refuses a
+batch into its pool never sent it: its obligations are due again at once.
+
+The floor: a destination owed less than the chain's minimum stake
+(``DefaultMinStake``, 0.002 TAO) in alpha at the subnet's price at the pass,
+raised by a margin for price drift, waits for a later pass: its obligations
+stay due and add up. An explicit floor may replace it, but never below the
+chain's transfer minimum (``DefaultMinTransfer``, 0.0001 TAO, under which the
+chain refuses a transfer), at the same price and margin.
 
 Once each: the journal (SQLite, one payer at a time) keeps every obligation
 past ``due`` with the amount and destination it was first reserved with (a
@@ -80,10 +88,12 @@ import logging
 import sqlite3
 import time
 import uuid
+import math
 from collections import Counter, defaultdict
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
+from fractions import Fraction
 from pathlib import Path
 from typing import Protocol
 
@@ -104,7 +114,19 @@ from reliquary.ledger.obligations import (
 logger = logging.getLogger(__name__)
 
 PAYOUT_RECEIPT_SCHEMA = "reliquary/payout-receipt/v1"
-DEFAULT_BATCH_SIZE = 32
+DEFAULT_BATCH_SIZE = 16
+# The most transfer_stake calls one batch_all may hold at runtime spec 497: each declares about 91.7 ms of
+# weight (its 256-hotkey staking walk bound included), and a Normal extrinsic may weigh about 2.6 s.
+MAX_BATCH_SIZE = 28
+# A batch's declared weight must stay under this share of the runtime's per-extrinsic limit.
+WEIGHT_HEADROOM = Fraction(9, 10)
+# The chain's minimum stake (DefaultMinStake) and its minimum transfer value (DefaultMinTransfer: a transfer
+# worth less at the current alpha price is refused), in TAO rao (subtensor runtime lib.rs:1038-1039; the
+# transfer check in stake_utils.rs:1591-1596).
+DEFAULT_MIN_STAKE_TAO_RAO = 2_000_000
+DEFAULT_MIN_TRANSFER_TAO_RAO = 100_000
+# What a floor converted at the pass's price is raised by, for the price to move before the transfer lands.
+DEFAULT_PRICE_MARGIN = 0.25
 # Blocks a signed batch stays valid (a power of two, as mortal eras are).
 DEFAULT_ERA_PERIOD = 64
 # A coldkey whose transfers failed on chain this many times (the chain refuses
@@ -173,32 +195,76 @@ class ChainReadError(PayoutError):
     empty default, a block that cannot be fetched): nothing is settled on it."""
 
 
+class PoolRejected(PayoutError):
+    """The node refused a signed batch into its transaction pool: it was never
+    imported, so never gossiped, and can never land. Its obligations are due
+    again at once."""
+
+
 @dataclass(frozen=True, slots=True)
 class PayoutConfig:
     netuid: int
     collector_coldkey: str
     collector_hotkey: str
-    min_transfer_rao: int
+    # The floor per destination in alpha rao, given; None: the chain's minimum stake at the pass's price
+    # (``transfer_floor``). Either way never below the chain's transfer minimum.
+    min_transfer_rao: int | None = None
     batch_size: int = DEFAULT_BATCH_SIZE
     reserve_rao: int = 0
     era_period: int = DEFAULT_ERA_PERIOD
+    price_margin: float = DEFAULT_PRICE_MARGIN
 
     def __post_init__(self) -> None:
-        for name in ("netuid", "min_transfer_rao", "batch_size", "reserve_rao", "era_period"):
+        for name in ("netuid", "batch_size", "reserve_rao", "era_period"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{name} must be a whole number >= 0, got {value!r}")
-        if self.batch_size < 1:
-            raise ValueError("batch_size must be at least 1")
+        given = self.min_transfer_rao
+        if given is not None and (isinstance(given, bool) or not isinstance(given, int) or given < 0):
+            raise ValueError(f"min_transfer_rao must be None or a whole number >= 0, got {given!r}")
+        if not 1 <= self.batch_size <= MAX_BATCH_SIZE:
+            raise ValueError(f"batch_size must be from 1 to {MAX_BATCH_SIZE} (the most a batch_all of transfers "
+                             f"may hold at runtime spec 497), got {self.batch_size}")
         if self.era_period < 4 or self.era_period & (self.era_period - 1):
             raise ValueError(f"era_period must be a power of two of at least 4, got {self.era_period}")
+        margin = self.price_margin
+        if isinstance(margin, bool) or not isinstance(margin, (int, float)) or not 0.0 <= margin <= 10.0:
+            raise ValueError(f"price_margin must be a number from 0 to 10, got {margin!r}")  # NaN fails too
         if not self.collector_coldkey or not self.collector_hotkey:
             raise ValueError("the collector's coldkey and hotkey are both needed")
 
     def to_dict(self) -> dict:
         return {"netuid": self.netuid, "collector_coldkey": self.collector_coldkey,
-                "collector_hotkey": self.collector_hotkey, "min_transfer_rao": self.min_transfer_rao,
-                "batch_size": self.batch_size, "reserve_rao": self.reserve_rao, "era_period": self.era_period}
+                "collector_hotkey": self.collector_hotkey, "min_transfer_given_rao": self.min_transfer_rao,
+                "batch_size": self.batch_size, "reserve_rao": self.reserve_rao, "era_period": self.era_period,
+                "price_margin": self.price_margin}
+
+
+def alpha_worth(tao_rao: int, price_rao: int, margin: float) -> int:
+    """The alpha rao worth ``tao_rao`` TAO rao at ``price_rao`` (TAO rao per
+    alpha), raised by ``margin``, rounded up: exact."""
+    if isinstance(price_rao, bool) or not isinstance(price_rao, int) or price_rao <= 0:
+        raise ChainReadError(f"the alpha price must be a positive number of TAO rao, got {price_rao!r}")
+    return math.ceil(Fraction(int(tao_rao)) * (1 + Fraction(str(margin))) * RAO_PER_ALPHA / price_rao)
+
+
+def transfer_floor(given_rao: int | None, price_rao: int, margin: float) -> dict:
+    """The floor per destination at a pass, in alpha rao, and where it came
+    from: the chain's minimum stake (``DEFAULT_MIN_STAKE_TAO_RAO``) at
+    ``price_rao`` raised by ``margin``, or ``given_rao``; never below the
+    chain's transfer minimum at the same price and margin."""
+    minimum = alpha_worth(DEFAULT_MIN_TRANSFER_TAO_RAO, price_rao, margin)
+    if given_rao is None:
+        floor = alpha_worth(DEFAULT_MIN_STAKE_TAO_RAO, price_rao, margin)
+        source = f"the chain's minimum stake (DefaultMinStake, 0.002 TAO) at the subnet price, +{margin:.0%}"
+    else:
+        floor, source = int(given_rao), "--min-transfer"
+    if floor < minimum:
+        floor = minimum
+        source += (f", raised to the chain's transfer minimum (DefaultMinTransfer, 0.0001 TAO) at the subnet "
+                   f"price, +{margin:.0%}")
+    return {"alpha_rao": floor, "tao": float(Fraction(floor * price_rao, RAO_PER_ALPHA * RAO_PER_ALPHA)),
+            "source": source, "chain_transfer_minimum_rao": minimum}
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,6 +322,10 @@ class PayoutChain(Protocol):
 
     async def find_extrinsic(self, extrinsic_hash: str, first_block: int, last_block: int) -> Inclusion | None: ...
 
+    async def alpha_price_rao(self, block: int) -> int: ...
+
+    async def max_extrinsic_weight(self) -> tuple[int, int | None] | None: ...
+
     async def submit(self, signed: SignedBatch) -> None: ...
 
 
@@ -266,6 +336,8 @@ class Signer(Protocol):
                    era_period: int) -> SignedBatch: ...
 
     async def sign_burn(self, amount_rao: int, *, nonce: int, era_block: int, era_period: int) -> SignedBatch: ...
+    async def declared_weight(self, transfers: Sequence[Transfer], *, nonce: int, era_block: int,
+                              era_period: int) -> tuple[int, int | None]: ...
 
 
 # -- the journal ---------------------------------------------------------------------------------------------------
@@ -1035,10 +1107,16 @@ async def send_batch(journal: Journal, chain: PayoutChain, config: PayoutConfig,
                      sleep) -> tuple[dict, bool]:
     """Keep a reserved batch's hash, send it, and read its fate from the chain
     until it is known or ``wait_seconds`` pass. Returns (its receipt entry,
-    whether its fate is known)."""
+    whether its fate is known). A batch the node refuses into its pool was
+    never sent: it is released at once (``expired``), its obligations due
+    again, no attempt counted."""
     journal.mark_submitted(batch_id, signed)
     try:
         await chain.submit(signed)
+    except PoolRejected as exc:
+        detail = f"refused by the node's transaction pool, never sent: {exc}"
+        journal.mark_released(batch_id, BATCH_EXPIRED, detail)
+        return {**_batch_receipt(journal.batch(batch_id), BATCH_EXPIRED, None, detail), "refused_by_pool": True}, True
     except Exception as exc:  # noqa: BLE001 - the send's fate is read from the chain, never assumed
         logger.warning("batch %s: send raised %r; reading the chain for its fate", batch_id, exc)
     deadline = clock() + wait_seconds
@@ -1051,6 +1129,34 @@ async def send_batch(journal: Journal, chain: PayoutChain, config: PayoutConfig,
             return _batch_receipt(batch, state, None, f"not final after {wait_seconds:.0f} s ({detail}): the next "
                                                     "pass settles it"), False
         await sleep(poll_seconds)
+
+
+def _fits(weight: tuple[int, int | None], limit: tuple[int, int | None]) -> bool:
+    for used, most in zip(weight, limit):
+        if used is not None and most is not None and Fraction(int(used)) > WEIGHT_HEADROOM * int(most):
+            return False
+    return True
+
+
+async def fit_batch(group: Sequence[Transfer], signer: Signer, limit: tuple[int, int | None] | None, *,
+                    nonce: int, era_block: int, era_period: int) -> tuple[list[Transfer], tuple | None]:
+    """The longest head of ``group`` whose ``batch_all`` the runtime would
+    admit: its declared weight (``Signer.declared_weight``, the node's fee
+    query of the unsigned batch) under ``WEIGHT_HEADROOM`` of the per-extrinsic
+    limit, in every dimension. Returns (that head, its declared weight); one
+    transfer at least, even over the limit (the node then refuses it, and it
+    is never sent)."""
+    group = list(group)
+    measure = getattr(signer, "declared_weight", None)
+    if measure is None or limit is None:
+        return group, None
+    while True:
+        weight = await measure(group, nonce=nonce, era_block=era_block, era_period=era_period)
+        if len(group) == 1 or _fits(weight, limit):
+            return group, weight
+        shrink = min(Fraction(int(most)) * WEIGHT_HEADROOM / int(used)
+                     for used, most in zip(weight, limit) if used and most is not None)
+        group = group[:max(1, min(len(group) - 1, math.floor(len(group) * shrink)))]
 
 
 async def _pass(obligations: Iterable[Obligation], *, journal: Journal, chain: PayoutChain, config: PayoutConfig,
@@ -1079,7 +1185,17 @@ async def _pass(obligations: Iterable[Obligation], *, journal: Journal, chain: P
     head, expected = await check_journal(journal, chain, config, receipt, pending=pending, unreadable=unreadable)
     owner_coldkey = await check_collector(chain, config, receipt, head)
 
-    # 2. What is due at this pass and the collector pays.
+    # 2. The floor per destination, at the subnet's price at this head.
+    price = await chain.alpha_price_rao(head)
+    floor = transfer_floor(config.min_transfer_rao, price, config.price_margin)
+    receipt.update({"min_transfer_rao": floor["alpha_rao"], "min_transfer_tao": floor["tao"],
+                    "min_transfer_source": floor["source"],
+                    "chain_transfer_minimum_rao": floor["chain_transfer_minimum_rao"],
+                    "alpha_price_rao": price, "alpha_price_tao": price / RAO_PER_ALPHA,
+                    "alpha_price_source": f"SwapRuntimeApi.current_alpha_price({config.netuid}) at finalized block "
+                                          f"{head}"})
+
+    # 3. What is due at this pass and the collector pays.
     due = [o for o in obligations if o.due_at <= at and state_at(o, now) == DUE]
     native = [o for o in due if o.task_id not in rails or o.work_period < rails[o.task_id]]
     mine = [o for o in due if o.task_id in rails and o.work_period >= rails[o.task_id]]
@@ -1105,7 +1221,7 @@ async def _pass(obligations: Iterable[Obligation], *, journal: Journal, chain: P
     available = max(0, stake - in_flight - config.reserve_rao)
     by_id = {o.obligation_id: o for o in payable}
     transfers, deferred, unfunded = plan_transfers([(o, found[o.obligation_id]) for o in payable],
-                                                   available_rao=available, min_transfer_rao=config.min_transfer_rao)
+                                                   available_rao=available, min_transfer_rao=floor["alpha_rao"])
     alone = {t.coldkey for t in transfers if tried.get(t.coldkey, 0) > 0}
     digest = plan_digest(transfers)
     receipt.update({
@@ -1131,20 +1247,32 @@ async def _pass(obligations: Iterable[Obligation], *, journal: Journal, chain: P
                               f"{planned} --confirm-plan {digest}")
         return _close(receipt)
 
-    # 3. Pay: one batch at a time, each final before the next takes the following nonce.
+    # 4. Pay: one batch at a time, each final before the next takes the following nonce. A shared batch holds
+    # at most ``batch_size`` transfers, fewer when its declared weight would not fit the runtime's limit.
     coldkeys = {oid: t.coldkey for t in transfers for oid in t.obligation_ids}
-    for group in batches_of(transfers, config.batch_size, alone=alone):
+    shared = [t for t in transfers if t.coldkey not in alone]
+    solo = [t for t in transfers if t.coldkey in alone]
+    limit = await chain.max_extrinsic_weight()
+    receipt["max_extrinsic_weight"] = None if limit is None else list(limit)
+    while shared or solo:
         tip = await chain.finalized_block()
         nonce = await chain.collector_nonce(tip)
         if nonce != expected:
             receipt["stopped"] = (f"the collector's nonce is {nonce} at block {tip}; this journal expects {expected}: "
                                   "another extrinsic was signed with the collector's key. Nothing more is sent")
             break
+        if shared:
+            group, weight = await fit_batch(shared[:config.batch_size], signer, limit, nonce=nonce, era_block=tip,
+                                            era_period=config.era_period)
+            shared = shared[len(group):]
+        else:
+            group, weight = [solo.pop(0)], None
         batch_id = f"{pass_day.isoformat()}-{uuid.uuid4().hex[:12]}"
         journal.reserve(batch_id, pass_day, group, by_id, coldkeys)
         signed = await signer.sign(group, nonce=nonce, era_block=tip, era_period=config.era_period)
         entry, known = await send_batch(journal, chain, config, batch_id, signed, wait_seconds=wait_seconds,
                                         poll_seconds=poll_seconds, clock=clock, sleep=sleep)
+        entry["declared_weight"] = None if weight is None else list(weight)
         receipt["batches"].append(entry)
         if not known:
             receipt["stopped"] = f"batch {batch_id} {entry['detail']}"
@@ -1153,6 +1281,10 @@ async def _pass(obligations: Iterable[Obligation], *, journal: Journal, chain: P
             expected = nonce + 1
         if entry["state"] in NEEDS_PERSON:
             receipt["stopped"] = entry["detail"]
+            break
+        if entry.get("refused_by_pool"):
+            receipt["stopped"] = (f"batch {batch_id} was {entry['detail']}; its obligations are due again. Nothing "
+                                  "more is sent this pass")
             break
     return _close(receipt, await stake_after(chain))
 
@@ -1254,14 +1386,17 @@ __all__ = [
     "MAX_ATTEMPTS",
     "MODE_DRY_RUN",
     "MODE_EXECUTE",
+    "MAX_BATCH_SIZE",
     "NEEDS_PERSON",
     "PAYOUT_RECEIPT_SCHEMA",
+    "PoolRejected",
     "PayoutChain",
     "PayoutConfig",
     "PayoutError",
     "SignedBatch",
     "Signer",
     "Transfer",
+    "alpha_worth",
     "batches_of",
     "burned_rao",
     "check_collector",
@@ -1269,6 +1404,7 @@ __all__ = [
     "close_receipt",
     "collector_rails",
     "destinations",
+    "fit_batch",
     "incomplete_receipt",
     "plan_digest",
     "plan_transfers",
@@ -1279,5 +1415,6 @@ __all__ = [
     "run_pass",
     "send_batch",
     "stake_after",
+    "transfer_floor",
     "write_receipt",
 ]

@@ -51,6 +51,8 @@ class FakeChain:
         self.subnet = ("5Owner", "5OwnerHot")
         self.bad_nonce_reads = 0      # how many nonce reads come back as an RPC error decodes them
         self.unreadable_blocks = False
+        self.price_rao = 5_000_000    # 0.005 TAO per alpha
+        self.max_weight = None        # the runtime's per-extrinsic limit; None: batches are not sized by weight
         self.blocks: dict[int, list[tuple[str, po.Inclusion]]] = {}
         self.submitted: list[po.SignedBatch] = []
         self.on_submit = on_submit
@@ -72,6 +74,12 @@ class FakeChain:
     async def subnet_owner(self, block):
         return self.subnet
 
+    async def alpha_price_rao(self, block):
+        return self.price_rao
+
+    async def max_extrinsic_weight(self):
+        return self.max_weight
+
     async def hotkey_owner(self, hotkey, block):
         owner = self.owners.get(hotkey)
         return owner(block) if callable(owner) else owner
@@ -91,6 +99,8 @@ class FakeChain:
 
     async def submit(self, signed):
         self.submitted.append(signed)
+        if self.on_submit == "reject":
+            raise po.PoolRejected("Invalid Transaction")    # the node's pool refused it: never imported
         if self.refuse and isinstance(signed.payload, list) and any(t.coldkey in self.refuse for t in signed.payload):
             self.land(signed, success=False)    # the chain refuses one destination: the whole batch_all reverts
             return
@@ -139,9 +149,15 @@ class FakeChain:
 
 class FakeSigner:
     coldkey = COLLECTOR
+    weight_per_transfer = 100
 
     def __init__(self):
         self.signed = []
+        self.weighed = []
+
+    async def declared_weight(self, transfers, *, nonce, era_block, era_period):
+        self.weighed.append(len(transfers))
+        return self.weight_per_transfer * len(transfers), None
 
     async def sign(self, transfers, *, nonce, era_block, era_period):
         body = json.dumps([[t.coldkey, t.amount_rao, list(t.obligation_ids)] for t in transfers] + [nonce, era_block])
@@ -160,7 +176,7 @@ class FakeSigner:
 
 def _config(**overrides):
     values = {"netuid": 81, "collector_coldkey": COLLECTOR, "collector_hotkey": COLLECTOR_HOT,
-              "min_transfer_rao": 0, "batch_size": 32, "reserve_rao": 0, "era_period": 64}
+              "min_transfer_rao": 0, "batch_size": 16, "reserve_rao": 0, "era_period": 64}
     values.update(overrides)
     return po.PayoutConfig(**values)
 
@@ -521,7 +537,8 @@ def test_a_receipt_is_written_beside_earlier_ones_never_over_them(tmp_path, jour
     assert first != second and json.loads(first.read_text())["schema"] == po.PAYOUT_RECEIPT_SCHEMA
 
 
-@pytest.mark.parametrize("bad", [{"era_period": 63}, {"batch_size": 0}, {"min_transfer_rao": -1},
+@pytest.mark.parametrize("bad", [{"era_period": 63}, {"batch_size": 0}, {"batch_size": 29}, {"min_transfer_rao": -1},
+                                 {"price_margin": -0.1}, {"price_margin": float("nan")}, {"min_transfer_rao": True},
                                  {"collector_hotkey": ""}])
 def test_a_payout_config_out_of_range_is_refused(bad):
     with pytest.raises(ValueError):
@@ -561,12 +578,8 @@ def test_ledger_pay_is_a_dry_run_by_default(tmp_path, monkeypatch):
     async def fake_subtensor(network):
         return _Subtensor()
 
-    async def fake_min(subtensor):
-        return 0
-
     monkeypatch.setattr(cli, "_subtensor", fake_subtensor)
     monkeypatch.setattr(cli, "_payout_chain", lambda subtensor, **kwargs: chain)
-    monkeypatch.setattr(cli, "_min_transfer_rao", fake_min)
     journal = tmp_path / "journal.sqlite"
     args = ["pay", "--collector-coldkey", COLLECTOR, "--collector-hotkey", COLLECTOR_HOT, "--journal", str(journal),
             "--receipts", str(tmp_path / "receipts"), "--archives", str(tmp_path / "archives"),
@@ -807,12 +820,8 @@ def test_ledger_pay_keeps_its_journal_and_receipts_in_one_documented_place(tmp_p
     async def fake_subtensor(network):
         return _Subtensor()
 
-    async def fake_min(subtensor):
-        return 0
-
     monkeypatch.setattr(cli, "_subtensor", fake_subtensor)
     monkeypatch.setattr(cli, "_payout_chain", lambda subtensor, **kwargs: chain)
-    monkeypatch.setattr(cli, "_min_transfer_rao", fake_min)
     result = CliRunner().invoke(cli.ledger_app, [
         "pay", "--collector-coldkey", COLLECTOR, "--collector-hotkey", COLLECTOR_HOT,
         "--archives", str(tmp_path / "archives"), "--assume-collector", PAID, "--as-of", "2026-11-28T12:05:00"])
@@ -1143,3 +1152,100 @@ def test_settle_needs_an_explicit_landed_or_not_and_evidence(tmp_path, journal):
     cleared = CliRunner().invoke(cli.ledger_app, ["clear-held", "--coldkey", "5ColdA", "--evidence", "fixed",
                                                   "--journal", str(journal.path)])
     assert cleared.exit_code == 0 and "0 obligation(s) cleared" in cleared.output
+
+
+# -- the floor: the chain's minimum stake at the subnet's price, never below its transfer minimum -------------------------
+
+
+def _owed(alpha):
+    """The share of a period that owes ``alpha`` at the frozen rate E."""
+    return alpha / E
+
+
+def test_the_default_floor_is_the_chain_minimum_stake_at_the_subnet_price(journal):
+    obligations = _ledger({PAID: {"5A": _owed(0.4), "5B": _owed(0.6)}})
+    chain = FakeChain(stake_rao=10**12, owners=OWNERS)
+    receipt = _pass(obligations, journal, chain, config=_config(min_transfer_rao=None))
+    # 0.002 TAO at 0.005 TAO per alpha is 0.4 alpha; +25 % for the price to move: 0.5 alpha.
+    assert receipt["min_transfer_rao"] == 500_000_000 and receipt["min_transfer_tao"] == pytest.approx(0.0025)
+    assert receipt["alpha_price_rao"] == 5_000_000 and receipt["alpha_price_tao"] == 0.005
+    assert "DefaultMinStake" in receipt["min_transfer_source"] and "current_alpha_price" in receipt["alpha_price_source"]
+    assert receipt["chain_transfer_minimum_rao"] == 25_000_000          # 0.0001 TAO, +25 %
+    assert [t["coldkey"] for b in receipt["batches"] for t in b["transfers"]] == ["5ColdB"]
+    assert receipt["deferred_below_minimum"]["obligations"] == 1 and receipt["min_transfer_given_rao"] is None
+    # The price doubles: the same 0.4 alpha is now worth enough.
+    chain.price_rao = 10_000_000
+    later = _pass(obligations, journal, chain, config=_config(min_transfer_rao=None))
+    assert later["min_transfer_rao"] == 250_000_000 and later["paid"]["transfers"] == 1
+
+
+def test_no_floor_given_goes_below_the_chains_transfer_minimum(journal):
+    obligations = _ledger({PAID: {"5A": _owed(0.02), "5B": _owed(0.03)}})
+    chain = FakeChain(stake_rao=10**12, owners=OWNERS)
+    receipt = _pass(obligations, journal, chain, config=_config(min_transfer_rao=0))
+    # 0.02 alpha is worth exactly 0.0001 TAO: under the chain's minimum once the margin is counted, never sent.
+    assert receipt["min_transfer_rao"] == 25_000_000 and "raised to the chain's transfer minimum" in \
+        receipt["min_transfer_source"]
+    assert [t["coldkey"] for b in receipt["batches"] for t in b["transfers"]] == ["5ColdB"]
+    assert po.transfer_floor(10**9, 5_000_000, 0.25)["alpha_rao"] == 10**9          # a higher floor is kept
+
+
+def test_the_floor_is_exact_and_a_price_that_cannot_be_read_stops_the_pass(journal):
+    assert po.alpha_worth(2_000_000, 3, 0.25) == -(-2_000_000 * 5 * 10**9 // (4 * 3))       # rounded up, exact
+    for bad in (0, -1, None, 1.5):
+        with pytest.raises(po.ChainReadError):
+            po.alpha_worth(2_000_000, bad, 0.25)
+    chain = FakeChain(stake_rao=10**12, owners=OWNERS)
+    chain.price_rao = 0
+    with pytest.raises(po.ChainReadError):
+        _pass(_ledger({PAID: {"5A": 0.01}}), journal, chain)
+    assert chain.submitted == []
+
+
+# -- batches: at most 16 by default, cut to the runtime's weight; a pool refusal is never sent -----------------------------
+
+
+def test_batches_are_cut_to_the_runtimes_per_extrinsic_weight(journal):
+    hotkeys = {f"5H{i:02d}": 0.001 * (i + 1) for i in range(20)}
+    obligations = _ledger({PAID: hotkeys})
+    chain = FakeChain(stake_rao=10**13, owners={hk: f"5Cold{hk}" for hk in hotkeys})
+    chain.max_weight = (1_000, None)            # 100 per transfer: nine fit under 90 % of the limit
+    signer = FakeSigner()
+    receipt = _pass(obligations, journal, chain, signer=signer)
+    assert [len(b["transfers"]) for b in receipt["batches"]] == [9, 9, 2]
+    assert [b["declared_weight"] for b in receipt["batches"]] == [[900, None], [900, None], [200, None]]
+    assert signer.weighed == [16, 9, 11, 9, 2] and receipt["paid"]["transfers"] == 20
+    assert receipt["max_extrinsic_weight"] == [1_000, None] and [s.nonce for s in chain.submitted] == [0, 1, 2]
+
+
+def test_a_batch_size_above_the_runtimes_cap_is_refused():
+    assert po.DEFAULT_BATCH_SIZE == 16 and po.MAX_BATCH_SIZE == 28
+    _config(batch_size=28)
+    with pytest.raises(ValueError):
+        _config(batch_size=29)
+
+
+def test_a_batch_the_nodes_pool_refuses_was_never_sent(journal):
+    obligations = _ledger({PAID: {"5A": 0.01, "5B": 0.02}})
+    chain = FakeChain(stake_rao=10**12, owners=OWNERS, on_submit="reject")
+    head = chain.head
+    receipt = _pass(obligations, journal, chain, wait_seconds=600.0)
+    (batch,) = receipt["batches"]
+    # Released at once: no waiting out the window, no attempt counted, nothing more sent this pass.
+    assert batch["state"] == po.BATCH_EXPIRED and "refused by the node's transaction pool" in batch["detail"]
+    assert chain.head == head and "due again" in receipt["stopped"]
+    rows = journal.rows(o.obligation_id for o in obligations)
+    assert {r["state"] for r in rows.values()} == {ob.DUE} and {r["attempts"] for r in rows.values()} == {0}
+    chain.on_submit = "include"
+    paid = _pass(obligations, journal, chain)
+    assert paid["paid"]["transfers"] == 2 and [s.nonce for s in chain.submitted] == [0, 0]
+
+
+def test_ledger_pay_refuses_a_batch_size_above_the_cap(tmp_path):
+    from typer.testing import CliRunner
+
+    from reliquary.ledger import cli
+
+    result = CliRunner().invoke(cli.ledger_app, ["pay", "--collector-coldkey", COLLECTOR, "--collector-hotkey",
+                                                 COLLECTOR_HOT, "--batch-size", "29"])
+    assert result.exit_code == 2 and "28" in result.output

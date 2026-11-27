@@ -488,3 +488,12 @@ def test_collector_status_says_whether_a_tier_landed(monkeypatch):
                 ["--before", "0.9", "--fraction", "1.5"], ["--before", "0.9", "--fraction", "0.1",
                                                            "--from-fraction", "1"]):
         assert CliRunner().invoke(cli.ledger_app, base + bad).exit_code != 0, bad
+
+
+def test_a_burn_the_nodes_pool_refuses_was_never_sent(journal):
+    chain = FakeChain(stake_rao=20 * ALPHA, owners=OWNERS, on_submit="reject")
+    receipt = _burn(journal, chain)
+    assert receipt["batches"][0]["state"] == po.BATCH_EXPIRED and "nothing was burned" in receipt["stopped"]
+    assert receipt["burned"]["rao"] == 0 and journal.burned_on(date(2026, 11, 28)) == 0   # the cap is not spent
+    chain.on_submit = "include"
+    assert _burn(journal, chain)["burned"]["rao"] == 5 * ALPHA and chain.stake == 15 * ALPHA
