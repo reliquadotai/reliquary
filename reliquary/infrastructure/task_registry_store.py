@@ -25,6 +25,7 @@ from reliquary.shared.task_registry import (
     require_default_declared_first,
     retire_task,
     release_cap,
+    require_payout_rail_unchanged,
     set_cap,
     set_admission,
     validate_registry,
@@ -170,6 +171,8 @@ async def _mutate(change, *, attempts: int, **client_kwargs) -> None:
     for attempt in range(1, attempts + 1):
         entries, etag = await read_registry(**client_kwargs)
         updated = change(entries)
+        # A task's payout rail is chosen when it is added: no change may move one.
+        require_payout_rail_unchanged(entries, updated)
         try:
             await write_registry(updated, etag, **client_kwargs)
             return

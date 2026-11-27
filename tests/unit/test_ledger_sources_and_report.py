@@ -193,11 +193,11 @@ def test_the_registry_is_read_never_written(monkeypatch):
                       params=params, status="active", retired_at=None, job_id=TASK)
     body = render_registry({TASK: entry})
     client = _bucket(monkeypatch, {"reliquary/tasks/registry.json": (None, body)})
-    ceilings, pay_ceilings, floored = asyncio.run(sources.read_registry_ceilings())
-    (ceiling,) = ceilings[TASK]
+    view = asyncio.run(sources.read_registry_ceilings())
+    (ceiling,) = view.ceilings[TASK]
     assert ceiling.miner_alpha_per_period == E and ceiling.pricing == ob.PRICING_AUCTION
     assert ceiling.max_price_pool_share_per_token == pytest.approx(2.0 / 1e6 / E)
-    assert pay_ceilings == {TASK: 0.05} and floored == []
+    assert view.pay_ceilings == {TASK: 0.05} and view.floored == [] and view.collector_tasks == []
     assert all(c[0] == "get_object" for c in client.calls if not isinstance(c, str))
 
 

@@ -1711,6 +1711,19 @@ def jobs_create(
         hidden=True,
         help="Accepted and ignored: every validator now settles period-ema-v1.",
     ),
+    payout_rail: str = typer.Option(
+        "native",
+        "--payout-rail",
+        help="How the order's miners are paid, chosen now and never changed: 'native' (the weights) or "
+        "'collector' (the payer pays its obligations at J+2 from the collector's stake; the weights give it "
+        "none). Collector needs --fleet-skips-collector-rail.",
+    ),
+    fleet_skips_collector_rail: bool = typer.Option(
+        False,
+        "--fleet-skips-collector-rail",
+        help="With --payout-rail collector: confirms every validator with a permit runs a weight setter that "
+        "gives collector-rail tasks no weight; one that does not would pay the order a second time.",
+    ),
     fleet_knows_corpus_generation: bool = typer.Option(
         False,
         "--fleet-knows-corpus-generation",
@@ -1801,6 +1814,28 @@ def jobs_create(
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     del fleet_knows_period_settlement  # every validator settles period-ema-v1 now
+    if payout_rail not in ("native", "collector"):
+        typer.echo(f"error: --payout-rail is 'native' or 'collector', got {payout_rail!r}", err=True)
+        raise typer.Exit(code=2)
+    if payout_rail == "collector":
+        from dataclasses import replace as _replace
+
+        from reliquary.shared.task_registry import (
+            PAYOUT_RAIL_COLLECTOR,
+            PAYOUT_RAIL_FROM_PARAM,
+            PAYOUT_RAIL_PARAM,
+            require_fleet_knows_payout_rail,
+        )
+        from reliquary.validator import corpus_periods as _cp
+
+        # The rail starts with the task: every period it will ever work in is the collector's to pay.
+        entry = _replace(entry, params={**entry.params, PAYOUT_RAIL_PARAM: PAYOUT_RAIL_COLLECTOR,
+                                        PAYOUT_RAIL_FROM_PARAM: _cp.period_of(_time.time())})
+        try:
+            require_fleet_knows_payout_rail(entry, acknowledged=fleet_skips_collector_rail)
+        except RegistryError as exc:
+            typer.echo(f"error: {exc} Pass --fleet-skips-collector-rail.", err=True)
+            raise typer.Exit(code=1) from exc
 
     # Before either write, so a refusal leaves nothing behind. The guard is in
     # `task_registry` and does not know this CLI, so the flag is named here.
