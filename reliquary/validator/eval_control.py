@@ -556,7 +556,7 @@ class PairedAuditDispatcher:
         self._scored_items: dict[ModelKey, collections.deque] = collections.defaultdict(collections.deque)
         self._busy_spans: dict[ModelKey, collections.deque] = collections.defaultdict(collections.deque)
         # Executors the fleet may release (more live than wanted): leased nothing more, so once their leases
-        # end they are idle for good and no batch waits on a destroyed card. First contact, to pick the newest.
+        # end they are idle for good and no batch waits on a destroyed card. The oldest go (`release_beyond`).
         self._releasing: set[str] = set()
         self.reuse_only_jobs: set[str] = set()
         self._first_seen: dict[str, float] = {}
@@ -1068,25 +1068,32 @@ class PairedAuditDispatcher:
             since, busy_model = self._busy_since.pop(executor_id)
             self._busy_spans[busy_model].append((now, now - since))
 
+    def _rented_at(self, document: dict) -> tuple[float, str]:
+        """An executor's age: its registration (made when the fleet rented it), else its first contact with this
+        process. A restart of the control reorders first contacts, never registrations."""
+        at = document.get("registered_at")
+        if isinstance(at, bool) or not isinstance(at, (int, float)) or not math.isfinite(at):
+            at = self._first_seen.get(document["executor_id"], 0.0)
+        return float(at), document["executor_id"]
+
     def reusable_auditor(self, model: ModelKey, protocol: str) -> str | None:
-        """Borrow the baseline only; a surplus executor must be free to leave."""
+        """Borrow one the fleet keeps (the newest claiming ``protocol``); a releasing executor must be free to leave."""
         if self._scorers != 1:
             return None
-        live = self.live_executors(model)
-        if not live:
-            return None
-        executor = min(live, key=lambda d: (self._first_seen.get(d["executor_id"], 0.0),
-                                           d["executor_id"]))["executor_id"]
-        if executor not in self._releasing and protocol in self._protocols.get(executor, ()):
-            return executor
-        return None
+        kept = [d for d in self.live_executors(model) if d["executor_id"] not in self._releasing
+                and protocol in self._protocols.get(d["executor_id"], ())]
+        return max(kept, key=self._rented_at)["executor_id"] if kept else None
 
     def release_beyond(self, model: ModelKey, keep: int | None) -> list[str]:
-        """The newest live executors of ``model`` beyond ``keep`` (None: none), to release."""
-        live = sorted(self.live_executors(model),
-                      key=lambda d: (self._first_seen.get(d["executor_id"], 0.0), d["executor_id"]))
-        ids = [d["executor_id"] for d in live]
-        return ids[max(1, keep):] if keep is not None else []
+        """The live executors of ``model`` beyond ``keep`` (None: none), to release: the oldest of those that claim.
+        The newest that claim are kept (at least one), so once the fleet rents another image the cards of the
+        old one leave first. One still loading its model (no claim yet) is neither kept nor released: it never
+        displaces a card that serves."""
+        if keep is None:
+            return []
+        serving = sorted((d for d in self.live_executors(model) if d["executor_id"] in self._protocols),
+                         key=self._rented_at)
+        return [d["executor_id"] for d in serving[:max(0, len(serving) - max(1, keep))]]
 
     def set_releasing(self, executor_ids) -> None:
         """The executors leased nothing more: exactly these (a model no longer served keeps none)."""
@@ -3093,12 +3100,13 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                 max_executors=min(max_executors, allowed.get(model, 1)))
             wanted = sizing.update(key, target)
             entry = document["models"].setdefault(key, {"executors_needed": 0, "live_executors": len(live)})
-            entry["reusable_draw_auditor"] = dispatcher.reusable_auditor(model, AUDIT_PROTOCOL_V3)
-            # Beyond what is wanted (at least the scorers a batch needs), the newest executors lease nothing more;
+            # Beyond what is wanted (at least the scorers a batch needs), the oldest executors lease nothing more;
             # the fleet releases one only once it holds no lease (`releasing` and `idle_executors`).
             releasing = dispatcher.release_beyond(
                 model, None if wanted is None else max(wanted, dispatcher.scorers))
             released.extend(releasing)
+            reusable = dispatcher.reusable_auditor(model, AUDIT_PROTOCOL_V3)
+            entry["reusable_draw_auditor"] = None if reusable in releasing else reusable
             entry.update({"executors_allowed": min(max_executors, allowed.get(model, 1)),
                           "expected_audits": None if expected is None else round(expected),
                           "items_per_second": rate, "executors_wanted": wanted,
