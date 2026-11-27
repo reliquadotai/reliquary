@@ -22,7 +22,7 @@ import os
 import urllib.parse
 import urllib.request
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from reliquary.ledger.obligations import (
@@ -78,6 +78,21 @@ def _bucket_row(key: str, modified, prefix: str, parse_key) -> tuple[str, int, i
     return task, parsed[0], parsed[1], None if modified is None else float(modified.timestamp())
 
 
+def selected(task: str, work: int, entry: int, *, work_from: int, work_to: int | None = None,
+             entry_from: int | None = None, full_tasks: Iterable[str] = ()) -> bool:
+    """Whether to read an archive: every archive of a task in ``full_tasks`` (its
+    whole history: what is still owed never drops out of view); else one whose
+    work is in [work_from, work_to], or that entered from ``entry_from`` on (a
+    late part of older work, settled recently; ``entry_from`` defaults to
+    ``work_from``)."""
+    if task in set(full_tasks):
+        return True
+    if work >= work_from and (work_to is None or work <= work_to):
+        return True
+    entry_from = work_from if entry_from is None else entry_from
+    return work_to is None and entry >= entry_from
+
+
 class BucketArchives:
     """The period archives in the bucket, read-only."""
 
@@ -85,16 +100,17 @@ class BucketArchives:
         self._concurrency = concurrency
         self._client_kwargs = client_kwargs
 
-    async def refs(self, *, work_from: int, work_to: int | None = None,
-                   tasks: Iterable[str] | None = None) -> list[ArchiveRef]:
-        """The archives of work periods in [work_from, work_to] (all later ones
-        when ``work_to`` is None), of ``tasks`` or of every task."""
+    async def refs(self, *, work_from: int, work_to: int | None = None, tasks: Iterable[str] | None = None,
+                   entry_from: int | None = None, full_tasks: Iterable[str] = ()) -> list[ArchiveRef]:
+        """The archives ``selected`` keeps, of ``tasks`` or of every task."""
         from reliquary.infrastructure.corpus_period_store import read_period_archive
 
         wanted = None if tasks is None else {str(task) for task in tasks}
+        full = {str(task) for task in full_tasks}
         listed = [row for row in await list_bucket_archives(**self._client_kwargs)
-                  if row[1] >= work_from and (work_to is None or row[1] <= work_to)
-                  and (wanted is None or row[0] in wanted)]
+                  if (wanted is None or row[0] in wanted)
+                  and selected(row[0], row[1], row[2], work_from=work_from, work_to=work_to,
+                               entry_from=entry_from, full_tasks=full)]
         gate = asyncio.Semaphore(self._concurrency)
 
         async def one(task, work, entry, modified):
@@ -117,11 +133,12 @@ class DirectoryArchives:
     def __init__(self, root: str | os.PathLike) -> None:
         self._root = Path(root)
 
-    async def refs(self, *, work_from: int, work_to: int | None = None,
-                   tasks: Iterable[str] | None = None) -> list[ArchiveRef]:
+    async def refs(self, *, work_from: int, work_to: int | None = None, tasks: Iterable[str] | None = None,
+                   entry_from: int | None = None, full_tasks: Iterable[str] = ()) -> list[ArchiveRef]:
         from reliquary.infrastructure.corpus_period_store import parse_key
 
         wanted = None if tasks is None else {str(task) for task in tasks}
+        full = {str(task) for task in full_tasks}
         out = []
         for path in sorted(self._root.glob("*/*.json*")):
             task = path.parent.name
@@ -129,7 +146,8 @@ class DirectoryArchives:
             if parsed is None or (wanted is not None and task not in wanted):
                 continue
             work, entry = parsed
-            if work < work_from or (work_to is not None and work > work_to):
+            if not selected(task, work, entry, work_from=work_from, work_to=work_to, entry_from=entry_from,
+                            full_tasks=full):
                 continue
             raw = path.read_bytes()
             doc = json.loads(gzip.decompress(raw) if path.name.endswith(".gz") else raw)
@@ -154,16 +172,21 @@ class RegistryView:
     pay_ceilings: dict[str, float]
     floored: list[str]
     collector_tasks: list[str]
+    # Each collector-rail task's first work period on the rail.
+    collector_from: dict[str, int] = field(default_factory=dict)
+    # Whether the registry object was there at all (absent reads as no task).
+    present: bool = True
 
 
 def registry_ceilings(declared: Mapping) -> RegistryView:
     """The ``RegistryView`` of the registry's entries."""
-    from reliquary.shared.task_registry import PAYOUT_RAIL_COLLECTOR, payout_rail
+    from reliquary.shared.task_registry import PAYOUT_RAIL_COLLECTOR, payout_rail, payout_rail_from
 
     ceilings: dict[str, list[Ceiling]] = {}
     pay_ceilings: dict[str, float] = {}
     floored: list[str] = []
     collector: list[str] = []
+    collector_from: dict[str, int] = {}
     for task_id, entry in (declared or {}).items():
         params = getattr(entry, "params", None)
         if not isinstance(params, Mapping) or not cp.is_period_task(entry):
@@ -179,8 +202,10 @@ def registry_ceilings(declared: Mapping) -> RegistryView:
             floored.append(str(task_id))
         if payout_rail(params) == PAYOUT_RAIL_COLLECTOR:
             collector.append(str(task_id))
+            collector_from[str(task_id)] = int(payout_rail_from(params))
     return RegistryView(ceilings=ceilings, pay_ceilings=pay_ceilings, floored=sorted(floored),
-                        collector_tasks=sorted(collector))
+                        collector_tasks=sorted(collector), collector_from=collector_from,
+                        present=bool(declared))
 
 
 async def read_registry_ceilings(**client_kwargs) -> RegistryView:
@@ -376,9 +401,12 @@ async def read_collector_status(subtensor, netuid: int, *, collector_hotkey: str
                                 collector_coldkey: str | None = None) -> dict:
     """What the chain says now of the subnet's burn and its collector,
     read-only: ``MinerBurned`` (the share of the miners' incentive the owner's
-    hotkeys kept at the last tempo), whether stake transfers are open, and the
-    collector hotkey's UID, coldkey, incentive and emission at the last epoch,
-    with its stake when its coldkey is given."""
+    hotkeys kept at the last tempo), whether stake transfers are open, the
+    commit-reveal setting and the immunity period, and the collector hotkey's
+    UID, coldkey, registration block, incentive and emission at the last
+    epoch, with its stake when its coldkey is given. ``held_by_owner`` names
+    why the chain would keep the collector's incentive: its coldkey is the
+    subnet owner's, or it is the subnet owner hotkey."""
     from bittensor.core.chain_data.metagraph_info import SelectiveMetagraphIndex as S
 
     head = int(await _retried(subtensor.get_current_block, "the chain head"))
@@ -388,32 +416,61 @@ async def read_collector_status(subtensor, netuid: int, *, collector_hotkey: str
     bits = int(value["bits"]) if isinstance(value, Mapping) else int(value)
     toggle = await _retried(lambda: subtensor.query_subtensor("TransferToggle", params=[netuid], block=head),
                             "TransferToggle")
-    fields = [S.Hotkeys, S.Coldkeys, S.Incentives, S.Emission, S.OwnerHotkey, S.OwnerColdkey, S.LastStep]
+    fields = [S.Hotkeys, S.Coldkeys, S.Incentives, S.Emission, S.OwnerHotkey, S.OwnerColdkey, S.LastStep, S.Tempo,
+              S.ImmunityPeriod, S.CommitRevealWeightsEnabled, S.CommitRevealPeriod, S.BlockAtRegistration]
     info = await _retried(lambda: subtensor.get_metagraph_info(netuid, selected_indices=fields, block=head),
                           f"metagraph of {netuid} at block {head}")
     hotkeys = [str(h) for h in info.hotkeys]
     uid = hotkeys.index(collector_hotkey) if collector_hotkey in hotkeys else None
     coldkey = None if uid is None else str(info.coldkeys[uid])
+    owner_coldkey, owner_hotkey = str(info.owner_coldkey), str(info.owner_hotkey)
+    held = []
+    if coldkey is not None and coldkey == owner_coldkey:
+        held.append("its coldkey is the subnet owner's")
+    if collector_hotkey == owner_hotkey:
+        held.append("it is the subnet owner hotkey")
     stake = None
     if collector_coldkey:
         stake = int((await _retried(lambda: subtensor.get_stake(collector_coldkey, collector_hotkey, netuid,
                                                                 block=head), "the collector's stake")).rao)
-    return {"block": head, "netuid": int(netuid), "last_step": int(info.last_step),
+    return {"block": head, "netuid": int(netuid), "last_step": int(info.last_step), "tempo": int(info.tempo),
             "miner_burned": bits / 2**32, "transfer_toggle": bool(getattr(toggle, "value", toggle)),
+            "commit_reveal": bool(info.commit_reveal_weights_enabled),
+            "commit_reveal_period": int(info.commit_reveal_period), "immunity_period": int(info.immunity_period),
             "collector_hotkey": collector_hotkey, "uid": uid, "coldkey": coldkey,
-            "held_by_owner": None if coldkey is None else coldkey == str(info.owner_coldkey),
+            "registered_at": None if uid is None else int(info.block_at_registration[uid]),
+            "held_by_owner": held or None,
             "incentive": None if uid is None else float(info.incentives[uid]),
             "emission_alpha": None if uid is None else float(info.emission[uid]),
-            "stake_rao": stake, "owner_hotkey": str(info.owner_hotkey)}
+            "stake_rao": stake, "owner_hotkey": owner_hotkey, "owner_coldkey": owner_coldkey}
 
 
-def tier_check(before: float, fraction: float, now: float, *, tolerance: float = 0.005) -> dict:
-    """After a tier routes ``fraction`` of the unpaid share to the collector,
-    ``MinerBurned`` should fall from ``before`` to about ``before x (1 -
-    fraction)`` at the next tempo, within ``tolerance`` (half a point)."""
-    expected = before * (1.0 - fraction)
-    return {"before": before, "fraction": fraction, "expected": expected, "now": now,
-            "within": abs(now - expected) <= tolerance, "tolerance": tolerance}
+def tier_check(before: float, fraction: float, now: float, *, from_fraction: float = 0.0,
+               collector_incentive: float | None = None, tolerance: float = 0.005) -> dict:
+    """Whether a tier release moving the collector's fraction from
+    ``from_fraction`` to ``fraction`` landed, from ``MinerBurned`` read
+    ``before`` it and ``now`` (all from 0 to 1).
+
+    ``MinerBurned`` is about U x (1 - f) for an unpaid share U, so it should be
+    near ``before x (1 - fraction) / (1 - from_fraction)``, within
+    ``tolerance``; demand moves U, so this drifts. With the collector's
+    incentive, the drift-free check: the collector's part of what is unpaid,
+    ``incentive / (incentive + MinerBurned)``, should be near ``fraction``."""
+    for name, value in (("before", before), ("now", now), ("fraction", fraction), ("from_fraction", from_fraction)):
+        if not 0.0 <= float(value) <= 1.0:
+            raise ValueError(f"{name} is a share from 0 to 1, got {value!r}")
+    if from_fraction >= 1.0:
+        raise ValueError("from a fraction of 1 nothing burns: MinerBurned cannot tell a tier")
+    expected = before * (1.0 - fraction) / (1.0 - from_fraction)
+    within = abs(now - expected) <= tolerance
+    ratio = ratio_within = None
+    if collector_incentive is not None and collector_incentive + now > 0:
+        ratio = collector_incentive / (collector_incentive + now)
+        ratio_within = abs(ratio - fraction) <= max(0.002, 0.1 * fraction)
+    return {"before": before, "fraction": fraction, "from_fraction": from_fraction, "expected": expected,
+            "now": now, "within": within, "tolerance": tolerance, "collector_share": ratio,
+            "collector_share_within": ratio_within,
+            "landed": ratio_within if ratio_within is not None else within}
 
 
 async def chain_alpha_per_period(subtensor, netuid: int) -> float:
@@ -437,9 +494,10 @@ __all__ = [
     "epoch_pay_from_info",
     "http_json",
     "list_bucket_archives",
-    "read_epoch_pays",
     "read_collector_status",
+    "read_epoch_pays",
     "read_registry_ceilings",
     "registry_ceilings",
     "tier_check",
+    "selected",
 ]

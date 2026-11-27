@@ -319,3 +319,16 @@ def test_the_requeue_moves_the_queue_to_the_earliest_room():
     assert min(new.values()) == 62 and max(new.values()) <= 62 + 15 // k
     assert all(n < old for _, old, n in moves)
     assert (2, 61) not in [(w, o) for w, o, _ in moves]  # entered: untouched
+
+
+def test_a_requeued_archive_keeps_the_entry_it_was_first_settled_under():
+    from scripts.requeue_period_archives import moved_document
+
+    first = moved_document({"entry_period": 30, "rewards_by_hotkey": {"h": 0.1}}, 30, 12)
+    assert (first["entry_period"], first["replaces_entry_period"], first["origin_entry_period"]) == (12, 30, 30)
+    second = moved_document(first, 12, 11)
+    assert (second["entry_period"], second["replaces_entry_period"], second["origin_entry_period"]) == (11, 12, 30)
+    # One moved by an older script, which wrote no origin: its replaced entry is the origin.
+    legacy = moved_document({"entry_period": 12, "replaces_entry_period": 30}, 12, 11)
+    assert legacy["origin_entry_period"] == 30
+

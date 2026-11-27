@@ -1,6 +1,7 @@
 """The J+2 payer: due obligations of tasks on the collector rail are paid from
 the collector's stake by transfer_stake, each once, through crashes, dropped
-sends, failures and replays; a dry run signs nothing and writes no journal."""
+sends, failures, replays, unreadable reads, and stale or second journals; a
+dry run signs nothing and writes no journal."""
 
 from __future__ import annotations
 
@@ -46,7 +47,10 @@ class FakeChain:
 
     def __init__(self, *, stake_rao, owners, head=21_000, on_submit="include"):
         self.head, self.nonce, self.stake = head, 0, stake_rao
-        self.owners = owners
+        self.owners = {COLLECTOR_HOT: COLLECTOR, **owners}
+        self.subnet = ("5Owner", "5OwnerHot")
+        self.bad_nonce_reads = 0      # how many nonce reads come back as an RPC error decodes them
+        self.unreadable_blocks = False
         self.blocks: dict[int, list[tuple[str, po.Inclusion]]] = {}
         self.submitted: list[po.SignedBatch] = []
         self.on_submit = on_submit
@@ -60,7 +64,13 @@ class FakeChain:
         return self.stake
 
     async def collector_nonce(self, block):
+        if self.bad_nonce_reads:
+            self.bad_nonce_reads -= 1
+            return 0
         return self.nonce
+
+    async def subnet_owner(self, block):
+        return self.subnet
 
     async def hotkey_owner(self, hotkey, block):
         owner = self.owners.get(hotkey)
@@ -71,6 +81,8 @@ class FakeChain:
 
     async def find_extrinsic(self, extrinsic_hash, first_block, last_block):
         self.calls.append("find_extrinsic")
+        if self.unreadable_blocks:
+            raise po.ChainReadError(f"block {first_block} could not be fetched")
         for number in range(first_block, last_block + 1):
             for digest, inclusion in self.blocks.get(number, []):
                 if digest == extrinsic_hash:
@@ -89,7 +101,7 @@ class FakeChain:
         if self.on_submit == "raise_after_include":
             raise ConnectionError("dropped after the node had it")
 
-    def land(self, signed, *, success=True, events=None):
+    def land(self, signed, *, success=True, events=None, outcome="from success"):
         self.head += 3
         self.nonce = max(self.nonce, signed.nonce + 1)
         if isinstance(signed.payload, dict):        # a burn_alpha of the collector's stake
@@ -115,7 +127,8 @@ class FakeChain:
             self.stake -= sum(t.amount_rao for t in transfers)
         self.blocks.setdefault(self.head, []).append(
             (signed.extrinsic_hash, po.Inclusion(block_number=self.head, block_hash=f"0x{self.head:064x}",
-                                                 success=success, events=tuple(events), fee_rao=125_000,
+                                                 success=success if outcome == "from success" else outcome,
+                                                 events=tuple(events), fee_rao=125_000,
                                                  error=None if success else "{'name': 'InsufficientStake'}")))
 
     def foreign(self):
@@ -153,25 +166,32 @@ def _config(**overrides):
 
 
 def _pass(obligations, journal, chain, *, execute=True, signer=None, now=NOW, day=PASS_DAY, config=None,
-          collector=(PAID,), wait_seconds=600.0, confirm="dry run"):
-    """One pass. Executing confirms, by default, the total a dry run just
-    printed: what an operator does."""
+          collector=(PAID,), wait_seconds=600.0, confirm="dry run", plan="dry run", receipted=True):
+    """One pass. Executing confirms, by default, the total and the plan a dry
+    run just printed, and marks what its receipt reports once written: what
+    an operator (the CLI) does."""
     clock = SimpleNamespace(t=0.0)
 
     async def sleep(seconds):
         clock.t += seconds
         chain.head += 5     # time passes on the chain too
 
-    def run(execute, confirm_rao):
+    def run(execute, confirm_rao, confirm_plan):
         return asyncio.run(po.run_pass(
             obligations, journal=journal, chain=chain, config=config or _config(), collector_tasks=collector,
             pass_day=day, terms=TERMS, now=now, execute=execute,
             signer=signer or (FakeSigner() if execute else None), confirm_rao=confirm_rao,
-            wait_seconds=wait_seconds, poll_seconds=12.0, clock=lambda: clock.t, sleep=sleep))
+            confirm_plan=confirm_plan, wait_seconds=wait_seconds, poll_seconds=12.0, clock=lambda: clock.t,
+            sleep=sleep))
 
-    if execute and confirm == "dry run":
-        confirm = run(False, None)["planned"]["rao"]
-    return run(execute, confirm if execute else None)
+    if execute and "dry run" in (confirm, plan):
+        preview = run(False, None, None)
+        confirm = preview["planned"]["rao"] if confirm == "dry run" else confirm
+        plan = preview["plan_digest"] if plan == "dry run" else plan
+    receipt = run(execute, confirm if execute else None, plan if execute else None)
+    if execute and receipted and not journal.read_only:
+        journal.mark_receipted(receipt["reported_batch_ids"])
+    return receipt
 
 
 OWNERS = {"5A": "5ColdA", "5B": "5ColdB", "5C": "5ColdC"}
@@ -180,6 +200,7 @@ OWNERS = {"5A": "5ColdA", "5B": "5ColdB", "5C": "5ColdC"}
 @pytest.fixture()
 def journal(tmp_path):
     handle = po.Journal(tmp_path / "payout.sqlite")
+    handle.initialise(collector_coldkey=COLLECTOR, netuid=81, nonce=0, reason="a first journal")
     yield handle
     handle.close()
 
@@ -200,7 +221,9 @@ def test_a_dry_run_plans_and_signs_nothing_and_writes_no_journal(tmp_path):
     journal.close()
     assert receipt["mode"] == po.MODE_DRY_RUN and not path.exists()
     assert chain.submitted == [] and receipt["batches"] == []
-    assert {t["coldkey"] for t in receipt["transfers"]} == {"5ColdA", "5ColdB"}
+    assert {t["coldkey"] for t in receipt["planned_transfers"]} == {"5ColdA", "5ColdB"}
+    # With no journal it knows nothing of what was paid: an execution would stop, and the dry run says so.
+    assert "not initialised" in receipt["stopped"] and "no such file" in receipt["stopped"]
     assert receipt["planned"]["rao"] == ob.amount_rao(0.01, E) + ob.amount_rao(0.02, E)
     # The native task's work is the weights': listed, never paid here.
     assert receipt["native_rail"]["obligations"] == 1 and receipt["native_rail"]["rao"] == ob.amount_rao(0.05, E)
@@ -313,7 +336,8 @@ def test_a_failed_batch_releases_its_obligations_for_the_next_pass(journal):
     chain.on_submit = "include"
     paid = _pass(obligations, journal, chain)
     assert paid["paid"]["transfers"] == 1 and len(chain.submitted) == 2
-    assert journal.rows([obligations[0].obligation_id])[obligations[0].obligation_id]["attempts"] == 2
+    # One failure on chain, one attempt counted.
+    assert journal.rows([obligations[0].obligation_id])[obligations[0].obligation_id]["attempts"] == 1
 
 
 def test_a_nonce_used_by_another_extrinsic_stops_the_payer_and_keeps_the_obligations_held(journal):
@@ -328,13 +352,18 @@ def test_a_nonce_used_by_another_extrinsic_stops_the_payer_and_keeps_the_obligat
     # Every later pass stays stopped until a person decides.
     later = _pass(obligations, journal, chain)
     assert later["stopped"] and "settled by hand" in later["stopped"] and len(chain.submitted) == 1
-    (batch,) = journal.foreign()
-    journal.settle_foreign(batch["batch_id"], paid=False, detail="read the chain: the transfer was never made")
+    (batch,) = journal.needs_person()
+    with pytest.raises(po.PayoutError):
+        journal.settle_by_hand(batch["batch_id"], landed=False, evidence=" ")
+    journal.settle_by_hand(batch["batch_id"], landed=False, evidence="read the chain: the transfer was never made")
     chain.on_submit = "include"
     resumed = _pass(obligations, journal, chain)
     assert resumed["stopped"] is None and resumed["paid"]["transfers"] == 1 and len(chain.submitted) == 2
+    # The other extrinsic spent nonce 0; the payer signed the next one.
+    assert [s.nonce for s in chain.submitted] == [0, 1]
     with pytest.raises(po.PayoutError):
-        journal.settle_foreign(batch["batch_id"], paid=True, detail="twice")
+        journal.settle_by_hand(batch["batch_id"], landed=True, evidence="twice")
+    assert [d["kind"] for d in journal.decisions()] == ["initialise", "settle"]
 
 
 # -- what is planned --------------------------------------------------------------------------------------------------
@@ -349,6 +378,21 @@ def test_funding_goes_oldest_first_and_stops_at_the_first_that_does_not_fit():
     # 5A (oldest) fits; 5B and 5C settled together after it: 5B comes first and does not fit, so neither is paid.
     assert [t.coldkey for t in transfers] == ["5ColdA"]
     assert {o.hotkey for o in unfunded} == {"5B", "5C"} and deferred == []
+
+
+def test_a_destination_that_does_not_fit_whole_is_paid_its_oldest_obligations_that_fit():
+    old = _ledger({PAID: {"5A": 0.01}}, work=WORK - 20)
+    new = _ledger({PAID: {"5A": 0.02, "5B": 0.001}})
+    pairs = [(o, OWNERS[o.hotkey]) for o in old + new]
+    transfers, deferred, unfunded = po.plan_transfers(pairs, available_rao=old[0].amount_rao + 5,
+                                                      min_transfer_rao=0)
+    # 5A's oldest obligation fits, its younger one does not; nothing younger (5B) overtakes it.
+    assert [(t.coldkey, t.obligation_ids) for t in transfers] == [("5ColdA", (old[0].obligation_id,))]
+    assert {o.obligation_id for o in unfunded} == {o.obligation_id for o in new}
+    # The part that fits must reach the floor.
+    transfers, deferred, unfunded = po.plan_transfers(pairs, available_rao=old[0].amount_rao + 5,
+                                                      min_transfer_rao=old[0].amount_rao + 1)
+    assert transfers == [] and len(unfunded) == 2 and [o.hotkey for o in deferred] == ["5B"]
 
 
 def test_the_reserve_is_never_paid_out(journal):
@@ -370,14 +414,15 @@ def test_a_destination_owed_under_the_minimum_waits_and_adds_up(journal):
     assert len(second["batches"][0]["transfers"][0]["obligation_ids"]) == 2
 
 
-def test_the_destination_is_the_owner_when_earned_and_is_kept_for_retries(journal):
-    obligations = _ledger({PAID: {"5A": 0.01}})
-    earned_block = int((obligations[0].earned_at - T0) // 12)
-    owners = {"5A": lambda block: "5ColdThen" if block <= earned_block else "5ColdNow"}
+def test_the_destination_is_the_owner_at_the_end_of_the_work_and_is_kept_for_retries(journal):
+    obligations = _ledger({PAID: {"5A": 0.01}}, settled_after=6 * 3600)
+    worked_block = int((obligations[0].earn_at - T0) // 12)
+    # Sold between the end of the work and the settlement: the seller's coldkey did the work.
+    owners = {"5A": lambda block: "5ColdThen" if block <= worked_block else "5ColdNow"}
     chain = FakeChain(stake_rao=10**12, owners=owners, on_submit="fail")
     failed = _pass(obligations, journal, chain)
     assert failed["batches"][0]["transfers"][0]["coldkey"] == "5ColdThen"
-    chain.owners = {"5A": "5ColdLater"}
+    chain.owners = {**chain.owners, "5A": "5ColdLater"}
     chain.on_submit = "include"
     paid = _pass(obligations, journal, chain)
     assert paid["batches"][0]["transfers"][0]["coldkey"] == "5ColdThen"
@@ -426,30 +471,46 @@ def test_the_journal_refuses_to_reserve_an_obligation_twice(journal):
     assert [b["batch_id"] for b in journal.batches()] == ["one"]
 
 
-def test_events_that_do_not_match_leave_a_paid_batch_finalized_not_reconciled(journal):
-    obligations = _ledger({PAID: {"5A": 0.01}})
+def test_events_that_do_not_match_mark_a_paid_batch_and_stop_the_payer_for_a_person(journal):
+    obligations = _ledger({PAID: {"5A": 0.01}, PAID + "-b": {"5B": 0.01}})
     chain = FakeChain(stake_rao=10**12, owners=OWNERS, on_submit="drop")
-    _pass(obligations, journal, chain, wait_seconds=1.0)
+    _pass(obligations, journal, chain, wait_seconds=1.0, collector=(PAID,))
     (signed,) = chain.submitted
     chain.land(signed, events=[{"module": "System", "event": "ExtrinsicSuccess", "attributes": {}}])
-    receipt = _pass(obligations, journal, chain)
-    assert receipt["recovered"][0]["state"] == po.BATCH_FINALIZED
-    assert "differ" in receipt["recovered"][0]["detail"]
-    assert set(_states(journal, obligations).values()) == {ob.FINALIZED}
+    receipt = _pass(obligations, journal, chain, collector=(PAID, PAID + "-b"))
+    assert receipt["recovered"][0]["state"] == po.BATCH_MISMATCH and "differ" in receipt["recovered"][0]["detail"]
+    assert receipt["stopped"] and receipt["paid"]["transfers"] == 1 and len(chain.submitted) == 1
+    paid_ids = [o.obligation_id for o in obligations if o.task_id == PAID]
+    assert {journal.rows(paid_ids)[i]["state"] for i in paid_ids} == {ob.FINALIZED}
+    # Paid, so it can only be settled as landed, once a person checked where the stake went.
+    (batch,) = journal.needs_person()
+    with pytest.raises(po.PayoutError):
+        journal.settle_by_hand(batch["batch_id"], landed=False, evidence="looked")
+    journal.settle_by_hand(batch["batch_id"], landed=True, evidence="block read: the stake went to 5ColdA")
+    chain.on_submit = "include"
+    resumed = _pass(obligations, journal, chain, collector=(PAID, PAID + "-b"))
+    assert resumed["stopped"] is None and resumed["paid"]["transfers"] == 1
 
 
-def test_reconciling_reads_mapped_and_listed_event_fields():
-    inclusion = po.Inclusion(block_number=1, block_hash="0x1", success=True, events=(
-        {"module": "SubtensorModule", "event": "StakeTransferred",
-         "attributes": {"origin_coldkey": COLLECTOR, "destination_coldkey": "5ColdA", "hotkey": COLLECTOR_HOT}},
-        {"module": "SubtensorModule", "event": "StakeTransferred",
-         "attributes": [COLLECTOR, "5ColdB", COLLECTOR_HOT, 81, 81, 5]}))
-    ok, _ = po.reconcile_events([{"coldkey": "5ColdA"}, {"coldkey": "5ColdB"}], inclusion,
-                                collector_coldkey=COLLECTOR, collector_hotkey=COLLECTOR_HOT)
+def test_reconciling_reads_mapped_and_listed_event_fields_and_their_subnets():
+    def inclusion(netuid=81):
+        return po.Inclusion(block_number=1, block_hash="0x1", success=True, events=(
+            {"module": "SubtensorModule", "event": "StakeTransferred",
+             "attributes": {"origin_coldkey": COLLECTOR, "destination_coldkey": "5ColdA", "hotkey": COLLECTOR_HOT,
+                            "origin_netuid": 81, "destination_netuid": netuid}},
+            {"module": "SubtensorModule", "event": "StakeTransferred",
+             "attributes": [COLLECTOR, "5ColdB", COLLECTOR_HOT, 81, 81, 5]}))
+
+    planned = [{"coldkey": "5ColdA"}, {"coldkey": "5ColdB"}]
+    ok, _ = po.reconcile_events(planned, inclusion(), collector_coldkey=COLLECTOR, collector_hotkey=COLLECTOR_HOT,
+                                netuid=81)
     assert ok
-    wrong, why = po.reconcile_events([{"coldkey": "5ColdA"}, {"coldkey": "5ColdB"}], inclusion,
-                                     collector_coldkey="5Other", collector_hotkey=COLLECTOR_HOT)
+    wrong, why = po.reconcile_events(planned, inclusion(), collector_coldkey="5Other",
+                                     collector_hotkey=COLLECTOR_HOT, netuid=81)
     assert not wrong and "not the collector's" in why
+    elsewhere, why = po.reconcile_events(planned, inclusion(netuid=3), collector_coldkey=COLLECTOR,
+                                         collector_hotkey=COLLECTOR_HOT, netuid=81)
+    assert not elsewhere and "subnet 81" in why
 
 
 def test_a_receipt_is_written_beside_earlier_ones_never_over_them(tmp_path, journal):
@@ -470,11 +531,22 @@ def test_a_payout_config_out_of_range_is_refused(bad):
 # -- the CLI ----------------------------------------------------------------------------------------------------------
 
 
+def _registry_view(monkeypatch, rails=None):
+    from reliquary.ledger import sources
+
+    async def read(**_):
+        return sources.RegistryView(ceilings=_ceilings(PAID), pay_ceilings={}, floored=[],
+                                    collector_tasks=sorted(rails or {}), collector_from=dict(rails or {}))
+
+    monkeypatch.setattr(sources, "read_registry_ceilings", read)
+
+
 def test_ledger_pay_is_a_dry_run_by_default(tmp_path, monkeypatch):
     from typer.testing import CliRunner
 
     from reliquary.ledger import cli
 
+    _registry_view(monkeypatch)
     folder = tmp_path / "archives" / PAID
     folder.mkdir(parents=True)
     doc = {"task_id": PAID, "job_id": PAID, "work_period": WORK, "rewards_by_hotkey": {"5A": 0.01}, "cap": 0.5,
@@ -496,15 +568,24 @@ def test_ledger_pay_is_a_dry_run_by_default(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "_payout_chain", lambda subtensor, **kwargs: chain)
     monkeypatch.setattr(cli, "_min_transfer_rao", fake_min)
     journal = tmp_path / "journal.sqlite"
-    result = CliRunner().invoke(cli.ledger_app, [
-        "pay", "--collector-coldkey", COLLECTOR, "--collector-hotkey", COLLECTOR_HOT, "--journal", str(journal),
-        "--receipts", str(tmp_path / "receipts"), "--archives", str(tmp_path / "archives"), "--prices", "none",
-        "--rate", str(E), "--assume-collector", PAID, "--as-of", "2026-11-28T12:05:00"])
-    assert result.exit_code == 0, result.output
+    args = ["pay", "--collector-coldkey", COLLECTOR, "--collector-hotkey", COLLECTOR_HOT, "--journal", str(journal),
+            "--receipts", str(tmp_path / "receipts"), "--archives", str(tmp_path / "archives"),
+            "--assume-collector", PAID, "--as-of", "2026-11-28T12:05:00"]
+    result = CliRunner().invoke(cli.ledger_app, args)
+    # No journal yet: the dry run plans, and says an execution would stop until one is initialised.
+    assert result.exit_code == 3, result.output
     assert "DRY-RUN pass of 2026-11-28" in result.output and "planned 1 transfer(s)" in result.output
+    assert "not initialised" in result.output and "--confirm-plan" not in result.output
     assert not journal.exists() and chain.submitted == []
     (receipt,) = (tmp_path / "receipts").glob("payout-2026-11-28-dry-run-*.json")
-    assert json.loads(receipt.read_text())["sources"]["assumed_collector_tasks"] == [PAID]
+    sources_used = json.loads(receipt.read_text())["sources"]
+    assert sources_used["assumed_collector_tasks"] == [PAID] and sources_used["as_of_supplied"] is True
+    handle = po.Journal(journal)
+    handle.initialise(collector_coldkey=COLLECTOR, netuid=81, nonce=0, reason="a first journal")
+    handle.close()
+    ready = CliRunner().invoke(cli.ledger_app, args)
+    assert ready.exit_code == 0, ready.output
+    assert "to pay this plan: --execute --confirm-rao" in ready.output and "--confirm-plan" in ready.output
 
 
 def test_ledger_pay_executes_only_from_the_registry_with_a_wallet(tmp_path):
@@ -514,11 +595,17 @@ def test_ledger_pay_executes_only_from_the_registry_with_a_wallet(tmp_path):
 
     base = ["pay", "--collector-coldkey", COLLECTOR, "--collector-hotkey", COLLECTOR_HOT, "--journal",
             str(tmp_path / "j.sqlite"), "--receipts", str(tmp_path / "r"), "--execute"]
-    for extra in (["--prices", "none", "--wallet-name", "w"], ["--assume-collector", PAID, "--wallet-name", "w"],
-                  []):
+    wallet = ["--wallet-name", "w"]
+    # What an execution pays is pinned: no other source, no other time, no other terms.
+    for extra in (["--prices", "none"] + wallet, ["--assume-collector", PAID] + wallet, [],
+                  ["--archives", str(tmp_path)] + wallet, ["--as-of", "2026-11-28T12:05:00"] + wallet,
+                  ["--pay-day", "2026-11-28"] + wallet, ["--lag-days", "1"] + wallet, ["--pay-at", "06:00"] + wallet,
+                  ["--hold-hours", "1"] + wallet):
         result = CliRunner().invoke(cli.ledger_app, base + extra)
         assert result.exit_code != 0, extra
     assert not (tmp_path / "j.sqlite").exists()
+    for gone in (["--rate", "chain"], ["--order-budget", f"{PAID}=1"]):
+        assert CliRunner().invoke(cli.ledger_app, base[:-1] + gone).exit_code == 2
 
 
 def test_events_are_normalized_to_ss58_accounts():
@@ -540,16 +627,27 @@ def test_events_are_normalized_to_ss58_accounts():
 # -- the owner's go, and transfers the chain refuses -------------------------------------------------------------------
 
 
-def test_executing_pays_only_the_total_a_confirmation_names(journal):
+def test_executing_pays_only_the_total_and_plan_a_confirmation_names(journal):
     obligations = _ledger({PAID: {"5A": 0.01, "5B": 0.02}})
     total = sum(o.amount_rao for o in obligations)
     chain = FakeChain(stake_rao=10**12, owners=OWNERS)
-    for wrong in (None, total - 1, total + 1):
-        stopped = _pass(obligations, journal, chain, confirm=wrong)
-        assert stopped["stopped"] and f"--confirm-rao {total}" in stopped["stopped"]
+    digest = _pass(obligations, journal, chain, execute=False)["plan_digest"]
+    for wrong_total, wrong_plan in ((None, digest), (total - 1, digest), (total + 1, digest), (total, None),
+                                    (total, "0" * 16)):
+        stopped = _pass(obligations, journal, chain, confirm=wrong_total, plan=wrong_plan)
+        assert stopped["stopped"] and f"--confirm-rao {total} --confirm-plan {digest}" in stopped["stopped"]
         assert chain.submitted == [] and journal.batches() == []
-    paid = _pass(obligations, journal, chain, confirm=total)
-    assert paid["paid"]["rao"] == total and paid["confirmed_rao"] == total
+    paid = _pass(obligations, journal, chain, confirm=total, plan=digest)
+    assert paid["paid"]["rao"] == total and paid["confirmed_rao"] == total and paid["confirmed_plan"] == digest
+
+
+def test_the_plan_digest_binds_destinations_amounts_and_obligations():
+    one = [po.Transfer(coldkey="a", amount_rao=5, obligation_ids=("x", "y"))]
+    assert po.plan_digest(one) == po.plan_digest([po.Transfer(coldkey="a", amount_rao=5, obligation_ids=("y", "x"))])
+    for other in ([po.Transfer(coldkey="b", amount_rao=5, obligation_ids=("x", "y"))],
+                  [po.Transfer(coldkey="a", amount_rao=6, obligation_ids=("x", "y"))],
+                  [po.Transfer(coldkey="a", amount_rao=5, obligation_ids=("x",))]):
+        assert po.plan_digest(other) != po.plan_digest(one)
 
 
 def test_a_dry_run_shows_the_total_an_execution_will_ask_to_confirm(journal):
@@ -579,13 +677,22 @@ def test_a_refused_destination_is_retried_alone_then_held_for_a_person(journal):
     assert third["batches"][0]["state"] == po.BATCH_FAILED
     held = _pass(obligations, journal, chain)
     b_ids = [o.obligation_id for o in obligations if o.hotkey == "5B"]
-    assert held["stuck"]["obligation_ids"] == b_ids and held["planned"]["transfers"] == 0
+    assert held["held"]["coldkey_refused"]["obligation_ids"] == b_ids and held["planned"]["transfers"] == 0
+    # The coldkey is held, not only its old obligations: its new work is held too, and batches no one else.
+    later = obligations + _ledger({PAID: {"5B": 0.01, "5C": 0.01}}, work=WORK + 20)
+    next_day = _pass(later, journal, chain, now=NOW + 86_400, day=date(2026, 11, 29))
+    assert next_day["held"]["coldkey_refused"]["obligations"] == 2
+    assert [b["state"] for b in next_day["batches"]] == [po.BATCH_FINALIZED]
+    assert [t["coldkey"] for t in next_day["batches"][0]["transfers"]] == ["5ColdC"]
     # A person fixes it (the swap announcement is gone) and clears it: paid once.
     chain.refuse = set()
-    assert journal.clear_attempts(b_ids) == 1
-    paid = _pass(obligations, journal, chain)
-    assert paid["paid"]["transfers"] == 1
-    assert set(_states(journal, obligations).values()) == {ob.RECONCILED}
+    with pytest.raises(po.PayoutError):
+        journal.clear_held(evidence="", coldkey="5ColdB")
+    assert journal.clear_held(evidence="swap announcement withdrawn", coldkey="5ColdB") == 1
+    paid = _pass(later, journal, chain, now=NOW + 86_400, day=date(2026, 11, 29))
+    assert paid["paid"]["transfers"] == 1 and paid["paid"]["rao"] == sum(o.amount_rao for o in later
+                                                                         if o.hotkey == "5B")
+    assert set(_states(journal, later).values()) == {ob.RECONCILED}
 
 
 def test_batches_put_retried_transfers_alone():
@@ -685,6 +792,7 @@ def test_ledger_pay_keeps_its_journal_and_receipts_in_one_documented_place(tmp_p
     from reliquary.ledger import cli
 
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    _registry_view(monkeypatch)
     folder = tmp_path / "archives" / PAID
     folder.mkdir(parents=True)
     doc = {"task_id": PAID, "job_id": PAID, "work_period": WORK, "rewards_by_hotkey": {"5A": 0.01}, "cap": 0.5,
@@ -707,10 +815,331 @@ def test_ledger_pay_keeps_its_journal_and_receipts_in_one_documented_place(tmp_p
     monkeypatch.setattr(cli, "_min_transfer_rao", fake_min)
     result = CliRunner().invoke(cli.ledger_app, [
         "pay", "--collector-coldkey", COLLECTOR, "--collector-hotkey", COLLECTOR_HOT,
-        "--archives", str(tmp_path / "archives"), "--prices", "none", "--rate", str(E),
-        "--assume-collector", PAID, "--as-of", "2026-11-28T12:05:00"])
-    assert result.exit_code == 0, result.output
+        "--archives", str(tmp_path / "archives"), "--assume-collector", PAID, "--as-of", "2026-11-28T12:05:00"])
+    assert result.exit_code == 3, result.output       # no journal yet
+    assert str(tmp_path / "home/.reliquary/payout/journal.sqlite") in result.output
     assert list((tmp_path / "home/.reliquary/payout/receipts").glob("payout-2026-11-28-dry-run-*.json"))
     refused = CliRunner().invoke(cli.ledger_app, ["pay", "--collector-coldkey", COLLECTOR, "--collector-hotkey",
                                                   COLLECTOR_HOT, "--confirm-rao", "5"])
     assert refused.exit_code != 0
+
+
+# -- one journal: a fresh, restored or second journal never pays again --------------------------------------------------
+
+
+def test_an_execution_on_a_journal_never_initialised_sends_nothing(tmp_path):
+    obligations = _ledger({PAID: {"5A": 0.01}})
+    chain = FakeChain(stake_rao=10**12, owners=OWNERS)
+    handle = po.Journal(tmp_path / "fresh.sqlite")
+    receipt = _pass(obligations, handle, chain)
+    handle.close()
+    assert "not initialised" in receipt["stopped"] and chain.submitted == []
+    assert receipt["planned"]["transfers"] == 1     # what it would have paid is shown, never sent
+
+
+def test_a_restored_journal_stops_on_the_collectors_nonce_and_pays_nothing_twice(tmp_path, journal):
+    import shutil
+
+    obligations = _ledger({PAID: {"5A": 0.01, "5B": 0.02}})
+    chain = FakeChain(stake_rao=10**12, owners=OWNERS)
+    journal.db.execute("PRAGMA wal_checkpoint(FULL)")
+    shutil.copy(journal.path, tmp_path / "backup.sqlite")          # yesterday's backup
+    paid = _pass(obligations, journal, chain)
+    assert paid["paid"]["transfers"] == 2
+    journal.close()
+    restored = po.Journal(tmp_path / "backup.sqlite")
+    again = _pass(obligations, restored, chain)
+    # The backup knows nothing of the batch sent since: it would plan the same obligations again. The
+    # collector's nonce is past what it expects, so nothing is sent.
+    assert again["planned"]["transfers"] == 2 and again["nonce"] == {"chain": 1, "journal": 0, "at_block": chain.head}
+    assert "expects 0" in again["stopped"] and len(chain.submitted) == 1
+    restored.close()
+
+
+def test_an_extrinsic_signed_outside_the_payer_stops_it_until_a_person_resyncs(journal):
+    obligations = _ledger({PAID: {"5A": 0.01}})
+    chain = FakeChain(stake_rao=10**12, owners=OWNERS)
+    chain.foreign()                                   # the owner used the collector's key for something else
+    stopped = _pass(obligations, journal, chain)
+    assert stopped["stopped"] and "find-nonce" in stopped["stopped"] and chain.submitted == []
+    with pytest.raises(po.PayoutError):
+        journal.resync(nonce=1, reason="")
+    assert journal.resync(nonce=1, reason="checked: one add_stake by the owner at nonce 0") == 0
+    resumed = _pass(obligations, journal, chain)
+    assert resumed["stopped"] is None and [s.nonce for s in chain.submitted] == [1]
+    with pytest.raises(po.PayoutError):
+        journal.resync(nonce=0, reason="going back")
+    assert [d["kind"] for d in journal.decisions()] == ["initialise", "resync"]
+
+
+def test_a_journal_kept_for_another_collector_or_subnet_stops_the_pass(tmp_path):
+    obligations = _ledger({PAID: {"5A": 0.01}})
+    chain = FakeChain(stake_rao=10**12, owners=OWNERS)
+    handle = po.Journal(tmp_path / "other.sqlite")
+    handle.initialise(collector_coldkey="5SomeoneElse", netuid=81, nonce=0, reason="test")
+    receipt = _pass(obligations, handle, chain)
+    handle.close()
+    assert "belongs to collector 5SomeoneElse" in receipt["stopped"] and chain.submitted == []
+
+
+def test_initialising_twice_is_refused_and_a_dry_run_never_writes_the_file(tmp_path, journal):
+    with pytest.raises(po.PayoutError):
+        journal.initialise(collector_coldkey=COLLECTOR, netuid=81, nonce=0, reason="again")
+    obligations = _ledger({PAID: {"5A": 0.01}})
+    chain = FakeChain(stake_rao=10**12, owners=OWNERS, on_submit="drop")
+    _pass(obligations, journal, chain, wait_seconds=1.0)
+    chain.head += 200
+    # A dry run handed the writable journal settles the expired batch in a snapshot, not in the file.
+    preview = _pass(obligations, journal, chain, execute=False)
+    assert preview["recovered"][0]["state"] == po.BATCH_EXPIRED
+    assert [b["state"] for b in journal.batches()] == [po.BATCH_SUBMITTED]
+
+
+def test_journal_init_refuses_a_journal_that_does_not_hold_every_published_paid_batch(tmp_path, monkeypatch, journal):
+    from reliquary.ledger import cli
+
+    obligations = _ledger({PAID: {"5A": 0.01}})
+    chain = FakeChain(stake_rao=10**12, owners=OWNERS)
+    receipt = _pass(obligations, journal, chain)
+    po.write_receipt(receipt, tmp_path / "receipts")
+    published = {b["extrinsic_hash"] for b in receipt["batches"]}
+
+    class _Subtensor:
+        async def close(self):
+            return None
+
+    async def fake_subtensor(network):
+        return _Subtensor()
+
+    monkeypatch.setattr(cli, "_subtensor", fake_subtensor)
+    monkeypatch.setattr(cli, "_payout_chain", lambda subtensor, **kwargs: chain)
+
+    def init(path, *, resync=False, published=published, receipts=tmp_path / "none"):
+        return asyncio.run(cli.collect_journal_init(
+            collector_coldkey=COLLECTOR, collector_hotkey=COLLECTOR_HOT, reason="disk lost", resync=resync,
+            journal_path=path, receipts=receipts, network="test", netuid=81, published=published))
+
+    # A new journal after paying: the published index (or a local receipt) lists a batch it does not hold.
+    for kwargs in ({}, {"published": set(), "receipts": tmp_path / "receipts"}):
+        with pytest.raises(typer_bad_parameter()):
+            init(tmp_path / "new.sqlite", **kwargs)
+    # The journal that paid holds them all: it can be re-aligned, and a first journal starts where nothing was paid.
+    journal.close()
+    assert "re-aligned" in init(journal.path, resync=True)
+    assert "initialised at the collector's nonce 1" in init(tmp_path / "first.sqlite", published=set())
+
+
+def typer_bad_parameter():
+    import typer
+
+    return typer.BadParameter
+
+
+# -- an outcome the chain does not tell, or a read that cannot be right, is never settled as unpaid ----------------------
+
+
+def test_an_included_batch_whose_outcome_is_unreadable_is_held_for_a_person_never_repaid(journal):
+    obligations = _ledger({PAID: {"5A": 0.01}})
+    chain = FakeChain(stake_rao=10**12, owners=OWNERS, on_submit="drop")
+    _pass(obligations, journal, chain, wait_seconds=1.0)
+    (signed,) = chain.submitted
+    # Included, but its events came back empty (a node error decodes as no events): it may have paid.
+    chain.land(signed, events=[], outcome=None)
+    receipt = _pass(obligations, journal, chain)
+    assert receipt["recovered"][0]["state"] == po.BATCH_UNKNOWN and receipt["stopped"]
+    assert set(_states(journal, obligations).values()) == {ob.SUBMITTED} and len(chain.submitted) == 1
+    assert receipt["planned"]["transfers"] == 0
+    (batch,) = journal.needs_person()
+    journal.settle_by_hand(batch["batch_id"], landed=True, evidence="block read: StakeTransferred to 5ColdA")
+    assert set(_states(journal, obligations).values()) == {ob.FINALIZED}
+    assert _pass(obligations, journal, chain)["planned"]["transfers"] == 0
+
+
+def test_a_failed_outcome_with_stake_moved_is_unknown_not_failed(journal):
+    obligations = _ledger({PAID: {"5A": 0.01}})
+    chain = FakeChain(stake_rao=10**12, owners=OWNERS, on_submit="drop")
+    _pass(obligations, journal, chain, wait_seconds=1.0)
+    (signed,) = chain.submitted
+    chain.land(signed, success=False, events=[
+        {"module": "SubtensorModule", "event": "StakeTransferred",
+         "attributes": [COLLECTOR, "5ColdA", COLLECTOR_HOT, 81, 81, 1]},
+        {"module": "System", "event": "ExtrinsicFailed", "attributes": {}}])
+    receipt = _pass(obligations, journal, chain)
+    assert receipt["recovered"][0]["state"] == po.BATCH_UNKNOWN and len(chain.submitted) == 1
+
+
+def test_a_nonce_read_below_the_batch_settles_nothing(journal):
+    obligations = _ledger({PAID: {"5A": 0.01, "5B": 0.01}})
+    chain = FakeChain(stake_rao=10**12, owners=OWNERS)
+    _pass(obligations[:1], journal, chain, collector=(PAID,))
+    chain.on_submit = "drop"
+    second = _pass(obligations, journal, chain, wait_seconds=1.0)
+    assert second["batches"][0]["state"] == po.BATCH_PENDING and second["batches"][0]["nonce"] == 1
+    chain.head += 200                       # past its window: a nonce read of 0 would call it expired
+    chain.bad_nonce_reads = 1               # one read comes back as the empty default
+    receipt = _pass(obligations, journal, chain, confirm=None, plan=None)
+    assert receipt["recovered"][0]["state"] == po.BATCH_UNREADABLE and "could not be read" in receipt["stopped"]
+    assert [b["state"] for b in journal.batches()][-1] == po.BATCH_SUBMITTED and len(chain.submitted) == 2
+
+
+def test_an_unfetchable_block_settles_nothing(journal):
+    obligations = _ledger({PAID: {"5A": 0.01}})
+    chain = FakeChain(stake_rao=10**12, owners=OWNERS, on_submit="drop")
+    _pass(obligations, journal, chain, wait_seconds=1.0)
+    chain.foreign()
+    chain.unreadable_blocks = True
+    receipt = _pass(obligations, journal, chain)
+    assert receipt["recovered"][0]["state"] == po.BATCH_UNREADABLE and receipt["stopped"]
+    assert [b["state"] for b in journal.batches()] == [po.BATCH_SUBMITTED]
+
+
+def test_attempts_count_only_failures_on_chain(journal):
+    obligations = _ledger({PAID: {"5A": 0.01}})
+    chain = FakeChain(stake_rao=10**12, owners=OWNERS)
+
+    class Aborts(FakeSigner):
+        async def sign(self, transfers, **kwargs):
+            raise KeyboardInterrupt("the owner cancelled the password prompt")
+
+    for _ in range(po.MAX_ATTEMPTS + 1):
+        with pytest.raises(KeyboardInterrupt):
+            _pass(obligations, journal, chain, signer=Aborts())
+    paid = _pass(obligations, journal, chain)
+    assert paid["paid"]["transfers"] == 1 and paid["held"]["coldkey_refused"]["obligations"] == 0
+    assert journal.rows([obligations[0].obligation_id])[obligations[0].obligation_id]["attempts"] == 0
+
+
+# -- what is held, and what is not the collector's to pay -----------------------------------------------------------------
+
+
+def test_only_frozen_rates_are_paid_and_the_amount_first_sent_is_kept(journal):
+    frozen = _ledger({PAID: {"5A": 0.01}})
+    chain = FakeChain(stake_rao=10**12, owners=OWNERS, on_submit="fail")
+    assert _pass(frozen, journal, chain)["batches"][0]["state"] == po.BATCH_FAILED
+    # The next day the same obligation is valued otherwise (another rate): it is held, never sent recomputed.
+    from dataclasses import replace
+
+    revalued = [replace(o, amount_rao=o.amount_rao * 2) for o in frozen]
+    chain.on_submit = "include"
+    held = _pass(revalued, journal, chain)
+    assert held["held"]["amount_changed"]["obligation_ids"] == [frozen[0].obligation_id]
+    assert held["planned"]["transfers"] == 0 and len(chain.submitted) == 1
+    chained = [replace(o, rate_source=ob.RATE_CHAIN) for o in _ledger({PAID: {"5B": 0.01}})]
+    receipt = _pass(chained, journal, chain)
+    assert receipt["held"]["rate_not_frozen"]["obligations"] == 1 and receipt["planned"]["transfers"] == 0
+
+
+def test_work_before_the_rails_first_period_is_the_weights_to_pay(journal):
+    before = _ledger({PAID: {"5A": 0.01}}, work=WORK - 1)
+    after = _ledger({PAID: {"5B": 0.01}})
+    chain = FakeChain(stake_rao=10**12, owners=OWNERS)
+    receipt = _pass(before + after, journal, chain, collector={PAID: WORK})
+    paid = {oid for b in receipt["batches"] for t in b["transfers"] for oid in t["obligation_ids"]}
+    assert paid == {after[0].obligation_id} and receipt["native_rail"]["obligations"] == 1
+
+
+def test_a_collector_that_is_the_owners_or_does_not_hold_its_hotkey_pays_nothing(journal):
+    obligations = _ledger({PAID: {"5A": 0.01}})
+    for subnet, holder in (((COLLECTOR, "5OwnerHot"), COLLECTOR), (("5Owner", COLLECTOR_HOT), COLLECTOR),
+                           (("5Owner", "5OwnerHot"), "5SomeoneElse")):
+        chain = FakeChain(stake_rao=10**12, owners={**OWNERS, COLLECTOR_HOT: holder})
+        chain.owners[COLLECTOR_HOT] = holder
+        chain.subnet = subnet
+        receipt = _pass(obligations, journal, chain)
+        assert receipt["stopped"] and chain.submitted == [], subnet
+
+
+def test_an_obligation_owed_to_the_subnet_owners_coldkey_is_held(journal):
+    obligations = _ledger({PAID: {"5A": 0.01, "5B": 0.01}})
+    chain = FakeChain(stake_rao=10**12, owners={**OWNERS, "5B": "5Owner"})
+    receipt = _pass(obligations, journal, chain)
+    assert receipt["held"]["to_subnet_owner"]["obligations"] == 1
+    assert [t["coldkey"] for b in receipt["batches"] for t in b["transfers"]] == ["5ColdA"]
+
+
+def test_a_due_journal_row_whose_archive_is_gone_is_reported(journal):
+    obligations = _ledger({PAID: {"5A": 0.01}})
+    chain = FakeChain(stake_rao=10**12, owners=OWNERS, on_submit="fail")
+    _pass(obligations, journal, chain)
+    receipt = _pass([], journal, chain)
+    assert receipt["journal_only"]["obligation_ids"] == [obligations[0].obligation_id]
+    assert receipt["journal_only"]["rao"] == obligations[0].amount_rao
+
+
+# -- receipts from the journal ------------------------------------------------------------------------------------------
+
+
+def test_every_settled_batch_goes_in_a_receipt_once_even_after_a_crash(tmp_path, journal):
+    obligations = _ledger({PAID: {"5A": 0.01, "5B": 0.02}})
+    chain = FakeChain(stake_rao=10**12, owners=OWNERS)
+    first = _pass(obligations, journal, chain, receipted=False)
+    # The pass "crashed" before its receipt was written: the next one lists the batch, until one is written.
+    second = _pass(obligations, journal, chain, receipted=False)
+    assert [b["batch_id"] for b in second["unreported"]] == [first["batches"][0]["batch_id"]]
+    assert second["paid"]["transfers"] == 2 and second["reported_batch_ids"] == [first["batches"][0]["batch_id"]]
+    journal.mark_receipted(second["reported_batch_ids"])
+    third = _pass(obligations, journal, chain)
+    assert third["unreported"] == [] and third["paid"]["transfers"] == 0
+    # A pass that raises leaves a receipt marked incomplete with what the journal settled.
+    partial = po.incomplete_receipt(journal, config=_config(), pass_day=PASS_DAY, now=NOW, execute=True,
+                                    error=RuntimeError("read timed out"))
+    assert partial["incomplete"] and partial["unreported"] == [] and "read timed out" in partial["stopped"]
+
+
+def test_fees_are_reported_in_tao(journal):
+    obligations = _ledger({PAID: {"5A": 0.01}})
+    receipt = _pass(obligations, journal, FakeChain(stake_rao=10**12, owners=OWNERS))
+    assert receipt["batches"][0]["fee_tao_rao"] == 125_000
+    assert receipt["paid"]["fee_tao_rao"] == 125_000 and receipt["paid"]["fee_tao"] == 125_000 / 10**9
+
+
+def test_an_execution_stopped_before_sending_is_not_published(tmp_path, monkeypatch, journal):
+    from reliquary.ledger import receipts as rc
+
+    obligations = _ledger({PAID: {"5A": 0.01}})
+    chain = FakeChain(stake_rao=10**12, owners=OWNERS)
+    stopped = po.write_receipt(_pass(obligations, journal, chain, confirm=1), tmp_path / "r")
+    _published(monkeypatch)
+    assert [r["action"] for r in asyncio.run(rc.publish([stopped]))] == ["no_batch"]
+
+
+def test_the_index_lists_every_paid_batch_hash(tmp_path, monkeypatch, journal):
+    from reliquary.ledger import receipts as rc
+
+    obligations = _ledger({PAID: {"5A": 0.01}})
+    receipt = _pass(obligations, journal, FakeChain(stake_rao=10**12, owners=OWNERS))
+    path = po.write_receipt(receipt, tmp_path / "r")
+    bucket = _published(monkeypatch)
+    asyncio.run(rc.publish([path], execute=True))
+    assert asyncio.run(rc.published_batches()) == {receipt["batches"][0]["extrinsic_hash"].lower()}
+    assert rc.local_paid_hashes(tmp_path / "r") == {receipt["batches"][0]["extrinsic_hash"].lower()}
+    assert json.loads(bucket.objects[rc.INDEX_KEY][0])["receipts"][0]["paid_batches"]
+
+
+# -- the person's commands ------------------------------------------------------------------------------------------------
+
+
+def test_settle_needs_an_explicit_landed_or_not_and_evidence(tmp_path, journal):
+    from typer.testing import CliRunner
+
+    from reliquary.ledger import cli
+
+    obligations = _ledger({PAID: {"5A": 0.01}})
+    chain = FakeChain(stake_rao=10**12, owners=OWNERS, on_submit="drop")
+    _pass(obligations, journal, chain, wait_seconds=1.0)
+    chain.foreign()
+    _pass(obligations, journal, chain)
+    (batch,) = journal.needs_person()
+    journal.close()
+    base = ["settle", batch["batch_id"], "--journal", str(journal.path)]
+    assert CliRunner().invoke(cli.ledger_app, base + ["--evidence", "read"]).exit_code != 0
+    assert CliRunner().invoke(cli.ledger_app, base + ["--not-landed"]).exit_code != 0
+    done = CliRunner().invoke(cli.ledger_app, base + ["--not-landed", "--evidence", "block 21004: an add_stake"])
+    assert done.exit_code == 0, done.output
+    reopened = po.Journal(journal.path)
+    assert reopened.batch(batch["batch_id"])["state"] == po.BATCH_VOID
+    assert reopened.decisions()[-1]["evidence"] == "block 21004: an add_stake"
+    reopened.close()
+    cleared = CliRunner().invoke(cli.ledger_app, ["clear-held", "--coldkey", "5ColdA", "--evidence", "fixed",
+                                                  "--journal", str(journal.path)])
+    assert cleared.exit_code == 0 and "0 obligation(s) cleared" in cleared.output

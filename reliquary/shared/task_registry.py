@@ -79,12 +79,15 @@ KEEP = object()
 # period pays. Absent: the cap.
 RL_START_POOL_PARAM = "rl_start_pool"
 # How a task's miners are paid, chosen when the task is added and never changed
-# after (no operation here rewrites a task's params but its cap and price):
-# ``native`` (also when absent) by the weights; ``collector``: the weight setter
-# gives the task no weight and the payer (``reliquary.ledger.payout``) pays its
-# settled obligations from the collector's stake at J+2. Only a task settled by
-# period can be paid by the collector: the payer pays period archives.
+# after (``require_payout_rail_unchanged``, which the registry store applies to
+# every write): ``native`` (also when absent) by the weights; ``collector``:
+# from ``PAYOUT_RAIL_FROM_PARAM`` (a work period, the task's first) on, the
+# weight setter gives the task's archives no weight and the payer
+# (``reliquary.ledger.payout``) pays their settled obligations from the
+# collector's stake at J+2. Only a task settled by period can be paid by the
+# collector: the payer pays period archives.
 PAYOUT_RAIL_PARAM = "payout_rail"
+PAYOUT_RAIL_FROM_PARAM = "payout_rail_from"
 PAYOUT_RAIL_NATIVE = "native"
 PAYOUT_RAIL_COLLECTOR = "collector"
 PAYOUT_RAILS = (PAYOUT_RAIL_NATIVE, PAYOUT_RAIL_COLLECTOR)
@@ -254,16 +257,73 @@ def payout_rail(params) -> str:
     return PAYOUT_RAIL_NATIVE
 
 
+def payout_rail_from(params) -> int | None:
+    """The first work period a collector-rail task's archives are the
+    collector's to pay (and get no weight); None for a native task. A
+    collector-rail task without a valid one (the registry refuses it, so only
+    a hand-edited object) starts at 0: the weight setter and the payer read it
+    alike, and never both pay a period."""
+    if payout_rail(params) != PAYOUT_RAIL_COLLECTOR:
+        return None
+    start = params.get(PAYOUT_RAIL_FROM_PARAM)
+    if isinstance(start, bool) or not isinstance(start, int) or start < 0:
+        return 0
+    return start
+
+
 def _validate_payout_rail(entry: TaskEntry) -> None:
     rail = entry.params.get(PAYOUT_RAIL_PARAM)
-    if rail is None:
+    start = entry.params.get(PAYOUT_RAIL_FROM_PARAM)
+    if rail is None and start is None:
         return
     if rail not in PAYOUT_RAILS:
         raise RegistryError(f"task {entry.task_id!r}: {PAYOUT_RAIL_PARAM} must be one of "
                             f"{', '.join(PAYOUT_RAILS)}, got {rail!r}")
-    if rail == PAYOUT_RAIL_COLLECTOR and entry.params.get("settlement") != SETTLEMENT_PERIOD_EMA:
-        raise RegistryError(f"task {entry.task_id!r}: only a task settled by period "
-                            f"({SETTLEMENT_PERIOD_EMA}) can be paid by the collector")
+    if rail == PAYOUT_RAIL_COLLECTOR:
+        if entry.params.get("settlement") != SETTLEMENT_PERIOD_EMA:
+            raise RegistryError(f"task {entry.task_id!r}: only a task settled by period "
+                                f"({SETTLEMENT_PERIOD_EMA}) can be paid by the collector")
+        if isinstance(start, bool) or not isinstance(start, int) or start < 0:
+            raise RegistryError(f"task {entry.task_id!r}: the collector rail needs {PAYOUT_RAIL_FROM_PARAM}, "
+                                f"the first work period it pays, got {start!r}")
+        # The payer pays only at the rate frozen in a corpus task's price ceiling: an RL task's
+        # rollouts have none, and would only ever be held.
+        if entry.mechanism != MECHANISM_CORPUS_GENERATION:
+            raise RegistryError(f"task {entry.task_id!r}: only a corpus task ({MECHANISM_CORPUS_GENERATION}) can be "
+                                "paid by the collector: the payer pays the rate frozen in its price ceiling")
+    elif start is not None:
+        raise RegistryError(f"task {entry.task_id!r}: {PAYOUT_RAIL_FROM_PARAM} goes with the collector rail only")
+
+
+def require_payout_rail_unchanged(before: Mapping[str, TaskEntry], after: Mapping[str, TaskEntry]) -> None:
+    """Refuse a registry write that changes the payout rail, or its first work
+    period, of a task that already exists: moving a task between rails would
+    pay its past work twice (by the weights, then by the collector) or not at
+    all. The rail is chosen when the task is added, and only then."""
+    for task_id, old in before.items():
+        new = after.get(task_id)
+        if new is None:
+            continue
+        for key in (PAYOUT_RAIL_PARAM, PAYOUT_RAIL_FROM_PARAM):
+            if old.params.get(key) != new.params.get(key):
+                raise RegistryError(f"task {task_id!r}: {key} cannot change once the task exists "
+                                    f"({old.params.get(key)!r} -> {new.params.get(key)!r})")
+
+
+def require_fleet_knows_payout_rail(entry: TaskEntry, *, acknowledged: bool) -> None:
+    """Refuse to declare a collector-rail task unless the operator confirms
+    that every validator with a permit runs a weight setter that gives it no
+    weight. One that does not still pays the task through the weights, while
+    the collector pays it too: its work would be paid twice. Like
+    ``require_fleet_knows_corpus_generation``, a deployment precondition the
+    CLI states, not an invariant of the object."""
+    if payout_rail(entry.params) != PAYOUT_RAIL_COLLECTOR or acknowledged:
+        return
+    raise RegistryError(
+        f"refusing to declare {entry.task_id!r} on the collector rail: a validator whose weight setter "
+        f"predates the rail still pays the task through the weights, and the collector would pay it again. "
+        f"Confirm every validator with a permit runs a binary that knows the rail, then declare the task "
+        f"again with the acknowledgement flag.")
 
 
 def _validate_rl_start_pool(entry: TaskEntry, cap: float) -> None:

@@ -201,6 +201,32 @@ def test_the_registry_is_read_never_written(monkeypatch):
     assert all(c[0] == "get_object" for c in client.calls if not isinstance(c, str))
 
 
+def test_selection_keeps_recent_work_late_parts_of_older_work_and_whole_histories():
+    window = WORK - 320                       # 16 days back
+    assert sources.selected(TASK, WORK, WORK + 1, work_from=window)
+    # Work older than the window, settled recently: a late part, read.
+    assert sources.selected(TASK, window - 400, WORK, work_from=window)
+    # Work and settlement both older than the window: not read, unless the task is read in full.
+    assert not sources.selected(TASK, window - 400, window - 399, work_from=window)
+    assert sources.selected(TASK, window - 400, window - 399, work_from=window, full_tasks=[TASK])
+    # A bounded query reads only its own work periods.
+    assert not sources.selected(TASK, window - 400, WORK, work_from=WORK, work_to=WORK)
+
+
+def test_a_late_part_of_work_older_than_the_window_is_read_and_falls_due(monkeypatch):
+    when = datetime(2026, 11, 30, 9, 0, tzinfo=timezone.utc)
+    old_work = WORK - 400                     # about 20 days before
+    late_entry = cp.period_of(when.timestamp()) + 1
+    objects = {f"reliquary/corpus-periods/{TASK}/{old_work:010d}-{late_entry:010d}.json.gz":
+               (when, gzip.compress(json.dumps(_doc({"5A": 0.01}, work_period=old_work)).encode()))}
+    _bucket(monkeypatch, objects)
+    refs = asyncio.run(sources.BucketArchives().refs(work_from=WORK - 320))
+    assert [(r.work_period, r.entry_period) for r in refs] == [(old_work, late_entry)]
+    ceilings = {TASK: [ob.Ceiling(miner_alpha_per_period=E, max_price_pool_share_per_token=1e-8)]}
+    (obligation,) = ob.build_ledger(refs, ceilings=ceilings).obligations
+    assert obligation.due_at == _utc("2026-11-30T12:00:00")
+
+
 def test_a_directory_laid_out_like_the_bucket_reads_the_same(tmp_path):
     folder = tmp_path / TASK
     folder.mkdir()
@@ -329,7 +355,9 @@ def test_the_cli_builds_a_report_from_a_directory_without_network(tmp_path):
     assert result.exit_code == 0, result.output
     assert "Pass of 2026-11-28" in result.output
     report = json.loads((out / "report-2026-11-28.json").read_text())
-    assert report["pass"]["obligations"] == 6 and report["rate"] == {"mode": "fixed", "alpha_per_period": E}
+    assert report["pass"]["obligations"] == 6
+    assert report["rate"] == {"mode": "fixed", "alpha_per_period": E, "fallbacks": []}
+    assert report["pass"]["by_rail"]["native"]["paid_by"] == "the weights"
     lines = (out / "obligations-2026-11-28.jsonl").read_text().splitlines()
     assert len(lines) == 6 and {json.loads(line)["state"] for line in lines} == {"due"}
     again = CliRunner().invoke(ledger_app, [

@@ -7,10 +7,16 @@ them lists every published receipt, newest first, for a page to read without
 listing the bucket. It is written with a compare-and-swap, so two
 publishers cannot erase each other's entries.
 
-Only receipts of executed passes are published; a dry run pays nothing.
-``publish`` is a dry run by default too: it says what it would write, and
-writes only with ``execute=True``. The bucket's public access (a public
-domain on that prefix) is configured outside this code.
+Only receipts of executed passes that list a batch are published: a dry run
+pays nothing, and an execution stopped before sending anything (at the
+owner's confirmation, say) has nothing on chain to show. ``publish`` is a dry
+run by default too: it says what it would write, and writes only with
+``execute=True``. The bucket's public access (a public domain on that prefix)
+is configured outside this code.
+
+The index also lists every paid batch's extrinsic hash: a payer journal that
+does not hold one of them is not the journal that paid it
+(``published_batches``, read before a journal is initialised or re-aligned).
 """
 
 from __future__ import annotations
@@ -20,7 +26,7 @@ import os
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 
-from reliquary.ledger.payout import MODE_EXECUTE, PAYOUT_RECEIPT_SCHEMA
+from reliquary.ledger.payout import MODE_EXECUTE, PAID, PAYOUT_RECEIPT_SCHEMA
 from reliquary.ledger.surplus import SURPLUS_RECEIPT_SCHEMA
 
 PUBLIC_PREFIX = "reliquary/public/payouts/"
@@ -50,12 +56,64 @@ def receipt_key(receipt: Mapping, name: str) -> str:
     return f"{PUBLIC_PREFIX}{kind}/{day}/{name}"
 
 
+def receipt_batches(receipt: Mapping) -> list[Mapping]:
+    """Every batch a receipt lists, each once."""
+    listed: dict[str, Mapping] = {}
+    for name in ("unreported", "recovered", "batches"):
+        for batch in receipt.get(name) or []:
+            listed.setdefault(str(batch.get("batch_id")), batch)
+    return list(listed.values())
+
+
+def paid_hashes(receipt: Mapping) -> list[str]:
+    """The extrinsic hashes of the batches a receipt shows paid."""
+    return sorted(str(b["extrinsic_hash"]).lower() for b in receipt_batches(receipt)
+                  if b.get("state") in PAID and b.get("extrinsic_hash"))
+
+
 def index_entry(receipt: Mapping, key: str) -> dict:
-    """A receipt's line in the index: what it paid, or burned."""
-    done = receipt.get("paid") or receipt.get("burned") or {}
+    """A receipt's line in the index: what it paid and burned (every receipt
+    totals both kinds of batch it lists), and the hashes of its batches that
+    landed."""
+    paid, burned = receipt.get("paid") or {}, receipt.get("burned") or {}
     return {"key": key, "schema": receipt.get("schema"), "kind": RECEIPT_KINDS.get(receipt.get("schema")),
-            "pass_day": receipt.get("pass_day"), "as_of": receipt.get("as_of"), "rao": done.get("rao"),
-            "transfers": done.get("transfers"), "stopped": receipt.get("stopped")}
+            "pass_day": receipt.get("pass_day"), "as_of": receipt.get("as_of"), "rao": paid.get("rao"),
+            "transfers": paid.get("transfers"), "burned_rao": burned.get("rao"), "stopped": receipt.get("stopped"),
+            "paid_batches": paid_hashes(receipt)}
+
+
+def local_paid_hashes(directory: str | Path) -> set[str]:
+    """The paid batches' hashes in the executed receipts of a directory."""
+    found: set[str] = set()
+    folder = Path(directory)
+    for path in sorted(folder.glob("*.json")) if folder.is_dir() else []:
+        try:
+            receipt = json.loads(path.read_bytes())
+        except ValueError:
+            continue
+        if isinstance(receipt, Mapping) and receipt.get("schema") in RECEIPT_KINDS \
+                and receipt.get("mode") == MODE_EXECUTE:
+            found.update(paid_hashes(receipt))
+    return found
+
+
+async def published_batches(*, bucket: str | None = None, **client_kwargs) -> set[str]:
+    """Every paid batch's extrinsic hash the bucket's index lists (none when
+    there is no index yet). Read-only."""
+    from botocore.exceptions import ClientError
+
+    from reliquary.infrastructure import storage
+
+    bucket = bucket or client_kwargs.get("bucket_name") or os.getenv("R2_BUCKET_ID", "reliquary")
+    async with storage.get_s3_client(**client_kwargs) as client:
+        try:
+            response = await client.get_object(Bucket=bucket, Key=INDEX_KEY)
+            index = json.loads(await response["Body"].read())
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code", "") not in _ABSENT:
+                raise
+            return set()
+    return {str(h).lower() for entry in index.get("receipts", []) for h in entry.get("paid_batches") or []}
 
 
 def merge_index(index: Mapping | None, entries: Iterable[Mapping]) -> dict:
@@ -72,8 +130,9 @@ async def publish(paths: Iterable[str | Path], *, execute: bool = False, bucket:
                   **client_kwargs) -> list[dict]:
     """Each receipt file and what was done with it: ``would_write`` (a dry
     run), ``written``, ``already_published`` (the same bytes are there),
-    ``not_executed`` (a dry-run receipt, never published) or ``skipped`` (not
-    a receipt). Another receipt under the same key raises ``ReceiptError``."""
+    ``not_executed`` (a dry-run receipt, never published), ``no_batch`` (an
+    execution that sent and settled nothing) or ``skipped`` (not a receipt).
+    Another receipt under the same key raises ``ReceiptError``."""
     from botocore.exceptions import ClientError
 
     from reliquary.infrastructure import storage
@@ -93,6 +152,9 @@ async def publish(paths: Iterable[str | Path], *, execute: bool = False, bucket:
             continue
         if receipt.get("mode") != MODE_EXECUTE:
             results.append({"path": str(path), "action": "not_executed"})
+            continue
+        if not any(b.get("state") not in ("pending", "unreadable") for b in receipt_batches(receipt)):
+            results.append({"path": str(path), "action": "no_batch"})
             continue
         planned.append((path, raw, receipt, receipt_key(receipt, path.name)))
     if not execute:
@@ -143,5 +205,5 @@ async def publish(paths: Iterable[str | Path], *, execute: bool = False, bucket:
     return results
 
 
-__all__ = ["INDEX_KEY", "PUBLIC_PREFIX", "RECEIPT_KINDS", "ReceiptError", "index_entry", "merge_index", "publish",
-           "receipt_key"]
+__all__ = ["INDEX_KEY", "PUBLIC_PREFIX", "RECEIPT_KINDS", "ReceiptError", "index_entry", "local_paid_hashes",
+           "merge_index", "paid_hashes", "publish", "published_batches", "receipt_batches", "receipt_key"]

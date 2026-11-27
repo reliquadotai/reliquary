@@ -15,8 +15,10 @@ Each (order, period, hotkey, unit type) is one obligation:
 
 - ``amount_rao``: whole rao of alpha, rounded down, never more than the
   period's budget, nor an optional budget for the whole order;
-- ``obligation_id``: a hash of (order, period, hotkey, unit type), the same
-  every time it is computed, so a payer can pay each one once;
+- ``obligation_id``: a hash of (order, period, hotkey, unit type) and the
+  archive's origin entry (the entry it was first settled under), the same
+  every time it is computed and whatever other archives are present, so a
+  payer can pay each one once;
 - states: ``earned`` (the period settled, so its audit is final) while its UTC
   day is still open, ``held`` (the day closed: the dispute window), then
   ``due`` on the first pass at or after J+2 12:00 UTC, or the first pass after
@@ -27,10 +29,21 @@ Each (order, period, hotkey, unit type) is one obligation:
 
 The order is the archive's task id (its bucket prefix, as the weight setter
 trusts it). A work period settled in several archives (verdicts that arrived
-after it was paid) gives one part per archive; the first keeps the plain id,
-later ones add their part number. An archive requeued to an earlier entry
-(``replaces_entry_period``) hides the one it replaces and keeps its part, so
-its obligations keep their ids.
+after it was paid) gives one part per archive, each keyed by its origin entry.
+An archive requeued to an earlier entry (``replaces_entry_period``) hides the
+one it replaces and keeps its origin (``origin_entry_period``), so its
+obligations keep their ids.
+
+Valuation is strict: in ``frozen`` mode an archive is valued only at the
+ceiling its own price was set with. With no such ceiling it is ``unvalued``
+(an anomaly, no obligation) unless a fallback (the order's latest ceiling, the
+chain's rate) is opted into, and then each obligation says so in
+``rate_source``. An order budget is spent in settlement order, so a part that
+settles later never takes budget from work already allocated.
+
+Two instants per obligation: ``earned_at``, when its archive settled (the due
+date counts from it), and ``earn_at``, the end of its work period, a protocol
+fact no copy or migration moves: a payer looks the hotkey's owner up there.
 
 Pure: no I/O and no clock. ``sources`` reads, ``cli`` runs. Nothing here holds
 a key or moves alpha.
@@ -49,7 +62,7 @@ from reliquary.protocol.release_contract import canonical_sha256
 from reliquary.validator import corpus_periods as cp
 
 RAO_PER_ALPHA = 10**9
-OBLIGATION_ID_SCHEMA = "reliquary/obligation/v1"
+OBLIGATION_ID_SCHEMA = "reliquary/obligation/v2"
 
 # What an obligation pays for, from what its archive was priced on.
 UNIT_OUTPUT_TOKENS = "output_tokens"
@@ -79,6 +92,9 @@ RATE_FROZEN_LATEST = "frozen_latest"  # the order's latest ceiling: the archive'
 RATE_CHAIN = "chain"                  # the chain's miner alpha per period
 RATE_FIXED = "fixed"                  # given by the operator
 RATE_MODES = (RATE_FROZEN, RATE_CHAIN, RATE_FIXED)
+# What a frozen valuation may fall back to when no ceiling matches, each only when opted into.
+FALLBACK_LATEST, FALLBACK_CHAIN = "latest", "chain"
+FALLBACKS = (FALLBACK_LATEST, FALLBACK_CHAIN)
 
 # Why an obligation was cut (``Obligation.capped``).
 CAPPED_PERIOD_BUDGET = "period_budget"
@@ -175,17 +191,24 @@ class RatePolicy:
     """How a share of the miners' emission becomes alpha (owner decision; a setting).
 
     ``frozen`` (default): the miner alpha per period of the ceiling the archive
-    was paid under, then the order's latest ceiling, then ``alpha_per_period``
-    when given (``chain``); ``chain``: ``alpha_per_period`` (the chain's miner
+    was paid under, and nothing else unless ``fallbacks`` allows it (each such
+    obligation is labelled); ``chain``: ``alpha_per_period`` (the chain's miner
     alpha per period) for every archive; ``fixed``: ``alpha_per_period`` as
     given."""
 
     mode: str = RATE_FROZEN
     alpha_per_period: float | None = None
+    # Frozen mode only: what an archive whose price matches no known ceiling may be valued at instead
+    # (``latest``: the order's latest ceiling; ``chain``: ``alpha_per_period``). None by default: unvalued.
+    fallbacks: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.mode not in RATE_MODES:
             raise ValueError(f"rate mode must be one of {RATE_MODES}, got {self.mode!r}")
+        if any(f not in FALLBACKS for f in self.fallbacks):
+            raise ValueError(f"fallbacks must be among {FALLBACKS}, got {self.fallbacks!r}")
+        if FALLBACK_CHAIN in self.fallbacks and self.alpha_per_period is None:
+            raise ValueError("the chain fallback needs alpha_per_period")
         rate = self.alpha_per_period
         if rate is not None and (isinstance(rate, bool) or not isinstance(rate, (int, float))
                                  or not math.isfinite(rate) or rate <= 0):
@@ -194,7 +217,7 @@ class RatePolicy:
             raise ValueError(f"rate mode {self.mode!r} needs alpha_per_period")
 
     def to_dict(self) -> dict:
-        return {"mode": self.mode, "alpha_per_period": self.alpha_per_period}
+        return {"mode": self.mode, "alpha_per_period": self.alpha_per_period, "fallbacks": list(self.fallbacks)}
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,6 +240,8 @@ class Obligation:
     work_period: int
     entry_period: int
     part: int
+    # The entry the archive was first settled under: part of the id, stable whatever else is present.
+    origin_entry: int
     hotkey: str
     unit_type: str
     # Verified output tokens when the archive can tell them per hotkey (a fixed
@@ -233,6 +258,8 @@ class Obligation:
     period_end: float
     earned_at: float
     due_at: float
+    # The end of the work period: the immutable instant a payer looks the hotkey's owner up at (D5).
+    earn_at: float
 
     @property
     def alpha(self) -> float:
@@ -244,11 +271,12 @@ class Obligation:
     def to_dict(self) -> dict:
         return {"obligation_id": self.obligation_id, "task_id": self.task_id, "job_id": self.job_id,
                 "work_period": self.work_period, "entry_period": self.entry_period, "part": self.part,
+                "origin_entry": self.origin_entry,
                 "hotkey": self.hotkey, "unit_type": self.unit_type, "units": self.units,
                 "pool_share": self.pool_share, "alpha_per_share": self.alpha_per_share,
                 "rate_source": self.rate_source, "amount_rao": self.amount_rao, "capped": self.capped,
                 "work_day": self.work_day.isoformat(), "period_end": self.period_end,
-                "earned_at": self.earned_at, "due_at": self.due_at}
+                "earned_at": self.earned_at, "due_at": self.due_at, "earn_at": self.earn_at}
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,6 +286,9 @@ class Ledger:
 
     obligations: tuple[Obligation, ...]
     anomalies: tuple[Mapping, ...] = ()
+    # Every archive's settled shares after the period's budget, valued or not: (task id, entry period,
+    # hotkey, pool share). What the weights pay, independent of any rate (``reconcile``).
+    shares: tuple[tuple[str, int, str, float], ...] = ()
 
     def visible_at(self, now: float) -> list[Obligation]:
         """The obligations already earned at ``now``."""
@@ -302,18 +333,17 @@ class PendingWork:
 # -- identity and amounts ---------------------------------------------------------------------------------------
 
 
-def obligation_id(task_id: str, work_period: int, hotkey: str, unit_type: str, part: int = 0) -> str:
-    """The id of one obligation: a SHA-256 of its order, period, hotkey and unit
-    type (and its part, past the first archive of a period). Stable across runs,
-    processes and machines."""
+def obligation_id(task_id: str, work_period: int, hotkey: str, unit_type: str, origin_entry: int) -> str:
+    """The id of one obligation: a SHA-256 of its order, period, hotkey, unit
+    type and its archive's origin entry. Intrinsic to the archive, so it is the
+    same across runs, processes and machines, and whichever other archives of
+    the period are present."""
     if unit_type not in UNIT_TYPES:
         raise ValueError(f"unknown unit type {unit_type!r}")
-    if isinstance(part, bool) or not isinstance(part, int) or part < 0:
-        raise ValueError(f"part must be a whole number >= 0, got {part!r}")
-    preimage = [OBLIGATION_ID_SCHEMA, str(task_id), int(work_period), str(hotkey), unit_type]
-    if part:
-        preimage.append(part)
-    return canonical_sha256(preimage)
+    if isinstance(origin_entry, bool) or not isinstance(origin_entry, int) or origin_entry < 0:
+        raise ValueError(f"origin_entry must be a whole number >= 0, got {origin_entry!r}")
+    return canonical_sha256([OBLIGATION_ID_SCHEMA, str(task_id), int(work_period), str(hotkey), unit_type,
+                             origin_entry])
 
 
 def amount_rao(pool_share, alpha_per_share) -> int:
@@ -346,9 +376,9 @@ def resolve_rate(document: Mapping, ceilings: Sequence[Ceiling], policy: RatePol
         same = [c for c in ceilings if c.max_price_pool_share_per_token == float(price)]
         if same:
             return float(_latest(same).miner_alpha_per_period), RATE_FROZEN
-    if ceilings and unit_type_of(document) != UNIT_RL_ROLLOUTS:
+    if FALLBACK_LATEST in policy.fallbacks and ceilings and unit_type_of(document) != UNIT_RL_ROLLOUTS:
         return float(_latest(ceilings).miner_alpha_per_period), RATE_FROZEN_LATEST
-    if policy.alpha_per_period is not None:
+    if FALLBACK_CHAIN in policy.fallbacks and policy.alpha_per_period is not None:
         return float(policy.alpha_per_period), RATE_CHAIN
     return None, "unvalued"
 
@@ -434,7 +464,7 @@ def archive_parts(archives: Iterable[ArchiveRef]) -> list[tuple[ArchiveRef, int]
             if moved is not None and moved in entries and int(ref.entry_period) < moved:
                 hidden.add(moved)
         kept = [ref for ref in group if int(ref.entry_period) not in hidden]
-        kept.sort(key=lambda ref: (_origin_entry(ref), int(ref.entry_period)))
+        kept.sort(key=lambda ref: (origin_entry(ref), int(ref.entry_period)))
         out.extend((ref, part) for part, ref in enumerate(kept))
     return out
 
@@ -449,20 +479,21 @@ def build_ledger(archives: Iterable[ArchiveRef], *, ceilings: Mapping[str, Seque
     ``ceilings``: each order's price ceilings (its frozen rates), by task id.
     ``pay_ceilings``: each task's ``cp.pay_ceiling`` (the most one archive may
     pay, the weight setter's bound), when known. ``order_budgets_rao``: a budget
-    for a whole order, in rao; its periods are paid in order until it runs out
-    (the part that crosses it pro rata). An archive whose rewards are not
-    finite non-negative numbers, or with no rate, gives no obligation and is
-    reported in ``anomalies``."""
+    for a whole order, in rao, spent in settlement order (the part that crosses
+    it pro rata); it bounds the order only when ``archives`` hold its whole
+    history. An archive whose rewards are not finite non-negative numbers, or
+    that cannot be valued, gives no obligation and is reported in
+    ``anomalies``; its shares still count in ``shares``."""
     ceilings = ceilings or {}
     pay_ceilings = pay_ceilings or {}
     budgets = {str(task): int(rao) for task, rao in (order_budgets_rao or {}).items()}
     for task, rao in budgets.items():
         if rao < 0:
             raise ValueError(f"the order budget of {task!r} is negative")
-    obligations: list[Obligation] = []
     anomalies: list[dict] = []
+    shares: list[tuple[str, int, str, float]] = []
+    valued: list[dict] = []
     spent_share: dict[tuple[str, int], Fraction] = defaultdict(Fraction)
-    spent_rao: dict[str, int] = defaultdict(int)
     for ref, part in archive_parts(archives):
         task, doc = str(ref.task_id), ref.document
         where = {"task_id": task, "work_period": int(ref.work_period), "entry_period": int(ref.entry_period)}
@@ -473,12 +504,6 @@ def build_ledger(archives: Iterable[ArchiveRef], *, ceilings: Mapping[str, Seque
             anomalies.append({"kind": "invalid_archive", **where, "detail": str(exc)})
             continue
         if not rewards:
-            continue
-        unit = unit_type_of(doc)
-        rate, source = resolve_rate(doc, ceilings.get(task, ()), rates)
-        if rate is None:
-            anomalies.append({"kind": "unvalued", **where, "pool_share": float(sum(rewards.values())),
-                              "detail": "no frozen ceiling for this order and no chain rate given"})
             continue
         if doc.get("task_id") not in (None, task):
             anomalies.append({"kind": "task_id_mismatch", **where, "body_task_id": doc.get("task_id")})
@@ -498,38 +523,61 @@ def build_ledger(archives: Iterable[ArchiveRef], *, ceilings: Mapping[str, Seque
                     anomalies.append({"kind": "over_period_budget", **where, "part": part,
                                       "settled_pool_share": float(settled), "room_pool_share": float(room)})
         spent_share[(task, ref.work_period)] += sum(paid.values(), Fraction(0))
-        amounts = {hotkey: amount_rao(share, rate) for hotkey, share in paid.items()}
-        if task in budgets:
-            left = max(0, budgets[task] - spent_rao[task])
-            total = sum(amounts.values())
+        shares.extend((task, int(ref.entry_period), hotkey, float(share)) for hotkey, share in sorted(paid.items()))
+        unit = unit_type_of(doc)
+        rate, source = resolve_rate(doc, ceilings.get(task, ()), rates)
+        if rate is None:
+            anomalies.append({"kind": "unvalued", **where, "pool_share": float(sum(paid.values(), Fraction(0))),
+                              "detail": "no ceiling matches its price, and no fallback was allowed"})
+            continue
+        if source not in (RATE_FROZEN, RATE_FIXED) and rates.mode == RATE_FROZEN:
+            anomalies.append({"kind": "valued_by_fallback", **where, "rate_source": source})
+        valued.append({"ref": ref, "part": part, "origin": origin_entry(ref), "unit": unit, "rate": rate,
+                       "source": source, "paid": paid, "rewards": rewards, "capped": capped,
+                       "amounts": {hotkey: amount_rao(share, rate) for hotkey, share in paid.items()},
+                       "earned": (float(ref.settled_at) if ref.settled_at is not None
+                                  # Unknown: the entry period's start, which a settlement always precedes.
+                                  else cp.period_end(int(ref.entry_period) - 1, genesis))})
+    # An order's budget, spent in settlement order: what settles later never takes budget from what came first.
+    for task, budget in budgets.items():
+        left = budget
+        for row in sorted((r for r in valued if str(r["ref"].task_id) == task),
+                          key=lambda r: (r["earned"], int(r["ref"].work_period), r["origin"])):
+            total = sum(row["amounts"].values())
             if total > left:
-                amounts = {hotkey: amount * left // total for hotkey, amount in amounts.items()}
-                capped = CAPPED_ORDER_BUDGET
-            spent_rao[task] += sum(amounts.values())
-        earned = (float(ref.settled_at) if ref.settled_at is not None
-                  # Unknown: the entry period's start, which a settlement always precedes.
-                  else cp.period_end(int(ref.entry_period) - 1, genesis))
+                row["amounts"] = {hotkey: amount * left // total for hotkey, amount in row["amounts"].items()}
+                row["capped"] = CAPPED_ORDER_BUDGET
+            left = max(0, left - sum(row["amounts"].values()))
+    obligations: list[Obligation] = []
+    for row in valued:
+        ref, task = row["ref"], str(row["ref"].task_id)
+        where = {"task_id": task, "work_period": int(ref.work_period), "entry_period": int(ref.entry_period),
+                 "part": row["part"]}
         day = work_day(ref.work_period, genesis)
-        due = due_at(day, earned, terms)
-        units = _units(doc, rewards, ceilings.get(task, ()), unit)
-        unpaid = 0
-        for hotkey in sorted(paid):
-            if amounts[hotkey] <= 0:
-                unpaid += 1
+        due = due_at(day, row["earned"], terms)
+        units = _units(ref.document, row["rewards"], ceilings.get(task, ()), row["unit"])
+        unpaid: dict[str, int] = defaultdict(int)
+        for hotkey in sorted(row["paid"]):
+            amount = row["amounts"][hotkey]
+            if amount <= 0:
+                # Why nothing is owed: the period's budget was spent by an earlier part, an order's budget
+                # ran out, or the share is under one rao.
+                reason = ("period_budget_spent" if row["paid"][hotkey] == 0
+                          else "order_budget_spent" if row["capped"] == CAPPED_ORDER_BUDGET else "under_one_rao")
+                unpaid[reason] += 1
                 continue
             obligations.append(Obligation(
-                obligation_id=obligation_id(task, ref.work_period, hotkey, unit, part),
-                task_id=task, job_id=_optional_str(doc.get("job_id")), work_period=int(ref.work_period),
-                entry_period=int(ref.entry_period), part=part, hotkey=hotkey, unit_type=unit,
-                units=None if units is None else units.get(hotkey), pool_share=float(paid[hotkey]),
-                alpha_per_share=float(rate), rate_source=source, amount_rao=amounts[hotkey], capped=capped,
-                work_day=day, period_end=cp.period_end(int(ref.work_period), genesis), earned_at=earned,
-                due_at=due))
-        if unpaid:
-            # Nothing is owed below one rao; past an order's budget, nothing at all.
-            kind = "order_budget_spent" if capped == CAPPED_ORDER_BUDGET else "under_one_rao"
-            anomalies.append({"kind": kind, **where, "part": part, "hotkeys": unpaid})
-    return Ledger(obligations=tuple(obligations), anomalies=tuple(anomalies))
+                obligation_id=obligation_id(task, ref.work_period, hotkey, row["unit"], row["origin"]),
+                task_id=task, job_id=_optional_str(ref.document.get("job_id")), work_period=int(ref.work_period),
+                entry_period=int(ref.entry_period), part=row["part"], origin_entry=row["origin"], hotkey=hotkey,
+                unit_type=row["unit"], units=None if units is None else units.get(hotkey),
+                pool_share=float(row["paid"][hotkey]), alpha_per_share=float(row["rate"]),
+                rate_source=row["source"], amount_rao=amount, capped=row["capped"], work_day=day,
+                period_end=cp.period_end(int(ref.work_period), genesis), earned_at=row["earned"], due_at=due,
+                earn_at=cp.period_end(int(ref.work_period), genesis)))
+        for reason, count in sorted(unpaid.items()):
+            anomalies.append({"kind": reason, **where, "hotkeys": count})
+    return Ledger(obligations=tuple(obligations), anomalies=tuple(anomalies), shares=tuple(shares))
 
 
 def pending_from_archives(archives: Iterable[ArchiveRef], now: float,
@@ -621,7 +669,13 @@ def _replaced_entry(ref: ArchiveRef) -> int | None:
     return None if moved is None else int(moved)
 
 
-def _origin_entry(ref: ArchiveRef) -> int:
+def origin_entry(ref: ArchiveRef) -> int:
+    """The entry an archive was first settled under: kept through requeues
+    (``origin_entry_period``, else the ``replaces_entry_period`` of a single
+    move), else its own entry."""
+    origin = ref.document.get("origin_entry_period")
+    if origin is not None:
+        return int(origin)
     moved = _replaced_entry(ref)
     return int(ref.entry_period) if moved is None else moved
 
@@ -665,6 +719,9 @@ __all__ = [
     "RATE_FIXED",
     "RATE_FROZEN",
     "RATE_FROZEN_LATEST",
+    "FALLBACKS",
+    "FALLBACK_CHAIN",
+    "FALLBACK_LATEST",
     "RatePolicy",
     "LEDGER_STATES",
     "STATES",
@@ -681,6 +738,7 @@ __all__ = [
     "due_at",
     "next_pass",
     "obligation_id",
+    "origin_entry",
     "pass_day",
     "pay_instant",
     "pending_from_archives",
