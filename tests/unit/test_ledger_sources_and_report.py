@@ -341,6 +341,46 @@ def test_a_report_before_the_pass_is_a_preview_and_a_late_settlement_joins_the_n
     assert later["pass"]["work_days"] == ["2026-11-24"] and later["pass"]["late_obligations"] == 1
 
 
+def test_replacement_preview_reads_local_archives_and_frozen_ceilings(tmp_path):
+    folder = tmp_path / "periods" / TASK
+    folder.mkdir(parents=True)
+    archive = folder / f"{WORK:010d}-{WORK + 1:010d}.json"
+    event = {"event_id": "departure", "hotkey": "old-hot", "coldkey_at_earn": "owner",
+             "reason": "replacement", "assessed_rao": 1000, "recovered_at_settlement_rao": 300}
+    document = _doc({"earning-hot": 5e-7}, replacement_debits_v1=[event])
+    archive.write_text(json.dumps(document))
+    native = folder.parent / "native-rl"
+    native.mkdir()
+    (native / archive.name).write_text(json.dumps({
+        "schema": ob.RL_ARCHIVE_SCHEMA, "task_id": "native-rl", "work_period": WORK,
+        "rewards_by_hotkey": {"native-hot": 0.01},
+    }))
+    oid = ob.obligation_id(TASK, WORK, "earning-hot", ob.UNIT_OUTPUT_TOKENS, WORK + 1)
+    evidence = {"owners": [{"hotkey": key, "coldkey": "owner", "work_period": WORK}
+                           for key in ("old-hot", "earning-hot")],
+                "balances": [{"obligation_id": oid, "rail": "collector", "state": "held", "retained_rao": 400},
+                             {"obligation_id": "unvalued-native", "rail": "native", "state": "paid", "retained_rao": 0}],
+                "applications": [], "ceilings": {TASK: [{"miner_alpha_per_period": 1,
+                                                        "max_price_pool_share_per_token": 1e-8}]}}
+    snapshot = tmp_path / "snapshot.json"
+    snapshot.write_text(json.dumps(evidence))
+    args = ["simulate-replacement-debits", "--archives", str(folder.parent), "--snapshot", str(snapshot)]
+    first = CliRunner().invoke(ledger_app, args)
+    assert first.exit_code == 0, first.output
+    report = json.loads(first.output)
+    assert report["mode"] == "simulation"
+    assert report["events"][0]["unrecovered_rao"] == 300
+    assert report["proposed_applications"] == [{"event_id": "departure", "obligation_id": oid, "amount_rao": 400}]
+    assert json.loads(snapshot.read_text()) == evidence
+    assert json.loads(archive.read_text()) == document
+
+    evidence["applications"] = report["proposed_applications"]
+    snapshot.write_text(json.dumps(evidence))
+    again = CliRunner().invoke(ledger_app, args)
+    assert again.exit_code == 0, again.output
+    assert json.loads(again.output)["proposed_applications"] == []
+
+
 def test_the_cli_builds_a_report_from_a_directory_without_network(tmp_path):
     folder = tmp_path / "archives" / TASK
     folder.mkdir(parents=True)
