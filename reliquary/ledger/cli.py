@@ -79,6 +79,49 @@ def _parse_instant(value: str | None) -> float:
     return parsed.timestamp()
 
 
+@ledger_app.command("simulate-replacement-debits")
+def simulate_debits_command(
+    archives: Path = typer.Option(..., "--archives", exists=True, file_okay=False,
+                                  help="Local corpus-periods directory for the full replay."),
+    snapshot: Path = typer.Option(..., "--snapshot", exists=True, dir_okay=False,
+                                  help="Local JSON with historical owners, balances, prior applications and ceilings."),
+) -> None:
+    """Preview J+2 recovery from local evidence. Prints proposals and changes no balances.
+
+    Supply owners, balances and applications for the same cut of history. The optional
+    ceilings map holds each task's frozen pay.price_ceiling views. pay_ceilings (pool shares)
+    and order_budgets_rao (whole-order limits) use the same units as the report.
+    """
+    from reliquary.ledger.obligations import Ceiling, build_ledger
+    from reliquary.ledger.replacement_debits import simulate_replacement_debits
+    from reliquary.ledger.sources import DirectoryArchives
+
+    try:
+        evidence = json.loads(snapshot.read_text())
+        if not isinstance(evidence, dict):
+            raise ValueError("snapshot must be an object")
+        ceilings = {task: [Ceiling.from_view(view, pricing=view.get("pricing")) for view in views]
+                    for task, views in evidence.get("ceilings", {}).items()}
+        budgets = evidence.get("order_budgets_rao", {})
+        if not isinstance(budgets, dict) or any(type(n) is not int or n < 0 for n in budgets.values()):
+            raise ValueError("order_budgets_rao must map tasks to nonnegative integer rao")
+        refs = asyncio.run(DirectoryArchives(archives).refs(work_from=0))
+        ledger = build_ledger(refs, ceilings=ceilings, pay_ceilings=evidence.get("pay_ceilings"),
+                              order_budgets_rao=budgets)
+        if any(ref.document.get("replacement_debits_v1") for ref in refs):
+            collector_ids = {b.get("obligation_id") for b in evidence["balances"] if b.get("rail") == "collector"}
+            tasks = {ob.task_id for ob in ledger.obligations if ob.obligation_id in collector_ids}
+            invalid = {a["kind"] for a in ledger.anomalies if a.get("task_id") in tasks
+                       and a["kind"] in {"unvalued", "invalid_archive", "task_id_mismatch"}}
+            if invalid:
+                raise ValueError("cannot value the replay from these archives and frozen ceilings: "
+                                 + ", ".join(sorted(invalid)))
+        result = simulate_replacement_debits(refs, ledger.obligations, evidence)
+    except (ValueError, TypeError, KeyError, AttributeError, OSError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(json.dumps({"mode": "simulation", **result}, sort_keys=True))
+
+
 @ledger_app.command("report")
 def report_command(
     pay_day: str = typer.Option(None, "--pay-day", help="UTC day of the pass (YYYY-MM-DD); default: the last "
