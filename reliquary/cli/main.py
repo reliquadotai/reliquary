@@ -37,12 +37,15 @@ from reliquary.constants import (
     VALIDATOR_HTTP_PORT,
 )
 from reliquary.environment.registry import resolve_environment_mix
+from reliquary.ledger.cli import ledger_app
 from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE
 from reliquary.validator.errors import FatalProofPlaneError
 
 _DEFAULT_ENVS = DEFAULT_ENVIRONMENTS
 
 app = typer.Typer(name="reliquary", help="Reliquary — Verifiable Inference Subnet")
+# The payout ledger (read-only): `reliquary ledger report`.
+app.add_typer(ledger_app)
 
 logger = logging.getLogger(__name__)
 
