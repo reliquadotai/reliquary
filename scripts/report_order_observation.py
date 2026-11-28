@@ -18,6 +18,7 @@ not inferred. Coverage refers only to the period fragments present in this file.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import math
 import sqlite3
@@ -80,6 +81,11 @@ class Receipt:
 def _load_periods(db, job, counts):
     receipts = {}
     complete = True
+    grant_columns = {r[1] for r in db.execute("PRAGMA table_info(observed_draw_grants)")}
+    rate_column = "miner_alpha_per_period" if "miner_alpha_per_period" in grant_columns else "NULL"
+    lookup = f"""SELECT {rate_column} FROM observed_draw_grants
+                 WHERE order_id=? AND receipt=? AND hotkey=? AND received=? AND tokens=? AND price IS ?"""
+
     periods = db.execute("""SELECT document FROM observed_periods WHERE order_id=?
                             ORDER BY work_period,entry_period""", (job,))
     for (document,) in periods:
@@ -102,11 +108,15 @@ def _load_periods(db, job, counts):
         deliveries = row["deliveries"]
         if deliveries is None:
             counts["fragments_without_receipts"] += 1
+            counts["settled_tokens_missing_receipt_details"] += volume
             complete = complete and volume == 0
             continue
         if not isinstance(deliveries, list):
             raise TypeError("invalid delivery list")
         detailed = 0
+        linked = 0
+        valued_tokens = 0
+        grant_value_rao = Fraction(0)
         for delivery in deliveries:
             sid, miner = delivery["id"], delivery["hotkey"]
             if not isinstance(sid, str) or not sid or not isinstance(miner, str) or not miner:
@@ -125,8 +135,17 @@ def _load_periods(db, job, counts):
                 counts["tokens_missing_receipt_time"] += volume_i
             else:
                 at = _number(at, "receipt time")
+            grant = grant_columns and db.execute(lookup,
+                (job, sid, miner, delivery["received_at"], volume_i, delivery["lease_price"])).fetchone()
+            if grant:
+                linked += volume_i
             price = delivery["lease_price"]
             price = _number(price, "observed lease price") if price is not None else None
+            if grant and price is not None:
+                grant_rate = grant[0]
+                if type(grant_rate) in (int, float) and math.isfinite(grant_rate) and grant_rate > 0:
+                    valued_tokens += volume_i
+                    grant_value_rao += volume_i * price * Fraction(grant_rate) * 10**9
             nominal = price * rate if price is not None and rate is not None else None
             receipts[sid] = Receipt(sid, miner, at, volume_i, audited, nominal)
             detailed += volume_i
@@ -134,7 +153,13 @@ def _load_periods(db, job, counts):
             counts["audited_receipt_tokens"] += volume_i if audited else 0
         if detailed != volume:
             counts["fragments_with_volume_mismatch"] += 1
+            counts["settled_tokens_inconsistent_receipt_details"] += volume
             complete = False
+        else:
+            counts["settled_tokens_valued_at_grant"] += valued_tokens
+            counts["grant_value_rao"] += grant_value_rao
+            counts["settled_tokens_with_original_grant"] += linked
+            counts["settled_tokens_without_original_grant"] += volume - linked
     return receipts, complete
 
 
@@ -226,6 +251,8 @@ def report(path, *, order_id=None):
     reasons = ("orders", "orders_without_owner_snapshot", "tokens_without_owner_snapshot", "captured_period_fragments", "valued_fragments", "fragments_missing_valuation",
                "settled_tokens", "fragments_without_receipts", "fragments_with_volume_mismatch",
                "receipt_tokens", "audited_receipt_tokens", "orders_with_incomplete_detail",
+               "settled_tokens_valued_at_grant", "settled_tokens_with_original_grant", "settled_tokens_without_original_grant",
+               "settled_tokens_missing_receipt_details", "settled_tokens_inconsistent_receipt_details",
                "tokens_missing_receipt_time", "orders_without_final_verified_total", "orders_with_matching_final_tokens",
                "orders_with_final_token_gap", "final_verified_tokens_on_known_orders", "captured_tokens_on_known_orders",
                "unmatched_incomplete_history_tokens", "unmatched_outage_tokens",
@@ -235,12 +262,16 @@ def report(path, *, order_id=None):
         **{name: counts[name] for name in reasons},
         "settled_baseline_rao_on_valued_fragments": counts["settled_baseline_rao"] if counts["valued_fragments"] else None,
         "matched_nominal_contract_millirao": counts["matched_contract_millirao"] if counts["matched_contract_tokens"] else None,
+        "gross_value_at_grant_rao_floor": math.floor(counts["grant_value_rao"]) if counts["settled_tokens_valued_at_grant"] else None,
+        "grant_value_basis": "gross lease share times emission recorded at grant on linked tokens in volume-consistent fragments, before debits",
+        "paired_nominal_observed_at_opening_rate_millirao_floor": math.floor(counts["paired_observed_millirao"]) if paired else None,
         "paired_nominal_observed_millirao_floor": math.floor(counts["paired_observed_millirao"]) if paired else None,
         "paired_nominal_contract_millirao": counts["paired_contract_millirao"] if paired else None,
         "ownership_basis": "last completed registry read known by the opening second within the registration cache TTL; rotations between reads are unobserved",
+        "original_grant_coverage_basis": "all captured settled tokens, split among linked, unlinked, missing receipt details and inconsistent fragment totals",
         "coverage_basis": "pairing requires complete receipt details and captured tokens equal to the authoritative final count",
         "settlement_basis": "archived net shares valued at the opening emission when the archived ceiling matches, floored to rao per miner per fragment",
-        "comparison_basis": "gross prices at original receipt times; elapsed-rate envelope is a conservative heuristic for bursty arrivals",
+        "comparison_basis": "paired observed nominal uses the opening emission and the lease price recorded on the receipt; elapsed-rate envelope is a conservative heuristic for bursty arrivals",
     }
 
 
@@ -263,6 +294,45 @@ def standing_supply(path, market, before):
     return {"before_unix_second": before, "active_offers": active, "offering_coldkeys": owners}
 
 
+async def verify_grants(path, job, records):
+    """Read canonical records and current verdicts for private acceptance links, returning only counts."""
+    counts = dict.fromkeys(("observed_grants", "without_acceptance_link", "unconfirmed_receipts",
+                            "confirmed_receipts", "unknown_verdicts", "passed", "failed", "voided"), 0)
+    with closing(sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)) as db:
+        db.execute("BEGIN")
+        if not db.execute("SELECT 1 FROM orders WHERE order_id=?", (job,)).fetchone():
+            raise ValueError("the requested order is absent from this observation file")
+        table = db.execute("SELECT 1 FROM sqlite_master WHERE name='observed_draw_grants'").fetchone()
+        if not table:
+            return {"coverage": "original grant capture unavailable", **counts}
+        # Release the SQLite read transaction before the remote reads so it cannot
+        # keep the front's observation writer out during a report.
+        rows = db.execute("""SELECT receipt,hotkey,received,tokens,price,debit,prompt,slot
+                             FROM observed_draw_grants WHERE order_id=?""", (job,)).fetchall()
+    for sid, miner, received, tokens, price, debit, prompt, slot in rows:
+        counts["observed_grants"] += 1
+        if sid is None:
+            counts["without_acceptance_link"] += 1
+            continue
+        expected = {"submission_id": sid, "hotkey": miner, "received_at": received,
+                    "token_count": tokens, "lease_price": price, "lease_debit": debit}
+        receipt = await records.read_submission(job, sid)
+        if not receipt or any(receipt.get(k) != v for k, v in {
+                **expected, "job_id": job, "prompt_index": prompt, "cursor": slot}.items()):
+            counts["unconfirmed_receipts"] += 1
+            continue
+        counts["confirmed_receipts"] += 1
+        verdict = await records.read_verdict(job, sid)
+        if (not verdict or any(verdict.get(k) != v for k, v in expected.items())
+                or type(verdict.get("passed")) is not bool):
+            counts["unknown_verdicts"] += 1
+            continue
+        void = await records.read_voided(job, sid)
+        outcome = "voided" if void is not None else ("passed" if verdict["passed"] else "failed")
+        counts[outcome] += 1
+    return {"coverage": "original grants captured locally; receipt and verdict checked at read time", **counts}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("database", type=Path)
@@ -270,11 +340,22 @@ def main():
     select.add_argument("--order", help="restrict the aggregate to one local order")
     select.add_argument("--market", help="count posted standing offers for a market before opening; eligibility is checked at opening")
     parser.add_argument("--before", type=int, help="exclusive opening second for --market (default: current Unix time)")
+    parser.add_argument("--verify-grants", action="store_true",
+                        help="read back canonical submissions and verdicts for captured grants of --order")
     args = parser.parse_args()
+    if args.verify_grants and args.order is None:
+        parser.error("--verify-grants requires --order")
     if args.before is not None and args.market is None:
         parser.error("--before requires --market")
     try:
-        if args.market is None:
+        if args.verify_grants:
+            from reliquary.infrastructure.corpus_record_store import BucketRecordStore
+
+            try:
+                result = asyncio.run(verify_grants(args.database, args.order, BucketRecordStore()))
+            except Exception:
+                parser.exit(2, "could not verify the local evidence against the canonical record store\n")
+        elif args.market is None:
             result = report(args.database, order_id=args.order)
         else:
             cutoff = int(time.time()) if args.before is None else args.before

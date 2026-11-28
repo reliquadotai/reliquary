@@ -2681,6 +2681,9 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
     def router_for(w):
         from reliquary.validator.corpus_validator import _lease_verifier
 
+        spec = (getattr(w.entry, "params", None) or {}).get("order_contract") or {}
+        observer = (contract_observation if contract_observation is not None and spec.get("mode") == "observation"
+                    and spec.get("market") in contract_observation.markets else None)
         router = build_corpus_router(
             job_id=str(w.entry.job_id), store=store, tokenizer=w.tokenizer,
             renderer=w.renderer, verify_signature=verify_signature,
@@ -2692,7 +2695,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             is_banned=w.is_banned, registration=registration, seen_index=w.seen_index,
             suspect_until=getattr(w, "suspect_until", None),
             job=getattr(w, "job", None), durable_records=False, auction=_auction_of(w),
-            lease_fault=_lease_fault_of(w),
+            lease_observation=observer, lease_fault=_lease_fault_of(w),
             # Held by this control for its audit (a restart's seed, a judge down): no lease runs out meanwhile.
             lease_held=functools.partial(routes.lease_clock_stopped, str(w.entry.job_id)),
             episode_intake=getattr(w, "episode_intake", None))

@@ -1705,6 +1705,7 @@ def build_corpus_router(
     durable_records: bool | None = None,
     pending_record_arrivals: dict[str, float] | None = None,
     auction=None,
+    lease_observation=None,
     lease_fault=None,
     lease_held: Callable[[], bool] | None = None,
 ) -> APIRouter:
@@ -1884,9 +1885,16 @@ def build_corpus_router(
         }
         return record
 
+    async def observe_accepted(lease_id, record):
+        if lease_observation is not None and lease_id is not None:
+            try:
+                await asyncio.to_thread(lease_observation.accepted, job_id, lease_id, record)
+            except Exception:
+                logger.warning("original lease receipt observation unavailable")
+
     async def _record_accepted(request: CorpusSubmissionRequest, served: str,
                                episode_facts: IntakeFacts | None = None, pricing: Mapping | None = None,
-                               prompt_tokens: int | None = None) -> None:
+                               prompt_tokens: int | None = None, observed_lease_id=None) -> None:
         if records is None:
             return
         record = _accepted_record(request, served, episode_facts, pricing=pricing,
@@ -1927,6 +1935,9 @@ def build_corpus_router(
                 logger.exception(
                     "corpus on_accepted callback failed for %s", submission_id[:12]
                 )
+
+        if observed_lease_id is not None:
+            await observe_accepted(observed_lease_id, record)
 
     async def seal(chunks: list[list[str]]) -> list[SegmentRef]:
         """Seal pending digests into segments; shared by submit and skip."""
@@ -2124,9 +2135,12 @@ def build_corpus_router(
         # A job priced by auction pays a slot at its lease's price, less the hotkey's debt (``corpus.token_auction``):
         # the debit is taken now and given back unless this submission is newly accepted.
         pricing: dict | None = None
-        if auction is not None and drawn:
+        observed_lease_id = None
+        if drawn and (auction is not None or lease_observation is not None):
             own = _leases(job).held(request.miner_hotkey, request.prompt_index, request.cursor)
-            if own is not None and own.price is not None:
+            if own is not None and lease_observation is not None:
+                observed_lease_id = own.lease_id
+            if auction is not None and own is not None and own.price is not None:
                 value = float(own.price) * sum(token_counts)
                 pricing = {"lease_price": float(own.price),
                            "lease_debit": auction.take_debit(request.miner_hotkey, value),
@@ -2230,8 +2244,10 @@ def build_corpus_router(
                 mark = time.perf_counter()
                 if record is not None:
                     await recover_records(job)
+                    if observed_lease_id is not None:
+                        await observe_accepted(observed_lease_id, record)
                 else:
-                    await _record_accepted(request, job_id, episode_facts, pricing, prompt_tokens)
+                    await _record_accepted(request, job_id, episode_facts, pricing, prompt_tokens, observed_lease_id)
                 timing["record_write"] = time.perf_counter() - mark
             finally:
                 # Whatever the record step does: the ledger's verdict decides.
@@ -2862,6 +2878,16 @@ def build_corpus_router(
         return _lease_refused(gated) if gated is not None else None
 
     def _grant_leases(job, state, hotkey: str, wanted: int):
+        granted, reason = _allocate_leases(job, state, hotkey, wanted)
+        if granted and lease_observation is not None:
+            try:
+                lease_observation.grants(job.job_id, granted, miner_alpha_per_period=(
+                    auction.params.miner_alpha_per_period if auction is not None else None))
+            except Exception:
+                logger.warning("original draw lease observation unavailable")
+        return granted, reason
+
+    def _allocate_leases(job, state, hotkey: str, wanted: int):
         """Up to ``wanted`` leases for ``hotkey`` (off the event loop), and why the next one was not granted
         (None when all were)."""
         from reliquary.corpus.draw_leases import free_draw_slots
