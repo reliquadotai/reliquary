@@ -11,6 +11,7 @@ an entry is logged once, never once per refresh.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import collections
 import logging
 import time
@@ -499,6 +500,9 @@ class CorpusJobSet:
             last = self._status_cache.get(job_id)
             final = {**(last[1] if last else {"job_id": job_id}), "state": "drained",
                      "counts_complete": False}
+        observed = (getattr(getattr(wiring, "entry", None), "params", None) or {}).get("order_contract", {}).get("mode") == "observation"
+        if observed:
+            final["observation_closed_at"] = int(self._clock())
         if self._finals is not None:
             # A durable settlement can become visible before the local totals catch up.
             if final["audited"] > final["settled"]:
@@ -514,7 +518,12 @@ class CorpusJobSet:
                 if final["audited"] < final["settled"]:
                     final["counts_complete"] = False
                 # Kept before anything is released: a restart serves it.
-                await self._finals.write_final_status(job_id, final)
+                created = await self._finals.write_final_status(job_id, final)
+                if observed and created is False:
+                    # A previous process already certified the final. Its timestamp owns the closure.
+                    final = await self._finals.read_final_status(job_id)
+                    if final is None:
+                        return
             except Exception:
                 logger.exception("corpus job %s: final status not written; retrying", job_id)
                 return
@@ -526,7 +535,9 @@ class CorpusJobSet:
         self._status_locks.pop(job_id, None)
         if self._on_unwired is not None:
             try:
-                self._on_unwired(wiring)
+                result = self._on_unwired(wiring)
+                if inspect.isawaitable(result):
+                    await result
             except Exception:
                 logger.exception("corpus job %s: releasing its wiring failed", job_id)
         logger.info("corpus job %s drained and unwired", job_id)

@@ -835,6 +835,11 @@ CORPUS_ASK_SWAP_DOMAIN = b"reliquary/corpus-ask/v3"
 def build_corpus_lease_binding(request) -> bytes:
     """A lease request's, a release's or an ask's binding (``CorpusAskRequest``), each under its own domain."""
     body = _corpus_fields(request)
+    if "market" in body and "sequence" in body:
+        parts = [str(body[key]).encode() for key in ("market", "miner_hotkey", "coldkey")]
+        parts.extend(int(body[key]).to_bytes(8, "big") for key in (
+            "sequence", "micro_alpha_per_mtoken", "tokens_per_second", "slots"))
+        return _bound(b"reliquary/corpus-standing-offer/v1", parts)
     if "micro_alpha_per_mtoken" in body:
         parts = [str(body["job_id"]).encode(), str(body["miner_hotkey"]).encode(),
                  int(body["issued_at"]).to_bytes(8, "big", signed=False), str(body["nonce"]).encode(),

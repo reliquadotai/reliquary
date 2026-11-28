@@ -137,6 +137,7 @@ class CorpusPeriodSettler:
         self.open_periods_at: float | None = None
         self.on_settled = on_settled
         self.on_window = None
+        self.on_observed_archive = None
 
     @property
     def totals(self) -> dict | None:
@@ -314,7 +315,7 @@ class CorpusPeriodSettler:
         return cp.entry_for(due, (entry for _, entry in listed),
                             used=(entry for w, entry in listed if w == work))
 
-    async def _finish(self, state: dict, etag) -> int:
+    async def _finish(self, state: dict, etag, batch=None) -> int:
         pending = state["pending"]
         written = await self._archives.read(self._task_id, pending["work_period"],
                                             pending["entry_period"])
@@ -346,6 +347,12 @@ class CorpusPeriodSettler:
             final["period_paid"] = {**(state.get("period_paid") or {}),
                                     str(pending["work_period"]): pending["period_paid"]}
         await self._records.write_settlement(self._job_id, final, etag)
+        if self.on_observed_archive is not None:
+            try:
+                await asyncio.to_thread(self.on_observed_archive, written or self._archive(pending),
+                                        pending["ids"], batch)
+            except Exception:
+                logger.exception("local observation missed a settled archive for %s", self._task_id)
         self._report(final, pending["ids"])
         if self.on_window is not None:
             try:
@@ -517,7 +524,7 @@ class CorpusPeriodSettler:
                 state["pending"].update(input_price=input_price, input_tokens=input_tokens,
                                         period_value=earlier_value + new_value)
             etag = await self._records.write_settlement(self._job_id, state, etag)
-            last = await self._finish(state, etag)
+            last = await self._finish(state, etag, batch)
             self.open_periods.pop(str(period), None)
             state, etag = await self._records.read_settlement(self._job_id)
         return last

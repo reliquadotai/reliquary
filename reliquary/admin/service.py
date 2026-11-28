@@ -1545,6 +1545,29 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         from reliquary.eval.prompt_source import eval_job_prefix
 
         evaluation = body.job_id.startswith(eval_job_prefix(task_prefix))
+        from dataclasses import replace
+
+        from reliquary.corpus import contract_spec
+
+        config = os.environ.get(contract_spec.MARKETS_ENV)
+
+        async def price_entry():
+            job = parse_job(manifest)
+            priced = replace(entry, params={**entry.params, **await token_price(body.max_price_usd_per_mtoken),
+                                             **order_pricing()})
+            sized = await sized_entry(priced, job, body.audit_executors)
+            try:
+                marker = contract_spec.declaration(config, job, sized.params, opened_at=int(clock()),
+                                                   evaluation=evaluation)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise HTTPException(status_code=503, detail=f"order_contract: {exc}") from exc
+            return sized if marker is None else replace(sized, params={**sized.params, contract_spec.PARAM: marker})
+
+        # Check the requested policy before writing an order record or manifest. A replay
+        # retains its stored contract even when prices, the config or the chain have changed.
+        priced_entry = None
+        if config and body.max_price_usd_per_mtoken is not None and not await entries_naming(body.job_id):
+            priced_entry = await price_entry()
         if ((evaluation or body.job_id.startswith(gen_job_prefix(task_prefix)))
                 and body.draw is not None and body.qualification_id is None
                 and not operator_generation_job(body)):
@@ -1582,13 +1605,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=409, detail=(
                 f"job {body.job_id!r} is already declared by task {named[0].task_id!r}"))
         if body.max_price_usd_per_mtoken is not None:
-            # Converted once, here: a replay answers the stored task above, whatever the rate is by then.
-            from dataclasses import replace
-
-            entry = replace(entry, params={**entry.params,
-                                           **await token_price(body.max_price_usd_per_mtoken),
-                                           **order_pricing()})
-            entry = await sized_entry(entry, parse_job(manifest), body.audit_executors)
+            entry = priced_entry if priced_entry is not None else await price_entry()
         try:
             await registry_store.create_task(entry, guard=await draining_limits(cap))
         except (RegistryError, registry_store.RegistryConflict) as exc:

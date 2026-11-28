@@ -107,14 +107,18 @@ class DrawLeases:
                  on_unused: Callable[[Lease, float], None] | None = None,
                  validator_fault: Callable[[Lease], tuple[str, str] | None] | None = None,
                  state_path: str | os.PathLike | None = None,
-                 held: Callable[[], bool] | None = None) -> None:
+                 held: Callable[[], bool] | None = None,
+                 contract_tail_rescue: Callable[[str], bool | None] | None = None) -> None:
         """``limit_per_hotkey`` False (a job priced by auction): no per-hotkey cap, the price decides who works.
         ``on_unused(lease, held_fraction)`` hears of a lease that ended without its slot taken: expired (1) or
         released (the share of its time it was held). ``validator_fault(lease)`` names ``(cause, detail)`` when
         our side failed the lease's episode (``sandbox.corpus_lease_faults``, from the session book and the
         issuer's own refusals, never the miner's word): that lease ends uncharged, neither ``on_unused`` (no debt,
         no halved capacity) nor counted against the hotkey's unused leases. ``held()``: the control keeps miners
-        off this job for its own reasons, so the leases' clock is stopped."""
+        off this job for its own reasons, so the leases' clock is stopped.
+        Providing ``contract_tail_rescue`` disables the legacy second lease halfway through a hold.
+        An eligible tail miner can race a lapsed holder during the original lease's late grace.
+        Any other miner with an allowance can still replace an expired lease exclusively."""
         self._job = job
         self._limit = bool(limit_per_hotkey)
         self._on_unused = on_unused
@@ -133,6 +137,9 @@ class DrawLeases:
         # (a late honest batch), for one more lease time: charged only once someone else takes the slot or
         # that time runs out.
         self._lapsed: dict[str, Lease] = {}
+        self._contract_tail_rescue = contract_tail_rescue
+        # Replacement lease id -> lapsed original, only for a two-miner race authorized at grant.
+        self._rescues: dict[str, str] = {}
         # The route grants off the event loop and refuses and settles on it.
         self._lock = threading.RLock()
         self._state_path = Path(state_path) if state_path is not None else None
@@ -172,6 +179,9 @@ class DrawLeases:
                 lease = Lease(**raw)
                 if kept or lease.expires_at + self.seconds > now:
                     self._lapsed[lease.lease_id] = lease
+            if self._contract_tail_rescue is not None:
+                self._rescues = {i: old for i, old in state.get("rescues", {}).items()
+                                 if i in self._by_id and old in self._lapsed}
             spared = state.get("spared")
             self._spared = {str(i): float(t) for i, t in spared.items() if str(i) in self._lapsed} \
                 if isinstance(spared, Mapping) else {}
@@ -197,9 +207,10 @@ class DrawLeases:
                 tmp = self._state_path.with_suffix(".tmp")
                 clock = "" if self._stopped_at is None else f', "stopped_at": {json.dumps(self._stopped_at)}'
                 spared = "" if not self._spared else f', "spared": {json.dumps(self._spared, sort_keys=True)}'
+                rescues = "" if not self._rescues else f', "rescues": {json.dumps(self._rescues)}'
                 tmp.write_text(f'{{"leases": [{self._encoded(self._by_id)}], '
                                f'"lapsed": [{self._encoded(self._lapsed)}], '
-                               f'"unused": {json.dumps(self._unused)}{clock}{spared}}}')
+                               f'"unused": {json.dumps(self._unused)}{clock}{spared}{rescues}}}')
                 os.replace(tmp, self._state_path)
                 if len(self._texts) > 2 * (len(self._by_id) + len(self._lapsed)) + 64:
                     self._texts = {i: self._texts[i] for book in (self._by_id, self._lapsed) for i in book}
@@ -224,6 +235,7 @@ class DrawLeases:
         if lease is None:
             return
         self._dirty = True
+        self._rescues.pop(lease_id, None)
         key = (lease.prompt_index, lease.slot)
         held = [other for other in self._by_slot.get(key, ()) if other != lease_id]
         if held:
@@ -363,10 +375,17 @@ class DrawLeases:
         for more than half its time. ``free_slots(start)`` yields the job's open ``(prompt, slot)``, prompts from
         ``start`` round. ``seconds``: this lease's time, at most the job's. None: no slot to lease; a string: why
         this hotkey gets none."""
+        rescue_allowed = False
+        if self._contract_tail_rescue is not None:
+            # Read the contract outside the lease lock: admission may itself read our holdings.
+            try:
+                rescue_allowed = self._contract_tail_rescue(hotkey) is True
+            except Exception:
+                logger.exception("draw leases: tail eligibility unavailable, using exclusive reissue")
         with self._lock:
-            return self._grant(hotkey, free_slots, price, round, seconds, offer)
+            return self._grant(hotkey, free_slots, price, round, seconds, offer, rescue_allowed)
 
-    def _grant(self, hotkey, free_slots, price=None, round=None, seconds=None, offer=None):
+    def _grant(self, hotkey, free_slots, price=None, round=None, seconds=None, offer=None, rescue_allowed=False):
         self.expire()
         if len(self.held_by(hotkey)) >= self.cap(hotkey):
             return "too_many_leases"
@@ -377,7 +396,11 @@ class DrawLeases:
         for prompt_index, slot in free_slots(start):
             held = self._by_slot.get((prompt_index, slot), ())
             if not held:
-                return self._add(hotkey, prompt_index, slot, now, price, round, seconds, "granted", offer)
+                original = self._rescue_original(hotkey, prompt_index, slot) if rescue_allowed else None
+                return self._add(hotkey, prompt_index, slot, now, price, round, seconds,
+                                 "granted_rescue" if original else "granted", offer, original)
+            if self._contract_tail_rescue is not None:
+                continue
             leases = [self._by_id[i] for i in held]
             if (tail is None and len(leases) == 1 and leases[0].hotkey != hotkey
                     and now - leases[0].granted_at >= SECOND_LESSEE_AFTER * (leases[0].expires_at - leases[0].granted_at)):
@@ -386,14 +409,22 @@ class DrawLeases:
             return self._add(hotkey, *tail, now, price, round, seconds, "granted_second", offer)
         return None
 
+    def _rescue_original(self, hotkey: str, prompt_index: int, slot: int) -> str | None:
+        for original in reversed(self._lapsed.values()):
+            if (original.prompt_index, original.slot) == (prompt_index, slot):
+                return original.lease_id if original.hotkey != hotkey else None
+        return None
+
     def _add(self, hotkey: str, prompt_index: int, slot: int, now: float, price: float | None = None,
              round: int | None = None, seconds: float | None = None, event: str = "granted",
-             offer: float | None = None) -> Lease:
+             offer: float | None = None, original: str | None = None) -> Lease:
         span = self.seconds if seconds is None else min(self.seconds, max(1.0, float(seconds), self.floor))
         lease = Lease(secrets.token_hex(16), hotkey, int(prompt_index), int(slot), now, now + span,
                       price, round, offer)
         self._by_id[lease.lease_id] = lease
         self._by_slot.setdefault((lease.prompt_index, lease.slot), []).append(lease.lease_id)
+        if original is not None:
+            self._rescues[lease.lease_id] = original
         self._log(event, lease, "" if price is None else f" price={price:.3g}")
         self._changed()
         return lease
@@ -428,21 +459,29 @@ class DrawLeases:
 
     def refusal(self, hotkey: str, prompt_index: int, slot: int) -> str | None:
         """Why this hotkey may not submit this slot now: another hotkey alone holds its live lease."""
-        holders = self.holders(prompt_index, slot)
-        if holders and all(lease.hotkey != hotkey for lease in holders):
-            return REASON_DRAW_SLOT_LEASED
-        return None
+        with self._lock:
+            holders = self.holders(prompt_index, slot)
+            if holders and self._authorized_holder(hotkey, holders) is None:
+                return REASON_DRAW_SLOT_LEASED
+            return None
 
-    def held(self, hotkey: str, prompt_index: int, slot: int) -> Lease | None:
-        """``hotkey``'s own live lease on this slot, else its lapsed one while no other hotkey holds the slot,
-        or None."""
-        holders = self.holders(prompt_index, slot)
+    def _authorized_holder(self, hotkey: str, holders: list[Lease]) -> Lease | None:
         for lease in holders:
             if lease.hotkey == hotkey:
                 return lease
-        if holders:
-            return None
+            original = self._rescues.get(lease.lease_id)
+            if original is not None:
+                lapsed = self._lapsed.get(original)
+                if lapsed is not None and lapsed.hotkey == hotkey:
+                    return lapsed
+        return None
+
+    def held(self, hotkey: str, prompt_index: int, slot: int) -> Lease | None:
+        """The terms this hotkey may submit under, including still-authorized late work."""
         with self._lock:
+            holders = self.holders(prompt_index, slot)
+            if holders:
+                return self._authorized_holder(hotkey, holders)
             key = (int(prompt_index), int(slot))
             for lease in self._lapsed.values():
                 if lease.hotkey == hotkey and (lease.prompt_index, lease.slot) == key:
