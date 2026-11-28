@@ -76,6 +76,9 @@ logger = logging.getLogger(__name__)
 SURPLUS_RECEIPT_SCHEMA = "reliquary/surplus-burn-receipt/v1"
 # How far back work awaiting its audit is held back from the burn (the ledger escalates older work to a person).
 DEFAULT_UNSETTLED_DAYS = 7
+LIABILITY_HISTORY_UNVERIFIED = (
+    "historical rail coverage and settlement finality for late archive parts have not been established"
+)
 # An execution burns as of the clock: an instant further from it is refused.
 CLOCK_SLACK_SECONDS = 300.0
 
@@ -126,7 +129,7 @@ def unsettled_rao(collector_tasks: Mapping[str, int], settled: Iterable[tuple[st
 
 async def run_burn(obligations: Iterable[Obligation], *, journal: Journal, chain: PayoutChain, config: PayoutConfig,
                    collector_tasks: Mapping[str, int] | Sequence[str], now: float, cap_rao: int,
-                   unsettled: int = 0, cannot_know: Sequence[str] = (), execute: bool = False,
+                   unsettled: int = 0, cannot_know: Sequence[str] = (LIABILITY_HISTORY_UNVERIFIED,), execute: bool = False,
                    signer: Signer | None = None, confirm_rao: int | None = None, wait_seconds: float = 600.0,
                    poll_seconds: float = 12.0, clock=time.time, sleep=asyncio.sleep) -> dict:
     """One surplus burn: settle what is unknown, check the journal and the
@@ -139,7 +142,7 @@ async def run_burn(obligations: Iterable[Obligation], *, journal: Journal, chain
     if isinstance(cap_rao, bool) or not isinstance(cap_rao, int) or cap_rao < 0:
         raise PayoutError(f"the cap must be a whole number of rao >= 0, got {cap_rao!r}")
     if execute:
-        if signer is None or signer.coldkey != config.collector_coldkey:
+        if not cannot_know and (signer is None or signer.coldkey != config.collector_coldkey):
             raise PayoutError("burning needs the collector's signer")
         if journal.read_only:
             raise PayoutError("burning needs the journal open for writing")
@@ -180,7 +183,8 @@ async def _burn(obligations, *, journal: Journal, chain: PayoutChain, config: Pa
     stake = await chain.collector_stake_rao(head)
     in_flight = journal.in_flight_rao()
     owed = owed_rao(obligations, journal, rails, now)
-    surplus = max(0, stake - owed - int(unsettled) - in_flight - config.reserve_rao)
+    # Without a liability bound the entire balance must be retained.
+    surplus = 0 if cannot_know else max(0, stake - owed - int(unsettled) - in_flight - config.reserve_rao)
     today = journal.burned_on(day)
     amount = min(surplus, max(0, cap_rao - today))
     receipt.update({"finalized_block": head, "collector_stake_rao": stake, "owed_rao": owed,
