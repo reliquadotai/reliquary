@@ -185,9 +185,16 @@ class Lease:
 
     def to_public(self) -> dict:
         """What the holder is told (the holder's own lease: no other lease is ever listed)."""
-        return {"lease_id": self.lease_id, "environment": self.environment, "prompt_idx": self.prompt_idx,
-                "checkpoint": self.checkpoint, "nonce": self.nonce, "issued_at": self.issued_at,
-                "expires_at": self.expires_at}
+        public = {"lease_id": self.lease_id, "environment": self.environment, "prompt_idx": self.prompt_idx,
+                  "checkpoint": self.checkpoint, "nonce": self.nonce, "issued_at": self.issued_at,
+                  "expires_at": self.expires_at}
+        if self.environment.startswith("customer:"):
+            # No compiled profile names a customer env: the miner renders and caps it by this task's contract.
+            from reliquary.constants import max_new_tokens_for_environment, thinking_for_environment
+
+            public["env_settings"] = {"max_new_tokens": int(max_new_tokens_for_environment(self.environment)),
+                                      "thinking": bool(thinking_for_environment(self.environment))}
+        return public
 
 
 @dataclass(frozen=True)

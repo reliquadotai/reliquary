@@ -371,3 +371,9 @@ def test_upload_seeds_preserve_the_json_safe_integer_boundary():
     assert out.sets[0].sampling["seed"] == safe
     assert [row["custom_id"] for row in out.sets[0].rows] == ["safe"]
     assert [(e.custom_id, e.code) for e in out.errors] == [("unsafe", "invalid_parameter")]
+
+
+def test_an_eval_upload_refuses_a_line_whose_reference_its_grader_cannot_read():
+    out = compile_({**completion("q1", "1+1="), "reference": "2 ± 0.5"},
+                   {**completion("q2", "2+2="), "reference": "four"}, purpose="eval", grader="numeric_v1")
+    assert [(e.line, e.code) for e in out.errors] == [(2, "invalid_reference")]

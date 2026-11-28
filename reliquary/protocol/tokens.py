@@ -32,7 +32,7 @@ def hash_tokens(tokens: list[int]) -> bytes:
 
 
 def encode_prompt(
-    tokenizer: Any, prompt_text: str, *, thinking: bool = True
+    tokenizer: Any, prompt_text: str, *, thinking: bool = True, system: str | None = None
 ) -> list[int]:
     """Canonical prompt → token encoder shared by miner and validator.
 
@@ -43,6 +43,9 @@ def encode_prompt(
     declared, fall back to plain encoding otherwise (base models, test
     fakes). Both sides MUST go through this helper — any divergence in
     prompt tokenisation trips PROMPT_MISMATCH before GRAIL even runs.
+
+    ``system``: the problem's system prompt, a turn before the user's (or, without a chat template, its text
+    and a blank line before the prompt). None renders exactly as before.
     """
     # v4+ raw-completion protocol: never apply a chat template, even when the
     # tokenizer declares one. Declaring is not training -- a "-Base" repo ships
@@ -52,7 +55,7 @@ def encode_prompt(
     from reliquary.constants import RAW_COMPLETION_PROMPTS
 
     if RAW_COMPLETION_PROMPTS:
-        return list(tokenizer.encode(prompt_text, add_special_tokens=False))
+        return list(tokenizer.encode(_raw_text(prompt_text, system), add_special_tokens=False))
 
     # Require chat_template to be a non-empty string so MagicMock-based test
     # stubs (which return a MagicMock for any attribute) fall through to the
@@ -61,7 +64,7 @@ def encode_prompt(
     if isinstance(chat_template, str) and chat_template and hasattr(
         tokenizer, "apply_chat_template"
     ):
-        messages = [{"role": "user", "content": prompt_text}]
+        messages = prompt_messages(prompt_text, system)
         # transformers >=5 returns a BatchEncoding from apply_chat_template
         # even with tokenize=True; request return_dict=False for a flat list
         # and still defensively unwrap input_ids if a version ignores it.
@@ -80,7 +83,16 @@ def encode_prompt(
         if isinstance(encoded, dict) or hasattr(encoded, "input_ids"):
             encoded = encoded["input_ids"]
         return list(encoded)
-    return list(tokenizer.encode(prompt_text, add_special_tokens=False))
+    return list(tokenizer.encode(_raw_text(prompt_text, system), add_special_tokens=False))
+
+
+def prompt_messages(prompt_text: str, system: str | None = None) -> list[dict]:
+    """The chat turns of a single-turn problem: its system prompt when it has one, then the user's."""
+    return ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt_text}]
+
+
+def _raw_text(prompt_text: str, system: str | None) -> str:
+    return f"{system}\n\n{prompt_text}" if system else prompt_text
 
 
 def verify_tokens(tokens: list[int], model_config: PretrainedConfig | Any) -> bool:

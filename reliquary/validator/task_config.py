@@ -95,7 +95,12 @@ def resolve_task_config(
         # The agentic contract environment is the same kind of statement.
         statements = (set(EXTERNAL_BODIES) | set(AGENTIC_BODIES)
                       if entry.mechanism == MECHANISM_CORPUS_GENERATION else set())
-        missing = sorted(declared - set(ENVIRONMENT_SPECS) - statements)
+        from reliquary.customer_env import is_customer_env
+
+        # A customer env version is known by its id (its rows and rewards come from the bucket and the reward
+        # host), so a contract naming one needs no installed package for it.
+        missing = sorted(name for name in declared - set(ENVIRONMENT_SPECS) - statements
+                         if not is_customer_env(name))
         if missing:
             raise TaskConfigError(
                 f"task {task_id!r} names environments this binary does not "

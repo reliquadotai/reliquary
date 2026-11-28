@@ -205,17 +205,40 @@ class HeldLease:
     nonce: str
     expires_at: float
     issued_at: float = 0.0
+    # A customer env's generation settings, from its task's contract (``max_new_tokens``, ``thinking``): no
+    # compiled profile names that env. None: the env's own profile entry.
+    env_settings: tuple[int, bool] | None = None
 
     @classmethod
     def from_wire(cls, body: Mapping[str, Any]) -> HeldLease:
+        settings = body.get("env_settings")
+        if settings is not None:
+            tokens, thinking = settings.get("max_new_tokens"), settings.get("thinking")
+            if (not isinstance(tokens, int) or isinstance(tokens, bool) or not 0 < tokens <= 1 << 20
+                    or not isinstance(thinking, bool)):
+                raise ValueError("a lease's env_settings are max_new_tokens (int) and thinking (bool)")
+            settings = (tokens, thinking)
         return cls(str(body["lease_id"]), str(body["environment"]), int(body["prompt_idx"]),
                    int(body["checkpoint"]), str(body["nonce"]), float(body["expires_at"]),
-                   float(body.get("issued_at", 0.0)))
+                   float(body.get("issued_at", 0.0)), settings)
 
     def to_wire(self) -> dict:
-        return {"lease_id": self.lease_id, "environment": self.environment, "prompt_idx": self.prompt_idx,
+        wire = {"lease_id": self.lease_id, "environment": self.environment, "prompt_idx": self.prompt_idx,
                 "checkpoint": self.checkpoint, "nonce": self.nonce, "expires_at": self.expires_at,
                 "issued_at": self.issued_at}
+        if self.env_settings is not None:
+            wire["env_settings"] = {"max_new_tokens": self.env_settings[0], "thinking": self.env_settings[1]}
+        return wire
+
+    def max_new_tokens(self) -> int:
+        from reliquary.constants import max_new_tokens_for_environment
+
+        return self.env_settings[0] if self.env_settings else max_new_tokens_for_environment(self.environment)
+
+    def thinking(self) -> bool:
+        from reliquary.constants import thinking_for_environment
+
+        return self.env_settings[1] if self.env_settings else thinking_for_environment(self.environment)
 
 
 class RequestRefused(Exception):
@@ -389,6 +412,19 @@ class HttpRlTransport:
                                     headers={**headers, "Content-Type": "application/json", "Content-Encoding": GZIP})
         return await self._call("POST", path, json=body, headers=headers)
 
+    async def customer_envs(self) -> list[str]:
+        """``GET /rl/customer-envs``: the task's customer envs, ``[]`` on a validator that serves none."""
+        try:
+            answer = await self._call("GET", f"{self._prefix}/customer-envs")
+        except RequestRefused as exc:
+            if exc.reason == "404":
+                return []
+            raise
+        from reliquary.customer_env.rl import register_customer_envs
+
+        # Known to this miner's registry from here: every later read of the env (rows, leases) is by its id.
+        return register_customer_envs(answer.get("environments") or ())
+
     async def episodes(self) -> dict:
         """``GET /rl/episodes``: the validator's episode envs (their blocks), ``{}`` when it serves none."""
         try:
@@ -558,6 +594,10 @@ class AsyncMinerConfig:
     # A task priced by auction: env -> (micro-alpha per million matched tokens, groups held at once). The miner
     # posts these offers before leasing and every ``ASK_REPOST_S``; a validator without an auction ignores them.
     asks: Mapping[str, tuple[int, int]] = field(default_factory=dict)
+    # Also serve every customer env a task trains: its prompts and settings come from that task's controller
+    # (``/rl/customer-envs``, the lease's ``env_settings``), its rewards from the validator's reward host.
+    customer_envs: bool = False
+    customer_ask: tuple[int, int] | None = None   # the offer posted on each customer env (the bare ask)
 
     def __post_init__(self) -> None:
         if not self.environments:
@@ -1276,20 +1316,18 @@ class VllmGroupGenerator:
         model_meta = None if generation is None else type("Meta", (), {"generation_config": generation})()
         self.eos_ids = sorted(resolve_eos_token_ids(model_meta, self.tokenizer))
 
-    def _prompt(self, environment: str, prompt_idx: int) -> list[int]:
-        from reliquary.constants import thinking_for_environment
+    def _prompt(self, lease: HeldLease) -> list[int]:
         from reliquary.environment import load_environment
         from reliquary.protocol.tokens import encode_prompt
 
-        env = self._envs.get(environment)
+        env = self._envs.get(lease.environment)
         if env is None:
-            env = self._envs[environment] = load_environment(environment)
-        problem = env.get_problem(prompt_idx)
-        return encode_prompt(self.tokenizer, problem["prompt"], thinking=thinking_for_environment(environment))
+            env = self._envs[lease.environment] = load_environment(lease.environment)
+        problem = env.get_problem(lease.prompt_idx)
+        return encode_prompt(self.tokenizer, problem["prompt"], thinking=lease.thinking(),
+                             system=problem.get("system") or None)
 
     def generate(self, leases: Sequence[HeldLease]) -> list[list[list[int]]]:
-        from reliquary.constants import max_new_tokens_for_environment
-
         from reliquary.protocol.rl_draw import lease_extra_args
 
         if self._engine is None:
@@ -1297,25 +1335,23 @@ class VllmGroupGenerator:
         # One engine call for the whole batch (leases x ROLLOUTS requests): each request carries its own lease's
         # draw (nonce, prompt, k, rollout index), read by request id in the runner-keyed processor.
         return self._engine.generate_batch(
-            [(self._prompt(lease.environment, lease.prompt_idx),
+            [(self._prompt(lease),
               [lease_extra_args(lease.nonce, lease.prompt_idx, lease.checkpoint, r) for r in range(ROLLOUTS)],
-              max_new_tokens_for_environment(lease.environment)) for lease in leases],
+              lease.max_new_tokens()) for lease in leases],
             eos_ids=self.eos_ids)
 
     def advance(self, leases: Sequence[HeldLease], budget_s: float) -> list[tuple[str, list[list[int]]]]:
         """Continuous batching: start ``leases`` in the running engine, step it for about ``budget_s``, return the
         groups that completed as ``(lease id, rollouts)``."""
-        from reliquary.constants import max_new_tokens_for_environment
-
         from reliquary.protocol.rl_draw import lease_extra_args
 
         if self._engine is None:
             raise RuntimeError("no weights loaded")
         for lease in leases:
             self._engine.add_group(
-                lease.lease_id, self._prompt(lease.environment, lease.prompt_idx),
+                lease.lease_id, self._prompt(lease),
                 [lease_extra_args(lease.nonce, lease.prompt_idx, lease.checkpoint, r) for r in range(ROLLOUTS)],
-                max_new_tokens_for_environment(lease.environment), eos_ids=self.eos_ids)
+                lease.max_new_tokens(), eos_ids=self.eos_ids)
         return self._engine.step_groups(budget_s)
 
     def abort(self) -> None:
@@ -1477,7 +1513,8 @@ async def run_async_miner(config: AsyncMinerConfig, *, validator_url: str, valid
                     work_dir=work_dir, note=share_setup))
                 stack.callback(sharing.cancel)
             chooser = TaskChooser(lambda: fetch_tasks(client, validator_url), served_envs=config.environments,
-                                  asks={env: price / 1e6 for env, (price, _) in config.asks.items()}, pinned=rl_task)
+                                  asks={env: price / 1e6 for env, (price, _) in config.asks.items()}, pinned=rl_task,
+                                  customer_envs=config.customer_envs)
             task = await chooser.choose()
             logger.info("rl task: mining %s%s", task_prefix(task), " (pinned)" if rl_task else "")
         generator, first, engine_blocks, engine_model = None, True, None, ModelFingerprint()
@@ -1536,9 +1573,16 @@ async def run_async_miner(config: AsyncMinerConfig, *, validator_url: str, valid
                 engine_blocks = blocks
                 if chooser is not None:
                     chooser.adopt_model(task)
+            task_envs = tuple(config.environments)
+            if config.customer_envs and not dry_run:
+                from reliquary.customer_env.rl import ROWS_URL_ENV
+
+                # This task's customer envs: their rows come from its controller, read when first leased.
+                os.environ[ROWS_URL_ENV] = f"{validator_url.rstrip('/')}{prefix}"
+                task_envs += tuple(e for e in await transport.customer_envs() if e not in task_envs)
             sources = getattr(getattr(generator, "episodes", None), "sources", None) or {}
-            ranges = planner_ranges(config.environments, sources=sources, blocks=blocks, prompt_ranges=prompt_ranges)
-            planners = {name: PromptPlanner(name, ranges[name]) for name in config.environments}
+            ranges = planner_ranges(task_envs, sources=sources, blocks=blocks, prompt_ranges=prompt_ranges)
+            planners = {name: PromptPlanner(name, ranges[name]) for name in task_envs}
             state, loaded = None, None
             if first and initial_dir is not None:
                 state = load_anchor_shards(sorted(Path(initial_dir).glob("*.safetensors")))
@@ -1548,8 +1592,12 @@ async def run_async_miner(config: AsyncMinerConfig, *, validator_url: str, valid
                 generator.load_weights({}, 0)
                 loaded = 0
             task_config = config
+            if task_envs != config.environments:
+                added = {e: config.customer_ask for e in task_envs if e not in config.environments
+                         and config.customer_ask is not None}
+                task_config = dataclasses.replace(config, environments=task_envs, asks={**config.asks, **added})
             if task_dir is not None and config.state_dir:
-                task_config = dataclasses.replace(config, state_dir=str(Path(config.state_dir) / "tasks" / task))
+                task_config = dataclasses.replace(task_config, state_dir=str(Path(config.state_dir) / "tasks" / task))
             miner = AsyncMiner(task_config, transport=transport, generator=generator, planners=planners,
                                checkpoint_sync=sync, loaded_version=loaded, state=state, env_weights=weights)
             miner.model_check = engine_model.matches

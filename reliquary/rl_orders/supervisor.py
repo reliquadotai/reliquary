@@ -199,13 +199,13 @@ class FinalizedRuntime:
 
 
 def verify_model(config: SupervisorConfig, entry) -> None:
-    from reliquary.protocol.profiles import PROFILES
+    from reliquary.protocol.profiles import entry_profile
 
     raw = _private_bytes(Path(config.model_manifest_file), 1 << 20)
     if hashlib.sha256(raw).hexdigest() != config.model_manifest_sha256:
         raise ValueError("local model manifest changed")
     manifest = strict_json_loads(raw)
-    profile = PROFILES[entry.profile_id]
+    profile = entry_profile(entry)
     if (not isinstance(manifest, dict) or set(manifest) != {"schema", "profile_id", "model_id", "revision", "files"}
             or manifest["schema"] != "reliquary/local-model/v1" or manifest["profile_id"] != entry.profile_id
             or manifest["model_id"] != profile.model_id or manifest["revision"] != profile.model_revision):
@@ -258,6 +258,19 @@ def child_environment(config: SupervisorConfig, entry, *, runtime_id: str, run_i
         "RELIQUARY_SUPERVISOR_HTTP_PORT": str(config.controller_port),
         "RELIQUARY_SUPERVISOR_NETWORK": config.network, "RELIQUARY_SUPERVISOR_NETUID": str(config.netuid),
     })
+    # A customer env's rewards come from a reward host: its address and client certificate, if this host has one.
+    env.update({key: os.environ[key] for key in (
+        "RELIQUARY_REWARD_HOST_URL", "RELIQUARY_REWARD_HOST_CLIENT_CERT", "RELIQUARY_REWARD_HOST_CLIENT_KEY",
+        "RELIQUARY_REWARD_HOST_CA") if os.environ.get(key)})
+    contract = getattr(entry, "contract", None)
+    if contract:
+        # A task carrying its contract (a training on customer envs) runs that contract, not the compiled profile.
+        import json
+
+        path = state / "task-contract.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(contract, sort_keys=True))
+        env["RELIQUARY_TASK_CONTRACT"] = str(path)
     return env
 
 

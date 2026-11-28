@@ -378,9 +378,9 @@ def compile_upload(body: bytes, *, tokenizer, vocab_size: int, model: str, revis
         raise ValueError(f"purpose is one of {PURPOSES}")
     if (purpose == "eval") != (grader is not None):
         raise ValueError("an eval upload names its grader, and only an eval upload does")
-    from reliquary.orders.graders import REFERENCE_GRADERS, check_reference
+    from reliquary.orders.graders import REFERENCE_GRADERS, check_reference, is_known_grader
 
-    if grader is not None and grader not in REFERENCE_GRADERS:
+    if grader is not None and not is_known_grader(grader):
         raise ValueError(f"grader_unknown: {grader!r}; graders: {sorted(REFERENCE_GRADERS)}")
     if not isinstance(vocab_size, int) or vocab_size <= 0:
         raise ValueError("vocab_size must be positive")

@@ -54,8 +54,11 @@ def training_enabled(env: Mapping[str, str] | None = None) -> bool:
 
 class TrainingEnvironment(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    name: str = Field(min_length=1, max_length=128)
+    name: str = Field(min_length=1, max_length=300)
     share_bps: int = Field(ge=1, le=10000)
+    # A customer env's settings, carried in the task's contract (a profile env keeps the profile's).
+    max_new_tokens: int | None = Field(default=None, ge=16, le=131072)
+    thinking: bool | None = None
 
 
 class TrainingLimits(BaseModel):
@@ -78,6 +81,8 @@ class CreateTraining(BaseModel):
     quote_id: str | None = Field(default=None, min_length=1, max_length=80, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9-]*$")
     quote_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     billing_basis: Literal["matched_token_ceiling_and_trainer_time_v1"] | None = None
+    # The platform account ordering it: required to name its own customer envs.
+    account: str | None = Field(default=None, min_length=1, max_length=128)
 
     @model_validator(mode="after")
     def _shares(self) -> CreateTraining:
@@ -92,9 +97,12 @@ class CreateTraining(BaseModel):
         return self
 
 
-def training_refusal(body: CreateTraining) -> str | None:
+def training_refusal(body: CreateTraining, *, customer_env=None) -> str | None:
     """Why the order cannot train (None: it can): a profile that is not an async RL one, an env outside it, or
-    an env without live RL rows in the catalog."""
+    an env without live RL rows in the catalog. A customer env (``customer:...``) is outside every profile: it
+    trains when ``customer_env(name, account)`` finds it qualified for RL and the order's own, and the order gives
+    its ``max_new_tokens``."""
+    from reliquary.customer_env import is_customer_env
     from reliquary.env_catalog import entry as catalog_entry
     from reliquary.protocol.profiles import DRAW_GUMBEL_MAX, PROFILES
 
@@ -104,6 +112,20 @@ def training_refusal(body: CreateTraining) -> str | None:
     if profile.sampling.draw != DRAW_GUMBEL_MAX:
         return f"profile {body.profile_id!r} is not drawn by Gumbel-max: async RL cannot audit it"
     for env in body.environments:
+        if is_customer_env(env.name):
+            if body.account is None:
+                return f"environment {env.name!r} is a customer env: the order names its account"
+            if env.max_new_tokens is None:
+                return f"customer env {env.name!r} needs max_new_tokens"
+            if customer_env is None:
+                return "customer envs are unavailable on this admin"
+            try:
+                customer_env(env.name, body.account)
+            except ValueError as exc:
+                return f"customer env {env.name!r}: {exc}"
+            continue
+        if env.max_new_tokens is not None or env.thinking is not None:
+            return f"environment {env.name!r} keeps its profile's settings: only a customer env sets them"
         if env.name not in profile.environments:
             return f"environment {env.name!r} is not in profile {body.profile_id!r}"
         catalog = catalog_entry(env.name)
@@ -130,9 +152,13 @@ def order_digest(body: CreateTraining) -> str:
     from reliquary.protocol.release_contract import canonical_sha256
 
     document = body.model_dump(mode="json")
-    for key in ("quote_id", "quote_sha256", "billing_basis"):
+    for key in ("quote_id", "quote_sha256", "billing_basis", "account"):
         if document[key] is None:
             document.pop(key)  # Existing declarations retain their original replay digest.
+    for env in document["environments"]:
+        for key in ("max_new_tokens", "thinking"):
+            if env[key] is None:
+                env.pop(key)
     return canonical_sha256(document)
 
 
@@ -140,8 +166,39 @@ def training_task_id(body: CreateTraining, task_prefix: str) -> str:
     return f"{task_prefix}{TRAINING_ID_INFIX}{body.training_id}"
 
 
+def customer_contract_entry(body: CreateTraining, *, task_id: str, cap: float, split: Mapping[str, float],
+                            model_architecture: str | None):
+    """The entry of a training naming customer envs: it CARRIES its contract, the profile's with each customer
+    env's settings added, so its controller and trainer run the customer envs as profile envs (every per-env read
+    of the validator side follows), and its leases carry them to the miners. The contract keeps the template's
+    profile id: every check that compares profile ids holds; its digest is what differs."""
+    from dataclasses import replace
+
+    from reliquary.cli.main import build_contract_task_entry
+    from reliquary.environment.abi import canonical_sha256
+    from reliquary.protocol.profiles import PROFILES
+
+    if not model_architecture:
+        raise ValueError("a training with customer envs needs its model's architecture")
+    profile = PROFILES[body.profile_id]
+    entry = build_contract_task_entry(task_id=task_id, from_profile=body.profile_id, model_id=profile.model_id,
+                                      model_revision=profile.model_revision, model_architecture=model_architecture,
+                                      environments=None, cap=cap, overrides={})
+    contract = dict(entry.contract)
+    contract["profile_id"] = profile.profile_id
+    environments = dict(contract["environments"])
+    for env in body.environments:
+        if env.name in profile.environments:
+            continue
+        environments[env.name] = {"max_new_tokens": int(env.max_new_tokens), "answer_format": None, "bft": None,
+                                  "thinking": bool(env.thinking) if env.thinking is not None else True}
+    contract["environments"] = environments
+    return replace(entry, profile_id=profile.profile_id, contract=contract,
+                   profile_sha256=canonical_sha256(contract), env_split=dict(split))
+
+
 def training_entry(body: CreateTraining, *, task_prefix: str, price_params: Mapping[str, Any],
-                   created_at: float):
+                   created_at: float, customer_env=None, model_architecture: str | None = None):
     """The registry entry of a training order (``price_params``: the ceiling in the task's alpha, as an order's,
     with the USD rate it was converted at). ValueError on an order the registry would refuse."""
     from dataclasses import replace
@@ -151,16 +208,22 @@ def training_entry(body: CreateTraining, *, task_prefix: str, price_params: Mapp
     from reliquary.validator.rl_async_service import BATCH_GROUPS_PARAM
     from reliquary.validator.rl_auction import LAG_TARGET_PARAM
 
-    refusal = training_refusal(body)
+    refusal = training_refusal(body, customer_env=customer_env)
     if refusal is not None:
         raise ValueError(refusal)
     from reliquary.protocol.profiles import PROFILES
 
     shares = {e.name: e.share_bps / 10000 for e in body.environments}
-    split = {name: shares.get(name, 0.0) for name in PROFILES[body.profile_id].environments}
+    profile = PROFILES[body.profile_id]
+    customer = [e for e in body.environments if e.name not in profile.environments]
+    split = {name: shares.get(name, 0.0) for name in (*profile.environments, *(e.name for e in customer))}
     cap = DEFAULT_TRAINING_CAP if body.cap is None else float(body.cap)
-    entry = build_task_entry(task_id=training_task_id(body, task_prefix), profile_id=body.profile_id, cap=cap,
-                             overrides={}, env_split=split)
+    if customer:
+        entry = customer_contract_entry(body, task_id=training_task_id(body, task_prefix), cap=cap, split=split,
+                                        model_architecture=model_architecture)
+    else:
+        entry = build_task_entry(task_id=training_task_id(body, task_prefix), profile_id=body.profile_id, cap=cap,
+                                 overrides={}, env_split=split)
     entry = with_rl_async_params(entry, planned_tokens_per_period=DEFAULT_PLANNED_TOKENS_PER_PERIOD)
     from reliquary.validator.corpus_periods import MAX_PRICE_ALPHA_USD_PARAM
 

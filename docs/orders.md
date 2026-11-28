@@ -42,8 +42,18 @@ ingest it (`reliquary/orders/uploads.py`):
 - A bad line is an error line (`batch-uploads/<upload_id>/errors.jsonl` in the platform bucket), never a failed file.
   Refused per line: greedy, `logit_bias`, penalties, logprobs, `stop`, `stream`, structured output, another model.
 - Limits: 50,000 lines, 200 MB per file. Idempotent on the request.
-- `purpose: "eval"` needs a `reference` per line and a grader of `orders.graders` (`boxed_math_v1`,
-  `exact_match_v1`; listed by `GET /admin/v1/architectures`).
+- `purpose: "eval"` needs a `reference` per line and a grader of `orders.graders` (listed, with what each
+  reads, by `GET /admin/v1/architectures`). A line whose reference the grader cannot read is `invalid_reference`.
+  Each grader reads the answer after the reasoning block; an answer over 100,000 characters scores 0.
+  - `boxed_math_v1`: the last `\boxed{}` equals the reference (numbers, fractions, LaTeX values).
+  - `exact_match_v1`: the answer, stripped, equals the reference, stripped.
+  - `numeric_v1`: reference `"42"`, `"1/3"`, `"2.5e3"` or `"100 ± 5"` (`+/-` too). The answer's last
+    `\boxed{}` value, else its last number, within the tolerance, else within 1e-6 x max(1, |reference|).
+  - `choice_v1`: reference one letter. The answer's last `\boxed{X}`, else its last `answer is X` /
+    `Answer: X`, else an answer that is only `X` (or `(X)`).
+  - `json_match_v1`: reference one JSON value, as text. The answer's last ` ```json ` fence, else the whole
+    answer, equals it as JSON: key order ignored, `1` equals `1.0`, a boolean is not a number, duplicate keys
+    and `NaN` fail.
 
 The answer lists the groups (`set_id`, `prompt_source`, `count`, `sampling`, prompt token counts), the error count
 and file, and a preview of the first rows.

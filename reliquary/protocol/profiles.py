@@ -766,6 +766,12 @@ def profile_from_contract(contract: Mapping[str, Any]) -> ProtocolProfile:
     if proofs_body is not None and not isinstance(proofs_body, list):
         raise ValueError("generation contract 'proofs' must be a list")
 
+    if any(str(name).startswith("customer:") for name in environments):
+        # A customer env is known by its id alone: the contract that names one is where every process
+        # (controller, validator, trainer) learns it, so this makes it known to the registry.
+        from reliquary.customer_env.rl import register_customer_envs
+
+        register_customer_envs(environments)
     return ProtocolProfile(
         profile_id=str(_required(contract, "profile_id")),
         model_id=str(_required(contract, "model_id")),
@@ -1620,6 +1626,12 @@ def resolve_protocol_profile(profile_id: str | None = None) -> ProtocolProfile:
             f"unknown protocol profile {selected_id!r}; "
             f"expected one of: {available}"
         ) from exc
+
+
+def entry_profile(entry) -> ProtocolProfile:
+    """The profile a registry entry runs: its carried contract when it has one, else its compiled profile."""
+    contract = getattr(entry, "contract", None)
+    return profile_from_contract(contract) if contract is not None else PROFILES[entry.profile_id]
 
 
 def _profile_from_contract_file(path: str) -> ProtocolProfile:

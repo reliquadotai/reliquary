@@ -493,7 +493,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                      upload_tokenizer=None, subnet_pool=None, tao_usd=None,
                      sandbox_machine_prefix: str | None = None, sandbox_machines=None,
                      order_sessions=None, training_runtime_store=None, rl_spend_reader=None,
-                     pod_checkpoint_store=None) -> FastAPI:
+                     pod_checkpoint_store=None, customer_envs=None) -> FastAPI:
     """The admin app. ``deliveries`` is the platform bucket's sink (None turns
     the export and grade routes off); ``records`` the subnet's record store;
     ``eval_store`` the subnet bucket holding the eval sets' grading files; ``order_sessions``
@@ -506,7 +506,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
     ``training_runtime_store`` or the private ``RELIQUARY_TRAINING_RUNTIME_ROOT`` supplies verified local
     runtime observations and immutable final usage/checkpoint reads. Paid admission stays closed.
     ``rl_spend_reader(run)`` returns a training task's spend summary or None (default: ``rl_spend.read_spend``).
-    ``pod_checkpoint_store`` holds the final models of orders run on rented pods (default: the private bucket)."""
+    ``pod_checkpoint_store`` holds the final models of orders run on rented pods (default: the private bucket).
+    ``customer_envs`` (``customer_env.admin.CustomerEnvs``; default: ``customer_env.admin.from_environment``)
+    serves the customer env routes; unconfigured, they answer 503."""
     from reliquary.infrastructure import corpus_executor_store as executors
     from reliquary.infrastructure import corpus_job_store as job_store
     from reliquary.infrastructure import task_registry_store as registry_store
@@ -586,6 +588,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=401, detail=refusal)
 
     router = APIRouter(prefix="/admin/v1", dependencies=[Depends(signed)])
+    from reliquary.customer_env import admin as customer_env_admin
+
+    customer_envs_served = customer_envs if customer_envs is not None else customer_env_admin.from_environment()
 
     def in_scope(name: str) -> None:
         if not name.startswith(task_prefix):
@@ -1707,14 +1712,25 @@ def create_admin_app(*, secret: bytes, pool_max: float,
 
             if (answer := await replayed()) is not None:
                 return answer
-            refusal = training_refusal(body)
+            customer_env = customer_env_admin.order_resolver(customer_envs_served)
+            refusal = training_refusal(body, customer_env=customer_env)
             if refusal is not None:
                 raise HTTPException(status_code=422, detail=refusal)
+            architecture = None
+            if any(e.name.startswith("customer:") for e in body.environments):
+                from reliquary.protocol.profiles import PROFILES
+
+                template = PROFILES[body.profile_id]
+                try:
+                    architecture = (await model_facts(template.model_id, template.model_revision))["architecture"]
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail=f"model_files_unreadable: {exc}") from exc
             try:
                 entry = training_entry(body, task_prefix=task_prefix,
                                        price_params=await token_price(
                                            TokenCeiling(input=0.0, output=body.max_price_usd_per_mtoken)),
-                                       created_at=clock())
+                                       created_at=clock(), customer_env=customer_env,
+                                       model_architecture=architecture)
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
             try:
@@ -2122,9 +2138,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         if deliveries is None:
             raise HTTPException(status_code=503, detail="platform_bucket_unavailable")
         if body.grader is not None:
-            from reliquary.orders.graders import REFERENCE_GRADERS
+            from reliquary.orders.graders import REFERENCE_GRADERS, is_known_grader
 
-            if body.grader not in REFERENCE_GRADERS:
+            if not is_known_grader(body.grader):
                 raise HTTPException(status_code=422, detail=(
                     f"grader_unknown: {body.grader!r}; graders: {sorted(REFERENCE_GRADERS)}"))
         if upload_tokenizer is None:
@@ -2152,6 +2168,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         except Exception as exc:
             logger.warning("upload %s could not be ingested", body.object_key, exc_info=True)
             raise HTTPException(status_code=503, detail="upload_unavailable") from exc
+
+    customer_env_admin.add_routes(router, customer_envs_served, deliveries=deliveries, eval_store=eval_store,
+                                  load_tokenizer=upload_tokenizer)
 
     @router.get("/architectures")
     async def architectures() -> dict:

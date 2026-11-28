@@ -1,0 +1,15 @@
+[project]
+name = "toy-add"
+version = "0.1.0"
+description = "A customer env fixture: add two numbers, scored exactly."
+requires-python = ">=3.11"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["toy_add"]
+
+[tool.reliquary]
+taskset = "toy_add"
