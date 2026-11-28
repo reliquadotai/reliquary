@@ -80,9 +80,15 @@ def test_a_row_with_a_system_prompt_is_served_to_rl_with_it():
     assert "system" not in env.get_problem(1)
 
 
-def test_the_registry_knows_a_customer_env_by_its_id():
+def test_a_contract_naming_a_customer_env_makes_it_known_to_the_registry():
+    from reliquary.customer_env.rl import register_customer_envs
     from reliquary.environment.registry import find_environment_spec, get_environment_spec
 
+    other = str(env_id("acct", "other-env", "b" * 64))
+    assert find_environment_spec(other) is None
+    assert register_customer_envs([other, "math", "customer:bad"]) == [other]
+    assert find_environment_spec(other) is not None
+    register_customer_envs([str(ENV)])
     spec = get_environment_spec(str(ENV))
     assert (spec.contract_version, spec.attainable_rewards, spec.validator_authoritative_reward) == (
         "reliquary/customer-env/v1", (), True)

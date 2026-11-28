@@ -25,7 +25,15 @@ def served():
 
 
 def remote(client, image=IMAGE, fresh=False):
-    return RemoteRewardClient("http://testserver", image, fresh=fresh, transport=client._transport)
+    import httpx
+
+    def forward(request):
+        # Through the test client's public API: its transport's stream type varies across Starlette versions.
+        answer = client.request(request.method, request.url.path, content=request.content,
+                                headers={"content-type": request.headers.get("content-type", "")})
+        return httpx.Response(answer.status_code, headers=answer.headers, content=answer.content)
+
+    return RemoteRewardClient("http://testserver", image, fresh=fresh, transport=httpx.MockTransport(forward))
 
 
 def test_scores_and_freezes_through_one_warm_worker(served):

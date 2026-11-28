@@ -75,6 +75,28 @@ class CustomerScorer:
             self._clients.clear()
 
 
+_DEFAULT: list = []
+_DEFAULT_LOCK = threading.Lock()
+
+
+def default_scorer() -> CustomerScorer | None:
+    """This process's scorer, configured once from its environment (``from_environment``); None without a reward
+    host. Its clients stay open for the process's life: one warm connection per qualified image."""
+    with _DEFAULT_LOCK:
+        if not _DEFAULT:
+            _DEFAULT.append(from_environment())
+        return _DEFAULT[0]
+
+
+def set_default_scorer(scorer: CustomerScorer | None) -> None:
+    """Replace this process's scorer (tests, or a host that builds its own)."""
+    with _DEFAULT_LOCK:
+        old = _DEFAULT[0] if _DEFAULT else None
+        _DEFAULT[:] = [scorer]
+    if old is not None and old is not scorer:
+        old.close()
+
+
 def from_environment() -> CustomerScorer | None:
     """The scorer this host is configured for, or None: ``RELIQUARY_REWARD_HOST_URL``, the client certificate
     (``RELIQUARY_REWARD_HOST_CLIENT_CERT`` / ``_CLIENT_KEY``), the host's CA (``RELIQUARY_REWARD_HOST_CA``) and the
@@ -129,4 +151,5 @@ def bucket_image_for(read=None) -> Callable[[str], str]:
     return image_for
 
 
-__all__ = ["CustomerScorer", "bucket_image_for", "check_reference", "from_environment", "is_customer_env", "reference"]
+__all__ = ["CustomerScorer", "bucket_image_for", "check_reference", "default_scorer", "from_environment",
+           "is_customer_env", "reference", "set_default_scorer"]

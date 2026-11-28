@@ -766,6 +766,12 @@ def profile_from_contract(contract: Mapping[str, Any]) -> ProtocolProfile:
     if proofs_body is not None and not isinstance(proofs_body, list):
         raise ValueError("generation contract 'proofs' must be a list")
 
+    if any(str(name).startswith("customer:") for name in environments):
+        # A customer env is known by its id alone: the contract that names one is where every process
+        # (controller, validator, trainer) learns it, so this makes it known to the registry.
+        from reliquary.customer_env.rl import register_customer_envs
+
+        register_customer_envs(environments)
     return ProtocolProfile(
         profile_id=str(_required(contract, "profile_id")),
         model_id=str(_required(contract, "model_id")),

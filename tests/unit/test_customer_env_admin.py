@@ -128,7 +128,16 @@ def test_unconfigured_routes_answer_503():
     assert client.get("/admin/v1/customer-envs/accounts/acct").status_code == 503
 
 
-def test_eval_grading_scores_a_customer_row_on_the_reward_host_only():
+@pytest.fixture
+def process_scorer():
+    from reliquary.customer_env import scoring
+
+    yield scoring.set_default_scorer
+    with scoring._DEFAULT_LOCK:
+        scoring._DEFAULT.clear()
+
+
+def test_eval_grading_scores_a_customer_row_on_the_reward_host_only(process_scorer):
     from reliquary.eval.grading import _Graders
 
     env = str(env_id("acct", "my-env", "a" * 64))
@@ -142,13 +151,12 @@ def test_eval_grading_scores_a_customer_row_on_the_reward_host_only():
         def close(self):
             pass
 
-    scorer = CustomerScorer(lambda e: "img@sha256:" + "c" * 64, lambda image: Client())
-    graders = _Graders(lambda *_: pytest.fail("no environment opens for a customer row"), None,
-                       customer_scorer=scorer)
+    process_scorer(CustomerScorer(lambda e: "img@sha256:" + "c" * 64, lambda image: Client()))
+    graders = _Graders(lambda *_: pytest.fail("no environment opens for a customer row"), None)
     row = {"problem_id": "p", "custom_id": "p", "grader": env, "reference": reference("t2", "b" * 64)}
     assert graders.grade(row, "<think>hmm</think> 4") == (1.0, "", False)
     assert seen == [{"key": "t2", "prompt_sha256": "b" * 64, "answer": " 4"}]
     value, detail, _ = graders.grade(row, "5")
-    assert value is None and detail == "customer_grader: timeout"
+    assert value is None and detail.endswith("customer_grader: timeout")
     bad = graders.grade({**row, "reference": "x"}, "4")
     assert bad[0] is None and "reference" in bad[1]

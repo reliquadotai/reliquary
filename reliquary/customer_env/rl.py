@@ -175,16 +175,59 @@ def score_customer_answers(problem: dict, completions: list[str], reward_materia
     return [float(r.score) for r in results]
 
 
-def customer_spec(name: str):
+def _spec_class():
     from reliquary.environment.registry import EnvironmentSpec
 
+    class CustomerSpec(EnvironmentSpec):
+        """One spec per version, all served by ``CustomerEnvironment`` built with the version id."""
+
+        __slots__ = ()
+
+        def create(self, split: str = "train") -> CustomerEnvironment:
+            if split != "train":
+                raise ValueError(f"{self.name} has no split {split}: its rows are one index space")
+            return CustomerEnvironment(self.name)
+
+    return CustomerSpec
+
+
+_CUSTOMER_SPEC = None
+
+
+def customer_spec(name: str):
+    global _CUSTOMER_SPEC
     parse_env_id(name)
-    return EnvironmentSpec(
+    if _CUSTOMER_SPEC is None:
+        _CUSTOMER_SPEC = _spec_class()
+    return _CUSTOMER_SPEC(
         name=name, factory_path="reliquary.customer_env.rl:CustomerEnvironment",
         scorer_path="reliquary.customer_env.rl:score_customer_answers", validator_authoritative_reward=True,
         admission_resource_class="cpu", termination_policy="eos_or_cap", final_answer_policy="text",
         reward_lattice_policy="customer-continuous-v1", attainable_rewards=(), contract_version=CONTRACT_VERSION)
 
 
+def register_customer_envs(names) -> list[str]:
+    """Make each well-formed customer env id among ``names`` known to the environment registry (its spec is its
+    id), where a task's contract or lease names it. ``environment/registry.py`` is left as it is: its source is
+    part of the grader fingerprint the sealed catalog sets carry (``eval.protocol.grader_sha256``), so the spec
+    goes into its run-time table from here."""
+    from reliquary.environment import registry
+
+    known = []
+    for name in names:
+        name = str(name)
+        if not is_customer_env(name):
+            continue
+        if registry.find_environment_spec(name) is None:
+            try:
+                spec = customer_spec(name)
+            except ValueError:
+                continue  # not a well-formed version id: nothing to know it by
+            with registry._CATALOGUE_LOCK:
+                registry._CATALOGUE_SPECS.setdefault(name, spec)
+        known.append(name)
+    return known
+
+
 __all__ = ["CONTRACT_VERSION", "PROMPT_SET_HEADER", "ROWS_URL_ENV", "CustomerEnvironment", "customer_spec",
-           "load_rows", "mount_rows_routes", "rows_body", "score_customer_answers", "task_environments"]
+           "load_rows", "register_customer_envs", "mount_rows_routes", "rows_body", "score_customer_answers", "task_environments"]

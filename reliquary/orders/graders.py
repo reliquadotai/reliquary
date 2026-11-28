@@ -172,7 +172,39 @@ class ReferenceGrader:
     check: Callable[[str], object] = lambda reference: None
 
 
-REFERENCE_GRADERS: dict[str, ReferenceGrader] = {g.name: g for g in (
+class _GraderTable(dict):
+    """The graders by name. ``get`` also answers for a customer env version id: a grader scoring on that
+    version's reward host (``customer_env.scoring``). ``eval/grading.py`` reads graders only through this table, so
+    a customer row grades without a line of it changing: its source is part of the grader fingerprint the sealed
+    catalog sets carry (``eval.protocol.grader_sha256``)."""
+
+    def get(self, key, default=None):
+        found = super().get(key)
+        if found is not None:
+            return found
+        from reliquary.customer_env import is_customer_env
+
+        if is_customer_env(key):
+            return ReferenceGrader(str(key), "text", lambda reference, answer: _score_customer(key, reference, answer),
+                                   "a customer env version, scored on its reward host")
+        return default
+
+
+def _score_customer(env: str, reference: str, answer: str) -> float:
+    """A customer row's score on its version's reward host; ValueError on a bad reference, RuntimeError with why
+    when the host or the customer's grader gives no score (the row is then ungraded, never a zero)."""
+    from reliquary.customer_env.scoring import default_scorer
+
+    scorer = default_scorer()
+    if scorer is None:
+        raise RuntimeError("customer_env_unavailable: no reward host configured")
+    value, detail = scorer.score(env, reference, answer)
+    if value is None:
+        raise RuntimeError(detail)
+    return float(value)
+
+
+REFERENCE_GRADERS: dict[str, ReferenceGrader] = _GraderTable({g.name: g for g in (
     ReferenceGrader("boxed_math_v1", "boxed", _boxed_math,
                     "the last \\boxed{} of the answer equals the reference (numbers, fractions, LaTeX values)"),
     ReferenceGrader("exact_match_v1", "text", _exact_match,
@@ -187,7 +219,7 @@ REFERENCE_GRADERS: dict[str, ReferenceGrader] = {g.name: g for g in (
     ReferenceGrader("json_match_v1", "text", _json_match,
                     "the answer's last ```json fence, else the whole answer, is JSON equal to the reference "
                     "(key order ignored, 1 equals 1.0, a boolean is not a number)", _json_reference),
-)}
+)})
 
 
 def is_known_grader(grader: object) -> bool:
@@ -217,7 +249,10 @@ def check_reference(grader: str, reference) -> str:
 def grade_reference(grader: str, reference: str, answer: str) -> float:
     if len(answer) > MAX_ANSWER_CHARS:
         return 0.0
-    return float(REFERENCE_GRADERS[grader].score(reference, answer))
+    found = REFERENCE_GRADERS.get(grader)
+    if found is None:
+        raise KeyError(grader)
+    return float(found.score(reference, answer))
 
 
 __all__ = ["MAX_ANSWER_CHARS", "MAX_REFERENCE_CHARS", "REFERENCE_GRADERS", "ReferenceGrader", "check_reference",

@@ -420,7 +420,10 @@ class HttpRlTransport:
             if exc.reason == "404":
                 return []
             raise
-        return [str(e) for e in answer.get("environments") or () if str(e).startswith("customer:")]
+        from reliquary.customer_env.rl import register_customer_envs
+
+        # Known to this miner's registry from here: every later read of the env (rows, leases) is by its id.
+        return register_customer_envs(answer.get("environments") or ())
 
     async def episodes(self) -> dict:
         """``GET /rl/episodes``: the validator's episode envs (their blocks), ``{}`` when it serves none."""
