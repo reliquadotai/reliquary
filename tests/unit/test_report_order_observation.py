@@ -312,7 +312,17 @@ def test_original_lease_evidence_survives_holds_and_restarts(tmp_path):
 
     archive(record_archive, 1, 2, [receipt("accepted", 3, canonical["received_at"]),
                                    receipt("missing-grant", 2, 150)])
+    archive(record_archive, 2, 3, [receipt("no-detail", 7, 160)], missing=True)
+    archive(record_archive, 3, 4, [receipt("partial", 1, 170)])
+    with sqlite3.connect(path) as db:
+        # A legacy or incomplete copy can have receipt rows whose volume does not match its archive.
+        doc, = db.execute("SELECT document FROM observed_periods WHERE work_period=3").fetchone()
+        db.execute("UPDATE observed_periods SET document=? WHERE work_period=3",
+                   (json.dumps({**json.loads(doc), "tokens": 11}),))
     result = report(path)
+    assert result["settled_tokens"] == 23
+    assert result["settled_tokens_missing_receipt_details"] == 7
+    assert result["settled_tokens_inconsistent_receipt_details"] == 11
     assert result["settled_tokens_with_original_grant"] == 3
     assert result["settled_tokens_without_original_grant"] == 2
     assert not any(value in json.dumps(result) for value in (MINER, JOB, shifted.lease_id, "missing-grant"))

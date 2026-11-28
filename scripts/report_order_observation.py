@@ -105,11 +105,13 @@ def _load_periods(db, job, counts):
         deliveries = row["deliveries"]
         if deliveries is None:
             counts["fragments_without_receipts"] += 1
+            counts["settled_tokens_missing_receipt_details"] += volume
             complete = complete and volume == 0
             continue
         if not isinstance(deliveries, list):
             raise TypeError("invalid delivery list")
         detailed = 0
+        linked = 0
         for delivery in deliveries:
             sid, miner = delivery["id"], delivery["hotkey"]
             if not isinstance(sid, str) or not sid or not isinstance(miner, str) or not miner:
@@ -131,7 +133,8 @@ def _load_periods(db, job, counts):
             grant = has_grants and db.execute("""SELECT granted FROM observed_draw_grants
                 WHERE order_id=? AND receipt=? AND hotkey=? AND received=? AND tokens=? AND price IS ?""",
                 (job, sid, miner, delivery["received_at"], volume_i, delivery["lease_price"])).fetchone()
-            counts["settled_tokens_with_original_grant" if grant else "settled_tokens_without_original_grant"] += volume_i
+            if grant:
+                linked += volume_i
             price = delivery["lease_price"]
             price = _number(price, "observed lease price") if price is not None else None
             nominal = price * rate if price is not None and rate is not None else None
@@ -141,7 +144,11 @@ def _load_periods(db, job, counts):
             counts["audited_receipt_tokens"] += volume_i if audited else 0
         if detailed != volume:
             counts["fragments_with_volume_mismatch"] += 1
+            counts["settled_tokens_inconsistent_receipt_details"] += volume
             complete = False
+        else:
+            counts["settled_tokens_with_original_grant"] += linked
+            counts["settled_tokens_without_original_grant"] += volume - linked
     return receipts, complete
 
 
@@ -234,6 +241,7 @@ def report(path, *, order_id=None):
                "settled_tokens", "fragments_without_receipts", "fragments_with_volume_mismatch",
                "receipt_tokens", "audited_receipt_tokens", "orders_with_incomplete_detail",
                "settled_tokens_with_original_grant", "settled_tokens_without_original_grant",
+               "settled_tokens_missing_receipt_details", "settled_tokens_inconsistent_receipt_details",
                "tokens_missing_receipt_time", "orders_without_final_verified_total", "orders_with_matching_final_tokens",
                "orders_with_final_token_gap", "final_verified_tokens_on_known_orders", "captured_tokens_on_known_orders",
                "unmatched_incomplete_history_tokens", "unmatched_outage_tokens",
@@ -246,6 +254,7 @@ def report(path, *, order_id=None):
         "paired_nominal_observed_millirao_floor": math.floor(counts["paired_observed_millirao"]) if paired else None,
         "paired_nominal_contract_millirao": counts["paired_contract_millirao"] if paired else None,
         "ownership_basis": "last completed registry read known by the opening second within the registration cache TTL; rotations between reads are unobserved",
+        "original_grant_coverage_basis": "all captured settled tokens, split among linked, unlinked, missing receipt details and inconsistent fragment totals",
         "coverage_basis": "pairing requires complete receipt details and captured tokens equal to the authoritative final count",
         "settlement_basis": "archived net shares valued at the opening emission when the archived ceiling matches, floored to rao per miner per fragment",
         "comparison_basis": "gross prices at original receipt times; elapsed-rate envelope is a conservative heuristic for bursty arrivals",
