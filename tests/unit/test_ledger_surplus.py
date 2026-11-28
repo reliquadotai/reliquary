@@ -255,7 +255,7 @@ def test_burning_needs_the_collectors_signer_and_a_whole_cap(journal):
     chain = FakeChain(stake_rao=20 * ALPHA, owners=OWNERS)
     with pytest.raises(po.PayoutError):
         asyncio.run(sp.run_burn((), journal=journal, chain=chain, config=_config(), collector_tasks=(),
-                                now=NOW, cap_rao=ALPHA, execute=True, signer=None, clock=lambda: NOW))
+                                now=NOW, cap_rao=ALPHA, cannot_know=(), execute=True, signer=None, clock=lambda: NOW))
     with pytest.raises(po.PayoutError):
         asyncio.run(sp.run_burn((), journal=journal, chain=chain, config=_config(), collector_tasks=(),
                                 now=NOW, cap_rao=1.5, execute=False))
@@ -399,7 +399,7 @@ def test_burn_surplus_is_a_dry_run_by_default_and_execution_inputs_are_pinned(tm
     result = CliRunner().invoke(cli.ledger_app, base + ["--cap", "4", "--prices", "none",
                                                         "--as-of", "2026-11-28T13:00:00"])
     assert result.exit_code == 3, result.output            # no journal yet: an execution would stop
-    assert "DRY-RUN surplus burn" in result.output and "this pass burns 4.000000000 alpha" in result.output
+    assert "DRY-RUN surplus burn" in result.output and "this pass burns 0.000000000 alpha" in result.output
     assert chain.submitted == [] and not (tmp_path / "home/.reliquary/payout/journal.sqlite").exists()
     assert list((tmp_path / "home/.reliquary/payout/receipts").glob("burn-2026-11-28-dry-run-*.json"))
     wallet = ["--execute", "--cap", "1", "--wallet-name", "w"]
@@ -456,10 +456,11 @@ def test_collect_burn_fails_closed_when_what_is_owed_cannot_be_known(tmp_path, m
     _view(monkeypatch, rails={PAID: 0})
     receipt, _ = _collect(tmp_path, journal.path, archives)
     assert "could not be valued" in receipt["stopped"]
-    # Priced and on the rail: the burn holds back what it owes and what may still settle.
+    # A priced first part establishes an obligation, without proving all later parts have arrived.
     _view(monkeypatch, rails={PAID: 0}, ceilings=priced)
     receipt, _ = _collect(tmp_path, journal.path, archives, unsettled_days=0.0)
-    assert receipt["stopped"] is None and receipt["owed_rao"] == ob.amount_rao(0.01, 147.6)
+    assert "settlement finality" in receipt["stopped"] and receipt["planned_rao"] == 0
+    assert receipt["owed_rao"] == ob.amount_rao(0.01, 147.6)
     assert receipt["unsettled_rao"] > 0
     # A task the journal paid that the registry no longer puts on the rail.
     handle = po.Journal(journal.path)
@@ -472,6 +473,43 @@ def test_collect_burn_fails_closed_when_what_is_owed_cannot_be_known(tmp_path, m
     _view(monkeypatch, rails={})
     receipt, _ = _collect(tmp_path, journal.path, archives)
     assert f"task {PAID} was paid by the collector" in receipt["stopped"]
+
+
+@pytest.mark.parametrize("starts_rail", [False, True])
+def test_native_registry_is_checked_after_the_finalized_balance(tmp_path, monkeypatch, journal, starts_rail):
+    from typer.testing import CliRunner
+    from reliquary.ledger import sources
+
+    chain = FakeChain(stake_rao=20 * ALPHA, owners=OWNERS)
+    cli = _quiet_chain(monkeypatch, chain)
+    journal.close()
+    observed = []
+    read_balance = chain.collector_stake_rao
+
+    async def balance(block):
+        observed.append("balance")
+        return await read_balance(block)
+
+    async def registry():
+        rails = {PAID: WORK} if starts_rail and "balance" in observed else {}
+        observed.append("registry")
+        return sources.RegistryView({}, {}, [], list(rails), rails, present=True)
+
+    monkeypatch.setattr(chain, "collector_stake_rao", balance)
+    monkeypatch.setattr(sources, "read_registry_ceilings", registry)
+    monkeypatch.setattr(cli, "_wallet_signer", lambda *a, **kw: FakeSigner())
+    result = CliRunner().invoke(cli.ledger_app, [
+        "burn-surplus", "--execute", "--wallet-name", "test", "--collector-coldkey", COLLECTOR,
+        "--collector-hotkey", COLLECTOR_HOT, "--cap", "5", "--confirm-rao", str(5 * ALPHA),
+        "--journal", str(journal.path), "--receipts", str(tmp_path / "receipts")])
+    assert observed[:3] == ["registry", "balance", "registry"]
+    receipt = json.loads(next((tmp_path / "receipts").glob("*.json")).read_text())
+    if starts_rail:
+        assert result.exit_code == 3 and "historical rail coverage" in result.output
+        assert receipt["planned_rao"] == 0 and not chain.submitted
+    else:
+        assert result.exit_code == 0 and len(chain.submitted) == 1
+        assert receipt["burned"]["rao"] == 5 * ALPHA
 
 
 def test_collector_status_says_whether_a_tier_landed(monkeypatch):

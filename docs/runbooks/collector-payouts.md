@@ -61,16 +61,15 @@ Before going above 1 %, publish the collector's hotkey and its policy: what it k
 
 ## 4. Burn the surplus
 
-The collector's surplus is its stake beyond what it owes collector-rail work (whatever its age), what that work still awaiting its audit may owe, what is in flight, and its reserve. In phase 1 (every order on the native rail), it owes nothing by transfer. The cap is the most burned per UTC day, by the clock.
+A burn is available while the canonical registry contains only native rails. Retirement preserves each declaration. Execution checks the registry again after reading the finalized balance. Once a collector rail has started, the command retains the full balance until the archives certify final settlement or an upper bound covers every outstanding part.
 
-1. Dry run, which signs nothing and writes only a receipt:
-   ```
-   reliquary ledger burn-surplus --collector-coldkey <collector coldkey> --collector-hotkey <collector hotkey> --cap <alpha per day>
-   ```
-   It prints the stake, what is owed, awaiting audit, in flight and kept, the surplus, what was already burned today, and this pass's amount in rao.
-2. On the owner's go, the same command with `--execute --confirm-rao <the amount printed> --wallet-name <collector wallet>`. An execution burns as of now, from the registry and the bucket's archives.
-3. It burns nothing when what is owed cannot be known: the registry is missing, a collector-rail archive cannot be valued, a task the journal paid is no longer on the rail, or a collector-rail order has no frozen rate.
-4. Publish: `reliquary ledger publish` lists what it would write; `reliquary ledger publish --execute` writes it. Publish after every execution: the published index is how a restored journal is checked.
+Inspect the receipt with a dry run.
+
+```
+reliquary ledger burn-surplus --collector-coldkey <collector coldkey> --collector-hotkey <collector hotkey> --cap <alpha per day>
+```
+
+For a native-only plan, the owner can execute with `--execute --confirm-rao <amount> --wallet-name <wallet>`. An incomplete liability history produces a stopped receipt with a plan of zero. Execution still reconciles earlier submissions. Publish receipts after each execution so the index remains available for checking a restored journal.
 
 ## 5. Pay collector-rail orders at J+2 (per-order pay, later)
 
