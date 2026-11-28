@@ -821,6 +821,54 @@ class WeightOnlyValidator:
             )
         return int(owner_uid)
 
+    @staticmethod
+    def _resolve_payout(metagraph, hotkey_to_uid: dict, epoch_block: int | None) -> tuple[int | None, float]:
+        """Where the collector's part of the unpaid share goes, and that part:
+        (its UID, the fraction), or (None, 0.0) for none.
+
+        The fraction is the tier of ``PAYOUT_TIERS`` in effect for the epoch
+        that ends at ``epoch_block`` (``payout_fraction``), read once here.
+        ``PAYOUT_HOTKEY`` is resolved in this exact metagraph snapshot, as the
+        owner's is. A hotkey with no UID here, the owner's, or held by the
+        subnet owner's coldkey (the chain keeps an owner hotkey's incentive:
+        routing to it would burn anyway) is refused loudly and its part burns:
+        never a guessed UID. So is any hotkey when the snapshot does not name
+        the subnet owner: the burn then fails closed, as without a collector.
+        """
+        # Imported here so tests can patch the code constants; nothing else sets them.
+        from reliquary.constants import PAYOUT_HOTKEY as _hotkey
+        from reliquary.constants import PAYOUT_TIERS as _tiers
+        from reliquary.constants import payout_fraction
+
+        fraction = payout_fraction(_tiers, epoch_block)
+        if _hotkey is None or fraction <= 0.0:
+            return None, 0.0
+        uid = hotkey_to_uid.get(_hotkey)
+        if uid is None:
+            logger.error("payout hotkey %s has no UID in the current metagraph; its share burns", _hotkey)
+            return None, 0.0
+        owner_hotkey = getattr(metagraph, "owner_hotkey", None)
+        owner_coldkey = getattr(metagraph, "owner_coldkey", None)
+        if not (isinstance(owner_hotkey, str) and owner_hotkey and isinstance(owner_coldkey, str) and owner_coldkey):
+            logger.error("the metagraph does not name the subnet owner: payout hotkey %s cannot be checked; its "
+                         "share burns", _hotkey)
+            return None, 0.0
+        coldkeys = getattr(metagraph, "coldkeys", None)
+        held_by = (dict(zip(metagraph.hotkeys, coldkeys)).get(_hotkey)
+                   if isinstance(coldkeys, (list, tuple)) else None)
+        if _hotkey == owner_hotkey or held_by == owner_coldkey:
+            logger.error("payout hotkey %s is the subnet owner's (its coldkey): the chain keeps its "
+                         "incentive; its share burns", _hotkey)
+            return None, 0.0
+        return int(uid), fraction
+
+    @staticmethod
+    def _metagraph_block(metagraph) -> int | None:
+        try:
+            return int(getattr(metagraph, "block"))
+        except (AttributeError, TypeError, ValueError):
+            return None
+
     async def _submit_weights(
         self,
         subtensor,
@@ -849,11 +897,25 @@ class WeightOnlyValidator:
         # dropping it would make the vector sum below one and let chain-side
         # normalization redistribute that mass among remaining miners.
         burn_weight = max(0.0, 1.0 - registered_total)
+        payout_weight = 0.0
         if burn_weight > 0:
-            burn_uid = self._resolve_burn_uid(meta, hotkey_to_uid)
-            weights_by_uid[burn_uid] = (
-                weights_by_uid.get(burn_uid, 0.0) + burn_weight
-            )
+            # The collector, when one is set, takes its tier's fraction of the
+            # unpaid share; the rest burns, exactly as when none is set. The
+            # tier is the epoch's (its id is the block it ends at, the same for
+            # every submission in it), so every validator switches together.
+            epoch_block = (self._active_submit_epoch if self._active_submit_epoch is not None
+                           else self._metagraph_block(meta))
+            payout_uid, fraction = self._resolve_payout(meta, hotkey_to_uid, epoch_block)
+            if payout_uid is not None:
+                payout_weight = burn_weight * fraction
+                weights_by_uid[payout_uid] = (
+                    weights_by_uid.get(payout_uid, 0.0) + payout_weight
+                )
+            if burn_weight - payout_weight > 0:
+                burn_uid = self._resolve_burn_uid(meta, hotkey_to_uid)
+                weights_by_uid[burn_uid] = (
+                    weights_by_uid.get(burn_uid, 0.0) + burn_weight - payout_weight
+                )
         if not weights_by_uid:
             logger.info("No non-zero weights to submit; nothing to do.")
             return True
@@ -876,10 +938,11 @@ class WeightOnlyValidator:
         if submitted:
             logger.info(
                 "Submitted weights: %d registered miners "
-                "(miner_total=%.4f, omitted=%.4f), burn=%.4f",
+                "(miner_total=%.4f, omitted=%.4f), burn=%.4f (to the collector: %.4f)",
                 registered_hotkey_count,
                 registered_total,
                 omitted_total,
-                burn_weight,
+                burn_weight - payout_weight,
+                payout_weight,
             )
         return submitted
