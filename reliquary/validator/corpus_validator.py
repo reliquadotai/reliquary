@@ -395,6 +395,7 @@ def wire_job_judge(w, *, records, judge_records, judge_threads, archives, proof,
     # job, its grader nothing ungraded or held (ruling P21).
     from reliquary.infrastructure.corpus_period_store import R2PeriodArchives
     from reliquary.validator import corpus_periods as cp
+    from reliquary.shared.task_registry import payout_rail_from
     from reliquary.validator.corpus_period_settlement import CorpusPeriodSettler, oldest_of
 
     grader = getattr(w, "grader", None)
@@ -403,6 +404,7 @@ def wire_job_judge(w, *, records, judge_records, judge_threads, archives, proof,
         sources.append(lambda: grader.oldest_unready_received_at())
     w.settler = CorpusPeriodSettler(
         task_id=w.entry.task_id, job_id=w.job.job_id, cap=w.cap, records=judge_records,
+        collector_from=payout_rail_from(w.entry.params),
         archives=R2PeriodArchives(guard=archives), oldest_pending=oldest_of(*sources),
         on_settled=on_settled, full_list_every_seconds=SETTLE_FULL_LIST_SECONDS,
         executor=judge_threads.codec,

@@ -303,6 +303,8 @@ def require_payout_rail_unchanged(before: Mapping[str, TaskEntry], after: Mappin
     for task_id, old in before.items():
         new = after.get(task_id)
         if new is None:
+            if old.params.get("settlement") == SETTLEMENT_PERIOD_EMA:
+                raise RegistryError(f"task {task_id!r}: retire the period task to preserve its payout rail")
             continue
         for key in (PAYOUT_RAIL_PARAM, PAYOUT_RAIL_FROM_PARAM):
             if old.params.get(key) != new.params.get(key):

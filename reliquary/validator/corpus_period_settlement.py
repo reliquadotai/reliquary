@@ -93,6 +93,7 @@ class CorpusPeriodSettler:
                  full_list_every_seconds: float | None = None, executor=None,
                  ready: Callable[[list[str]], Awaitable[set[str]]] | None = None,
                  max_price: float | None = None, max_input_price: float | None = None,
+                 collector_from: int | None = None,
                  hold: Callable[[dict, Callable[[float], int]], set[str]] | None = None,
                  capped: Callable[[dict, Callable[[float], int]], set[str]] | None = None) -> None:
         self._ready = ready
@@ -104,6 +105,7 @@ class CorpusPeriodSettler:
         self._max_price = None if max_price is None else float(max_price)
         # Pool share one prompt token may pay, beside it; None: prompts unpaid.
         self._max_input_price = None if max_input_price is None else float(max_input_price)
+        self._collector_from = collector_from
         self._task_id = task_id
         self._job_id = job_id
         self._cap = float(cap)
@@ -289,6 +291,8 @@ class CorpusPeriodSettler:
                     "entry_period": pending["entry_period"],
                     "rewards_by_hotkey": dict(pending["rewards"]),
                     "tokens": pending["tokens"], "verdicts": len(pending["ids"])}
+        if "payout_rail" in pending:
+            document["payout_rail"] = pending["payout_rail"]
         if "cap" in pending:
             # The cap this period was paid under: the weight setter pays the
             # archive up to it whatever the registry's cap is by then, so
@@ -508,6 +512,8 @@ class CorpusPeriodSettler:
             entry = await self._entry(period, cp.period_of(now, genesis) + 1)
             state = {**state, "last_entry": entry, "pending": {
                 "work_period": period, "entry_period": entry, "cap": self._cap,
+                "payout_rail": ("collector" if self._collector_from is not None and period >= self._collector_from
+                                else "native"),
                 "ids": ids, "rewards": share, "tokens": new_tokens, "totals": totals,
                 "period_tokens": earlier + new_tokens,
                 "period_paid": already + paid, "period_price": uniform}}

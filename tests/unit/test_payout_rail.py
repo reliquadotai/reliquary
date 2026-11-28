@@ -77,7 +77,15 @@ def test_no_write_moves_an_existing_task_between_rails():
     before = {NATIVE: native, PAID: paid}
     require_payout_rail_unchanged(before, before)
     require_payout_rail_unchanged({NATIVE: native}, before)          # a new task chooses its rail
-    require_payout_rail_unchanged(before, {NATIVE: native})          # a task gone is not a move
+    from reliquary.shared.task_registry import add_task, retire_task
+
+    retired = retire_task(before, PAID, 1)
+    require_payout_rail_unchanged(before, retired)
+    with pytest.raises(RegistryError, match="already exists"):
+        add_task(retired, _entry(PAID))
+    for kept in ({NATIVE: native}, {PAID: paid}):
+        with pytest.raises(RegistryError, match="retire"):
+            require_payout_rail_unchanged(before, kept)
     for moved in ({NATIVE: replace(native, params={**native.params, "payout_rail": "collector",
                                                    "payout_rail_from": WORK}), PAID: paid},
                   {NATIVE: native, PAID: replace(paid, params={**paid.params, "payout_rail_from": WORK + 5})},
@@ -111,6 +119,16 @@ def test_the_registry_store_refuses_a_write_that_moves_a_rail(monkeypatch):
     assert written == []
     asyncio.run(store._mutate(lambda entries: dict(entries), attempts=1))
     assert written == [{NATIVE: native}]
+
+
+def test_collector_declaration_cannot_reassign_an_earlier_period(monkeypatch):
+    from reliquary.infrastructure import task_registry_store as store
+
+    monkeypatch.setattr(store.time, "time", lambda: cp.period_end(WORK) - 1)
+    before = {"default": _rl_entry("default", 0.5)}
+    for requested, first in [(WORK - 1, WORK), (WORK, WORK), (WORK + 1, WORK + 1)]:
+        updated = store._create(before, _collector(start=requested))
+        assert updated[PAID].params["payout_rail_from"] == first
 
 
 def test_declaring_a_collector_rail_task_needs_the_fleet_acknowledged():

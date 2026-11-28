@@ -2544,6 +2544,7 @@ def wire_order_judge(w, *, records, job_store, remote, params, miner_states, bea
     from reliquary.validator.corpus_miner_status import (
         MinerBook, feed, proof_thresholds, read_recent_windows,
     )
+    from reliquary.shared.task_registry import payout_rail_from
     from reliquary.validator.corpus_period_settlement import CorpusPeriodSettler, oldest_of
     from reliquary.validator.corpus_settlement import SETTLE_FULL_LIST_SECONDS, settler_fed
 
@@ -2571,6 +2572,7 @@ def wire_order_judge(w, *, records, job_store, remote, params, miner_states, bea
         grader.on_voided = w.miners.voided
     w.settler = CorpusPeriodSettler(
         task_id=entry.task_id, job_id=job.job_id, cap=cap, records=records,
+        collector_from=payout_rail_from(entry.params),
         archives=R2PeriodArchives(guard=settle_archives),
         oldest_pending=oldest_of(*pending), ready=grader.ready if grader is not None else None,
         on_settled=on_settled, full_list_every_seconds=SETTLE_FULL_LIST_SECONDS, executor=settle_executor,

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 import json
 from dataclasses import replace
 from collections.abc import Mapping
@@ -18,6 +19,8 @@ from reliquary.shared.task_registry import (
     KEEP,
     TaskEntry,
     MECHANISM_CORPUS_GENERATION,
+    PAYOUT_RAIL_FROM_PARAM,
+    payout_rail_from,
     RegistryError,
     add_task,
     parse_registry,
@@ -193,7 +196,16 @@ def _create(entries: Mapping[str, TaskEntry], entry: TaskEntry, guard=None):
     # re-applies it against the winner of a lost race, so two operators
     # racing cannot slip a non-`default` first entry past each other.
     require_default_declared_first(entries, entry)
-    return _guarded(entries, add_task(entries, entry), guard)
+    updated = add_task(entries, entry)
+    start = payout_rail_from(entry.params)
+    if start is not None:
+        from reliquary.validator.corpus_periods import period_of
+
+        # A retry may cross a period boundary. The first successful declaration cannot
+        # reassign work from a previous period to the collector.
+        first = max(start, period_of(time.time()))
+        updated[entry.task_id] = replace(entry, params={**entry.params, PAYOUT_RAIL_FROM_PARAM: first})
+    return _guarded(entries, updated, guard)
 
 
 def _guarded(before, updated, guard):
