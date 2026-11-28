@@ -512,11 +512,11 @@ class CorpusPeriodSettler:
             entry = await self._entry(period, cp.period_of(now, genesis) + 1)
             state = {**state, "last_entry": entry, "pending": {
                 "work_period": period, "entry_period": entry, "cap": self._cap,
-                "payout_rail": ("collector" if self._collector_from is not None and period >= self._collector_from
-                                else "native"),
                 "ids": ids, "rewards": share, "tokens": new_tokens, "totals": totals,
                 "period_tokens": earlier + new_tokens,
                 "period_paid": already + paid, "period_price": uniform}}
+            if self._collector_from is not None:
+                state["pending"]["payout_rail"] = "collector" if period >= self._collector_from else "native"
             if self._max_price is not None:
                 state["pending"].update(max_price=self._max_price, budget=budget)
             if input_price is not None:

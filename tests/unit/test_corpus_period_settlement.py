@@ -148,15 +148,15 @@ def test_a_crash_after_choosing_pays_once():
     assert set(archives.docs) == {(2, 16)} and records.state["pending"] is None
 
 
-@pytest.mark.parametrize(("start", "expected"), [(None, "native"), (2, "collector"), (3, "native")])
+@pytest.mark.parametrize(("start", "expected"), [(None, None), (2, "collector"), (3, "native")])
 def test_period_rail_survives_a_publication_restart(start, expected):
     records, archives = Records(), Archives(fail_once=True)
     records.verdicts = {"a": verdict("a", "a", 10, at(2))}
     with pytest.raises(ConnectionError):
         asyncio.run(settler(records, archives, at(9), collector_from=start).settle_once())
-    assert records.state["pending"]["payout_rail"] == expected
+    assert records.state["pending"].get("payout_rail") == expected
     asyncio.run(settler(records, archives, at(15)).settle_once())
-    assert archives.docs[(2, 16)]["payout_rail"] == expected
+    assert archives.docs[(2, 16)].get("payout_rail") == expected
 
 
 def test_a_crash_after_the_write_does_not_write_again():
