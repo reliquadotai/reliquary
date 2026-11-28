@@ -280,7 +280,7 @@ def test_original_lease_evidence_survives_holds_and_restarts(tmp_path):
     held = [False]
     _, _, _, clock, leases, slots = _setup(held=lambda: held[0])
     original = leases.grant(MINER, slots, price=0.125, offer=0.1)
-    obs.grants(JOB, [original])
+    obs.grants(JOB, [original], miner_alpha_per_period=4.0)
     held[0] = True
     leases.expire()
     clock.now += 20
@@ -325,6 +325,14 @@ def test_original_lease_evidence_survives_holds_and_restarts(tmp_path):
     assert result["settled_tokens_inconsistent_receipt_details"] == 11
     assert result["settled_tokens_with_original_grant"] == 3
     assert result["settled_tokens_without_original_grant"] == 2
+    assert result["settled_tokens_valued_at_grant"] == 3
+    assert result["gross_value_at_grant_rao_floor"] == 1_500_000_000  # Opening emission was 2.
+    with sqlite3.connect(path) as db:
+        db.execute("UPDATE observed_draw_grants SET miner_alpha_per_period=NULL")
+    unknown = report(path)
+    assert unknown["settled_tokens_with_original_grant"] == 3
+    assert unknown["settled_tokens_valued_at_grant"] == 0
+    assert unknown["gross_value_at_grant_rao_floor"] is None
     assert not any(value in json.dumps(result) for value in (MINER, JOB, shifted.lease_id, "missing-grant"))
 
 

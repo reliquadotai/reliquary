@@ -81,7 +81,10 @@ class Receipt:
 def _load_periods(db, job, counts):
     receipts = {}
     complete = True
-    has_grants = db.execute("SELECT 1 FROM sqlite_master WHERE name='observed_draw_grants'").fetchone()
+    grant_columns = {r[1] for r in db.execute("PRAGMA table_info(observed_draw_grants)")}
+    rate_column = "miner_alpha_per_period" if "miner_alpha_per_period" in grant_columns else "NULL"
+    lookup = f"""SELECT {rate_column} FROM observed_draw_grants
+                 WHERE order_id=? AND receipt=? AND hotkey=? AND received=? AND tokens=? AND price IS ?"""
 
     periods = db.execute("""SELECT document FROM observed_periods WHERE order_id=?
                             ORDER BY work_period,entry_period""", (job,))
@@ -112,6 +115,8 @@ def _load_periods(db, job, counts):
             raise TypeError("invalid delivery list")
         detailed = 0
         linked = 0
+        valued_tokens = 0
+        grant_value_rao = Fraction(0)
         for delivery in deliveries:
             sid, miner = delivery["id"], delivery["hotkey"]
             if not isinstance(sid, str) or not sid or not isinstance(miner, str) or not miner:
@@ -130,13 +135,17 @@ def _load_periods(db, job, counts):
                 counts["tokens_missing_receipt_time"] += volume_i
             else:
                 at = _number(at, "receipt time")
-            grant = has_grants and db.execute("""SELECT granted FROM observed_draw_grants
-                WHERE order_id=? AND receipt=? AND hotkey=? AND received=? AND tokens=? AND price IS ?""",
+            grant = grant_columns and db.execute(lookup,
                 (job, sid, miner, delivery["received_at"], volume_i, delivery["lease_price"])).fetchone()
             if grant:
                 linked += volume_i
             price = delivery["lease_price"]
             price = _number(price, "observed lease price") if price is not None else None
+            if grant and price is not None:
+                grant_rate = grant[0]
+                if type(grant_rate) in (int, float) and math.isfinite(grant_rate) and grant_rate > 0:
+                    valued_tokens += volume_i
+                    grant_value_rao += volume_i * price * Fraction(grant_rate) * 10**9
             nominal = price * rate if price is not None and rate is not None else None
             receipts[sid] = Receipt(sid, miner, at, volume_i, audited, nominal)
             detailed += volume_i
@@ -147,6 +156,8 @@ def _load_periods(db, job, counts):
             counts["settled_tokens_inconsistent_receipt_details"] += volume
             complete = False
         else:
+            counts["settled_tokens_valued_at_grant"] += valued_tokens
+            counts["grant_value_rao"] += grant_value_rao
             counts["settled_tokens_with_original_grant"] += linked
             counts["settled_tokens_without_original_grant"] += volume - linked
     return receipts, complete
@@ -240,7 +251,7 @@ def report(path, *, order_id=None):
     reasons = ("orders", "orders_without_owner_snapshot", "tokens_without_owner_snapshot", "captured_period_fragments", "valued_fragments", "fragments_missing_valuation",
                "settled_tokens", "fragments_without_receipts", "fragments_with_volume_mismatch",
                "receipt_tokens", "audited_receipt_tokens", "orders_with_incomplete_detail",
-               "settled_tokens_with_original_grant", "settled_tokens_without_original_grant",
+               "settled_tokens_valued_at_grant", "settled_tokens_with_original_grant", "settled_tokens_without_original_grant",
                "settled_tokens_missing_receipt_details", "settled_tokens_inconsistent_receipt_details",
                "tokens_missing_receipt_time", "orders_without_final_verified_total", "orders_with_matching_final_tokens",
                "orders_with_final_token_gap", "final_verified_tokens_on_known_orders", "captured_tokens_on_known_orders",
@@ -251,13 +262,16 @@ def report(path, *, order_id=None):
         **{name: counts[name] for name in reasons},
         "settled_baseline_rao_on_valued_fragments": counts["settled_baseline_rao"] if counts["valued_fragments"] else None,
         "matched_nominal_contract_millirao": counts["matched_contract_millirao"] if counts["matched_contract_tokens"] else None,
+        "gross_value_at_grant_rao_floor": math.floor(counts["grant_value_rao"]) if counts["settled_tokens_valued_at_grant"] else None,
+        "grant_value_basis": "gross lease share times emission recorded at grant on linked tokens in volume-consistent fragments, before debits",
+        "paired_nominal_observed_at_opening_rate_millirao_floor": math.floor(counts["paired_observed_millirao"]) if paired else None,
         "paired_nominal_observed_millirao_floor": math.floor(counts["paired_observed_millirao"]) if paired else None,
         "paired_nominal_contract_millirao": counts["paired_contract_millirao"] if paired else None,
         "ownership_basis": "last completed registry read known by the opening second within the registration cache TTL; rotations between reads are unobserved",
         "original_grant_coverage_basis": "all captured settled tokens, split among linked, unlinked, missing receipt details and inconsistent fragment totals",
         "coverage_basis": "pairing requires complete receipt details and captured tokens equal to the authoritative final count",
         "settlement_basis": "archived net shares valued at the opening emission when the archived ceiling matches, floored to rao per miner per fragment",
-        "comparison_basis": "gross prices at original receipt times; elapsed-rate envelope is a conservative heuristic for bursty arrivals",
+        "comparison_basis": "paired observed nominal uses the opening emission and the lease price recorded on the receipt; elapsed-rate envelope is a conservative heuristic for bursty arrivals",
     }
 
 
