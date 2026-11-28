@@ -125,6 +125,7 @@ pytest -q --ignore=tests/gpu --ignore=tests/integration/test_grader_e2e.py
 
 | Guide | Purpose |
 | --- | --- |
+| [Test a verifiable reward before RL](docs/reward-check-tutorial.md) | Run an offline reward checker and inspect reward contrast |
 | [Mining orders](docs/mining-orders.md) | The command, the order list, pricing |
 | [Orders](docs/orders.md) | How batch and evaluation orders are built, audited and delivered |
 | [Validating](docs/validating.md) | Running a validator |
