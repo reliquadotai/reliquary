@@ -327,15 +327,6 @@ def validate_entry(entry: TaskEntry) -> None:
         validate_audit_params(entry.params)
     except ValueError as exc:
         raise RegistryError(str(exc)) from exc
-    cap = _number(entry.params["cap"], "cap")
-    if not 0.0 <= cap <= 1.0:
-        raise RegistryError(f"cap must be between 0.0 and 1.0, got {cap}")
-    if TAIL_CAP_PARAM in entry.params:
-        tail = _number(entry.params[TAIL_CAP_PARAM], TAIL_CAP_PARAM)
-        if not 0.0 <= tail <= 1.0:
-            raise RegistryError(f"{TAIL_CAP_PARAM} must be between 0.0 and 1.0, got {tail}")
-    _validate_token_price(entry)
-    _validate_pricing(entry)
     if "order_contract" in entry.params:
         from reliquary.corpus.contract_spec import PILOT_UNAVAILABLE, validate_spec
 
@@ -349,6 +340,15 @@ def validate_entry(entry: TaskEntry) -> None:
             raise RegistryError("order_contract requires a corpus task settled by period")
         if marker["mode"] == "pilot":
             raise RegistryError(PILOT_UNAVAILABLE)
+    cap = _number(entry.params["cap"], "cap")
+    if not 0.0 <= cap <= 1.0:
+        raise RegistryError(f"cap must be between 0.0 and 1.0, got {cap}")
+    if TAIL_CAP_PARAM in entry.params:
+        tail = _number(entry.params[TAIL_CAP_PARAM], TAIL_CAP_PARAM)
+        if not 0.0 <= tail <= 1.0:
+            raise RegistryError(f"{TAIL_CAP_PARAM} must be between 0.0 and 1.0, got {tail}")
+    _validate_token_price(entry)
+    _validate_pricing(entry)
     _validate_rl_start_pool(entry, cap)
     floor = _number(entry.params["floor"], "floor")
     if floor > cap:
