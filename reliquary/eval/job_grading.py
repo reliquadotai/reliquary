@@ -32,13 +32,12 @@ _RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 def rl_provenance(model: str | None, *, run_id: str | None = None, step: int | None = None,
                   checkpoint_version: int | None = None) -> dict:
     """The RL identity a report carries: ``rl_run_id`` (the trainer's wandb run id), ``rl_step`` and
-    ``rl_checkpoint_version``. Explicit values win; the step (and the version, one step per checkpoint) is read
-    from an HF backup's repo name. Empty when nothing is known: the report is unchanged."""
+    ``rl_checkpoint_version``. Explicit values win; only the optimizer step is read from an HF backup's
+    repo name. Checkpoint publication cadence is independent. Empty when nothing is known."""
     if step is None and model:
         found = _BACKUP_STEP.search(model)
         if found:
             step = int(found.group(1))
-            checkpoint_version = step if checkpoint_version is None else checkpoint_version
     if run_id is not None and not _RUN_ID.fullmatch(run_id):
         raise ValueError(f"rl run id {run_id!r}: letters, digits, '.', '_' or '-', at most 128")
     for name, value in (("rl step", step), ("rl checkpoint version", checkpoint_version)):
