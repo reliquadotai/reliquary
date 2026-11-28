@@ -526,7 +526,8 @@ def test_observation_binds_original_grant_to_new_acceptance_without_changing_wir
     (sid, record), = records.submissions.items()
     assert "lease_id" not in record and "granted_at" not in record
     with sqlite3.connect(path) as db:
-        row, = db.execute("SELECT lease_id,receipt,tokens,received,price,debit FROM observed_draw_grants "
+        row, = db.execute("SELECT lease_id,receipt,tokens,received,price,debit,miner_alpha_per_period FROM observed_draw_grants "
                           "WHERE receipt IS NOT NULL")
     assert row == (lease["lease_id"], sid, record["token_count"], record["received_at"],
-                   record["lease_price"], record["lease_debit"])
+                   record["lease_price"], record["lease_debit"], EMISSION)
+    assert row[4] * row[6] * 1e6 == pytest.approx(lease["detail"]["price_alpha_per_mtoken"])

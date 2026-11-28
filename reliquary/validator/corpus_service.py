@@ -2881,7 +2881,8 @@ def build_corpus_router(
         granted, reason = _allocate_leases(job, state, hotkey, wanted)
         if granted and lease_observation is not None:
             try:
-                lease_observation.grants(job.job_id, granted)
+                lease_observation.grants(job.job_id, granted, miner_alpha_per_period=(
+                    auction.params.miner_alpha_per_period if auction is not None else None))
             except Exception:
                 logger.warning("original draw lease observation unavailable")
         return granted, reason

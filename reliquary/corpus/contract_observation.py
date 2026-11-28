@@ -49,7 +49,11 @@ class ContractObservation:
                 order_id TEXT NOT NULL, lease_id TEXT NOT NULL, hotkey TEXT NOT NULL,
                 prompt INTEGER NOT NULL, slot INTEGER NOT NULL, granted REAL NOT NULL, expires REAL NOT NULL,
                 price REAL, offer REAL, receipt TEXT, received REAL, tokens INTEGER, debit REAL,
+                miner_alpha_per_period REAL,
                 PRIMARY KEY(order_id,lease_id), UNIQUE(order_id,receipt))""")
+
+            if "miner_alpha_per_period" not in {r[1] for r in db.execute("PRAGMA table_info(observed_draw_grants)")}:
+                db.execute("ALTER TABLE observed_draw_grants ADD COLUMN miner_alpha_per_period REAL")
 
         return book
 
@@ -68,13 +72,14 @@ class ContractObservation:
                 raise PermissionError("lease observation requires an owner-controlled database")
         return self.book.path
 
-    def grants(self, job, leases):
+    def grants(self, job, leases, *, miner_alpha_per_period=None):
         # Called with the immutable objects returned by grant, before any hold can shift their clocks.
         with closing(sqlite3.connect(self._private_path(), timeout=0)) as db, db:
             db.executemany("""INSERT OR IGNORE INTO observed_draw_grants
-                (order_id,lease_id,hotkey,prompt,slot,granted,expires,price,offer) VALUES (?,?,?,?,?,?,?,?,?)""",
+                (order_id,lease_id,hotkey,prompt,slot,granted,expires,price,offer,miner_alpha_per_period)
+                VALUES (?,?,?,?,?,?,?,?,?,?)""",
                 [(job, lease.lease_id, lease.hotkey, lease.prompt_index, lease.slot, lease.granted_at,
-                  lease.expires_at, lease.price, lease.offer) for lease in leases])
+                  lease.expires_at, lease.price, lease.offer, miner_alpha_per_period) for lease in leases])
 
     def accepted(self, job, lease_id, record):
         # The native CAS accepted this attempt. A private row alone does not prove publication;
