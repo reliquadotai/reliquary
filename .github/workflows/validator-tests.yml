@@ -32,13 +32,19 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cpu
           python -m pip install -e ".[dev]"
+      # The latency and starvation controls compare their own four judges against
+      # one route. Parallel xdist tests would add unrelated load to that timing.
+      - name: Measure judge and route isolation
+        if: matrix.shard == 1
+        run: pytest -q --timeout=900 tests/unit/test_corpus_judge_isolation.py
       - name: Run validator suite (shard ${{ matrix.shard }}/4)
         run: |
           pytest -q -n 4 --durations=15 --timeout=900 \
             --test-shard=${{ matrix.shard }}/4 \
             --ignore=tests/gpu \
             --ignore=tests/integration/test_grader_e2e.py \
-            --ignore=tests/unit/test_corpus_split_e2e.py
+            --ignore=tests/unit/test_corpus_split_e2e.py \
+            --ignore=tests/unit/test_corpus_judge_isolation.py
       - name: Every corpus-split-e2e test has its own job
         if: matrix.shard == 1
         run: |
