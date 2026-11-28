@@ -4,7 +4,8 @@
     python -m reliquary.customer_env.pack --from-prime owner/name@1.2.0 --taskset name \\
         --examples examples.jsonl -o name.tar.gz
 
-It adds ``[tool.reliquary]`` when the directory has none (``--taskset``, ``--args``), writes a hash-pinned
+It adds ``[tool.reliquary]`` when the directory has none (``--taskset``, ``--args``, ``--license``), records a
+Prime Hub env's source (owner, name, version: shown wherever the env is listed), writes a hash-pinned
 ``requirements.lock`` with ``uv pip compile --generate-hashes`` when there is none (verifiers left out: our base
 provides it), copies the examples, and writes a deterministic archive that ``package.read_package`` accepts.
 Nothing here runs on our hosts.
@@ -48,16 +49,43 @@ def pull_from_prime(spec: str, target: Path, *, run: Run = _run) -> Path:
     return min(candidates, key=lambda p: len(p.parts))
 
 
-def _with_manifest(pyproject: str, taskset: str | None, args: dict | None) -> str:
+def prime_source(spec: str, pulled: Path) -> dict:
+    """The provenance of a Prime Hub env: its owner, name and the version pulled."""
+    owner, _, rest = spec.partition("/")
+    name, _, version = rest.partition("@")
+    if not version:
+        version = str((tomllib.loads((pulled / "pyproject.toml").read_text()).get("project") or {}).get("version", ""))
+    source = {"hub": "prime_hub", "owner": owner, "name": name,
+              "url": f"https://app.primeintellect.ai/dashboard/environments/{owner}/{name}"}
+    return {**source, "revision": version} if version else source
+
+
+def _toml_table(header: str, values: dict) -> list[str]:
+    return ["", f"[{header}]", *(f"{k} = {json.dumps(v)}" for k, v in values.items())]
+
+
+def _with_manifest(pyproject: str, taskset: str | None, args: dict | None, *, license: str | None = None,
+                   source: dict | None = None) -> str:
     project = tomllib.loads(pyproject)
-    if "reliquary" in (project.get("tool") or {}):
+    tool = (project.get("tool") or {}).get("reliquary")
+    lines = []
+    if tool is None:
+        if not taskset:
+            raise ValueError("pyproject.toml has no [tool.reliquary]: pass --taskset (the verifiers taskset id)")
+        lines = ["", "[tool.reliquary]", f"taskset = {json.dumps(taskset)}"]
+        if license:
+            lines.append(f"license = {json.dumps(license)}")
+        if args:
+            body = ", ".join(f"{k} = {json.dumps(v)}" for k, v in sorted(args.items()))
+            lines.append(f"args = {{{body}}}")
+    elif license and not tool.get("license"):
+        if source is None:
+            raise ValueError("pyproject.toml has a [tool.reliquary]: name the license there")
+        source = {**source, "license": license}  # the table is closed: the upstream license goes with its source
+    if source and not (tool or {}).get("source"):
+        lines += _toml_table("tool.reliquary.source", source)
+    if not lines:
         return pyproject
-    if not taskset:
-        raise ValueError("pyproject.toml has no [tool.reliquary]: pass --taskset (the verifiers taskset id)")
-    lines = ["", "[tool.reliquary]", f"taskset = {json.dumps(taskset)}"]
-    if args:
-        body = ", ".join(f"{k} = {json.dumps(v)}" for k, v in sorted(args.items()))
-        lines.append(f"args = {{{body}}}")
     return pyproject.rstrip("\n") + "\n" + "\n".join(lines) + "\n"
 
 
@@ -95,14 +123,15 @@ def archive_bytes(directory: Path, root: str) -> bytes:
 
 
 def pack(source: Path, examples: Path, *, taskset: str | None = None, args: dict | None = None,
-         run: Run = _run) -> bytes:
+         license: str | None = None, provenance: dict | None = None, run: Run = _run) -> bytes:
     with tempfile.TemporaryDirectory(prefix="pack-") as tmp:
         work = Path(tmp) / source.name
         shutil.copytree(source, work, ignore=shutil.ignore_patterns(*SKIP), symlinks=False)
         pyproject = work / "pyproject.toml"
         if not pyproject.is_file():
             raise ValueError(f"{source} has no pyproject.toml")
-        pyproject.write_text(_with_manifest(pyproject.read_text(), taskset, args))
+        pyproject.write_text(_with_manifest(pyproject.read_text(), taskset, args, license=license,
+                                            source=provenance))
         if not (work / "requirements.lock").is_file():
             (work / "requirements.lock").write_text(lock(work, run=run))
         shutil.copyfile(examples, work / "examples.jsonl")
@@ -118,6 +147,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--from-prime", metavar="OWNER/NAME[@VERSION]", help="pull it from the Prime Hub instead")
     parser.add_argument("--taskset", help="the verifiers taskset id, when pyproject.toml has no [tool.reliquary]")
     parser.add_argument("--args", type=json.loads, default=None, help="the taskset's config fields, as JSON")
+    parser.add_argument("--license", help="the env's license (SPDX id): a version without one cannot be public")
     parser.add_argument("--examples", type=Path, required=True, help="examples.jsonl: key, answer, expected_score")
     parser.add_argument("-o", "--output", type=Path, required=True)
     ns = parser.parse_args(argv)
@@ -125,11 +155,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("give a source directory or --from-prime, not both")
     with tempfile.TemporaryDirectory(prefix="prime-") as tmp:
         source = pull_from_prime(ns.from_prime, Path(tmp)) if ns.from_prime else ns.source
-        data = pack(source, ns.examples, taskset=ns.taskset, args=ns.args)
+        provenance = prime_source(ns.from_prime, source) if ns.from_prime else None
+        data = pack(source, ns.examples, taskset=ns.taskset, args=ns.args, license=ns.license,
+                    provenance=provenance)
     ns.output.write_bytes(data)
     pkg = read_package(data)
     print(json.dumps({"output": str(ns.output), "sha256": pkg.sha256, "taskset": pkg.taskset,
-                      "examples": len(pkg.examples), "requirements": len(pkg.requirements)}))
+                      "examples": len(pkg.examples), "requirements": len(pkg.requirements),
+                      "license": pkg.license, "source": pkg.source}))
     return 0
 
 

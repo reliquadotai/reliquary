@@ -74,7 +74,8 @@ class Qualifier:
             package = read_package(data)
         except PackageInvalid as exc:
             raise _Refused("package_invalid", str(exc)) from None
-        self._registry.update(record.env_id, status="building", kind=package.kind)
+        self._registry.update(record.env_id, status="building", kind=package.kind, license=package.license,
+                              source=package.source)
         if package.kind == "agentic":
             raise _Refused("agentic_not_supported",
                            "agentic environments run on the order's gateways: not served yet")
@@ -146,7 +147,7 @@ class Qualifier:
             cost={"qualification_seconds": round(freeze_s + 3 * score_s, 3),
                   "scoring_ms_per_item": round(1000 * score_s / max(1, len(items)), 3)})
         self._store.create_bytes(subnet_key(env, "record.json"),
-                                 json.dumps(final.public(), sort_keys=True).encode())
+                                 json.dumps(final.view(), sort_keys=True).encode())
         return final
 
     @staticmethod

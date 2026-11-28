@@ -1,6 +1,9 @@
 """The admin host's index of customer env versions (sqlite), and the frozen rows validators read.
 
 A version's record moves queued -> building -> qualifying -> qualified | refused, and qualified -> disabled.
+Its owner may make a qualified version that names a license public: any account may then order it, for good
+(orders already placed on it keep it). ``listed`` puts a public version in the catalog; the owner may take it
+out again. Its ``source`` (where an imported env comes from) is shown with it.
 The frozen prompts and the final record are also written create-only to the subnet bucket
 (``reliquary/customer-envs/<account>/<name>/<sha256>/``): validators read them there, never this index.
 """
@@ -43,8 +46,13 @@ class Record:
     cost: dict = field(default_factory=dict)
     created_at: float = 0.0
     qualified_at: float | None = None
+    license: str | None = None
+    source: dict | None = None
+    public: bool = False
+    listed: bool = False
+    published_at: float | None = None
 
-    def public(self) -> dict:
+    def view(self) -> dict:
         """What the platform reads: everything but the bucket key."""
         out = asdict(self)
         out.pop("object_key")
@@ -99,6 +107,37 @@ class Registry:
         rows = self._db.execute("SELECT body FROM customer_envs WHERE account = ? ORDER BY env_id", (account,))
         return sorted((Record(**json.loads(r[0])) for r in rows), key=lambda r: r.created_at, reverse=True)
 
+    def catalog(self) -> list[Record]:
+        """The public, listed, qualified versions, newest first."""
+        rows = self._db.execute("SELECT body FROM customer_envs WHERE status = 'qualified'"
+                                " AND json_extract(body, '$.public') = 1 AND json_extract(body, '$.listed') = 1")
+        return sorted((Record(**json.loads(r[0])) for r in rows), key=lambda r: r.published_at or 0, reverse=True)
+
+    def publish(self, env_id: str, *, account: str, public: bool | None, listed: bool | None) -> Record:
+        """The owner's change of visibility, or ValueError: public needs a qualified version with a license and
+        is final; listed needs public."""
+        with self._lock:
+            record = self.get(env_id)
+            if record is None:
+                raise KeyError(env_id)
+            if record.account != account:
+                raise ValueError("customer_env_not_yours")
+            if public is False and record.public:
+                raise ValueError("customer_env_public_is_final: unlist it instead")
+            if public and not record.public:
+                if record.status != "qualified":
+                    raise ValueError(f"customer_env_not_qualified: {record.status}")
+                if not record.license:
+                    raise ValueError("customer_env_license_missing: name the license in [tool.reliquary]")
+                record.public, record.published_at = True, self._clock()
+                if listed is None:
+                    listed = True
+            if listed and not record.public:
+                raise ValueError("customer_env_not_public")
+            if listed is not None:
+                record.listed = bool(listed)
+            return self._put(record)
+
     def in_flight(self, account: str) -> int:
         return self._db.execute("SELECT COUNT(*) FROM customer_envs WHERE account = ? AND status IN"
                                 " ('queued','building','qualifying')", (account,)).fetchone()[0]
@@ -118,7 +157,7 @@ def resolve(registry: Registry, env: str, *, account: str, product: str) -> Reco
         raise ValueError("customer_env_unknown")
     if record.status != "qualified":
         raise ValueError(f"customer_env_not_qualified: {record.status}")
-    check_order_env(env, account=account, product=product, uses=record.uses)
+    check_order_env(env, account=account, product=product, uses=record.uses, public=record.public)
     return record
 
 

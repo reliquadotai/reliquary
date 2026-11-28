@@ -19,6 +19,11 @@ MAX_MEMBERS = 10_000
 MIN_EXAMPLES, MAX_EXAMPLES = 2, 64
 MAX_EXAMPLE_ANSWER_CHARS = 100_000
 KINDS = ("single_turn", "agentic")
+# Where an imported env comes from: shown with it wherever it is listed, frozen in its sha256.
+HUBS = ("huggingface", "prime_hub")
+_SOURCE_KEYS = {"hub", "owner", "name", "url", "revision", "license"}
+_LICENSE_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9 .+()-]{0,99}\Z")
+_SOURCE_TEXT_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._/@+-]{0,199}\Z")
 _TASKSET_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\Z")
 # One requirement per logical line, each with at least one --hash=sha256:...
 _REQ_NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*(\[[A-Za-z0-9,._-]+\])?==[A-Za-z0-9.+!_-]+\Z")
@@ -46,6 +51,10 @@ class Package:
     requirements: tuple[str, ...]
     examples: tuple[Example, ...]
     files: tuple[str, ...] = field(repr=False)
+    # The env's license (SPDX id or short name), None when the package names none: it cannot then be public.
+    license: str | None = None
+    # ``hub``, ``owner``, ``name``, ``url``, ``revision`` (and the upstream ``license``) of an imported env.
+    source: dict | None = None
 
 
 def _members(data: bytes) -> list[tuple[tarfile.TarInfo, tarfile.TarFile]]:
@@ -107,6 +116,51 @@ def _examples(text: str) -> tuple[Example, ...]:
     return tuple(examples)
 
 
+def _license(value, where: str) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, dict):  # PEP 621: license = {text = "..."} (a {file = ...} names no license)
+        value = value.get("text")
+        if value is None:
+            return None
+    if not isinstance(value, str) or not _LICENSE_RE.match(value.strip()):
+        raise PackageInvalid(f"{where}: a license is an SPDX id or a short name (at most 100 characters)")
+    return value.strip()
+
+
+def _project_license(project: dict) -> str | None:
+    """``[project] license`` when it is a short name; a full license text names none we can show."""
+    try:
+        return _license((project.get("project") or {}).get("license"), "[project] license")
+    except PackageInvalid:
+        return None
+
+
+def _source(value) -> dict | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or not set(value) <= _SOURCE_KEYS or not {"hub", "owner", "name"} <= set(value):
+        raise PackageInvalid(f"[tool.reliquary.source] holds hub, owner and name, and may hold "
+                             f"{sorted(_SOURCE_KEYS - {'hub', 'owner', 'name'})}")
+    if value["hub"] not in HUBS:
+        raise PackageInvalid(f"[tool.reliquary.source] hub is one of {HUBS}")
+    out = {"hub": value["hub"]}
+    for key in ("owner", "name", "revision"):
+        if key in value:
+            if not isinstance(value[key], str) or not _SOURCE_TEXT_RE.match(value[key]):
+                raise PackageInvalid(f"[tool.reliquary.source] {key} is a hub name or revision")
+            out[key] = value[key]
+    if "url" in value:
+        url = value["url"]
+        if not isinstance(url, str) or not url.startswith("https://") or len(url) > 300 \
+                or any(c.isspace() or c in "\"'<>" for c in url):
+            raise PackageInvalid("[tool.reliquary.source] url is an https:// link")
+        out["url"] = url
+    if "license" in value:
+        out["license"] = _license(value["license"], "[tool.reliquary.source] license")
+    return out
+
+
 def read_package(data: bytes) -> Package:
     """The archive's manifest, requirements and examples, or ``PackageInvalid``."""
     if len(data) > MAX_PACKED_BYTES:
@@ -147,7 +201,7 @@ def read_package(data: bytes) -> Package:
     tool = (project.get("tool") or {}).get("reliquary")
     if not isinstance(tool, dict):
         raise PackageInvalid("pyproject.toml needs a [tool.reliquary] table")
-    unknown = sorted(set(tool) - {"taskset", "args", "kind"})
+    unknown = sorted(set(tool) - {"taskset", "args", "kind", "license", "source"})
     if unknown:
         raise PackageInvalid(f"[tool.reliquary]: unknown keys {unknown}")
     taskset, args, kind = tool.get("taskset"), tool.get("args", {}), tool.get("kind", "single_turn")
@@ -157,10 +211,16 @@ def read_package(data: bytes) -> Package:
         raise PackageInvalid("[tool.reliquary] args is a table")
     if kind not in KINDS:
         raise PackageInvalid(f"[tool.reliquary] kind is one of {KINDS}")
+    source = _source(tool.get("source"))
+    # The package's own license, else the one its source publishes it under, else its project's.
+    license = (_license(tool.get("license"), "[tool.reliquary] license")
+               or (source or {}).get("license")
+               or _project_license(project))
     return Package(sha256=sha256, root=root, taskset=taskset, args=args, kind=kind,
                    requirements=_requirements(texts["requirements.lock"]),
-                   examples=_examples(texts["examples.jsonl"]), files=tuple(sorted(files)))
+                   examples=_examples(texts["examples.jsonl"]), files=tuple(sorted(files)),
+                   license=license, source=source)
 
 
-__all__ = ["KINDS", "MAX_PACKED_BYTES", "MAX_UNPACKED_BYTES", "Example", "Package", "PackageInvalid",
+__all__ = ["HUBS", "KINDS", "MAX_PACKED_BYTES", "MAX_UNPACKED_BYTES", "Example", "Package", "PackageInvalid",
            "read_package"]
