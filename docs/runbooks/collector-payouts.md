@@ -61,15 +61,15 @@ Before going above 1 %, publish the collector's hotkey and its policy: what it k
 
 ## 4. Burn the surplus
 
-The current release retains the full balance. The registry contains current rails and a settled work period can receive later archive parts. Certifying a burn requires the historical rail assignments and either final settlement for each period or an upper bound covering every outstanding part.
+A burn is available while the canonical registry contains only native rails. Retirement preserves each declaration. Execution checks the registry again after reading the finalized balance. Once a collector rail has started, the command retains the full balance until the archives certify final settlement or an upper bound covers every outstanding part.
 
-Inspect the receipt with a dry run:
+Inspect the receipt with a dry run.
 
 ```
 reliquary ledger burn-surplus --collector-coldkey <collector coldkey> --collector-hotkey <collector hotkey> --cap <alpha per day>
 ```
 
-The receipt reports known obligations, estimated unsettled work, the reason for stopping and a burn plan of zero. An execution can reconcile previous submissions and record their outcomes. It leaves new burns blocked until the liability history can be certified. Publish receipts after each execution so the index remains available for checking a restored journal.
+For a native-only plan, the owner can execute with `--execute --confirm-rao <amount> --wallet-name <wallet>`. An incomplete liability history produces a stopped receipt with a plan of zero. Execution still reconciles earlier submissions. Publish receipts after each execution so the index remains available for checking a restored journal.
 
 ## 5. Pay collector-rail orders at J+2 (per-order pay, later)
 

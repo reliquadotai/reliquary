@@ -47,7 +47,7 @@ import asyncio
 import logging
 import time
 import uuid
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from datetime import date
 
 from reliquary.ledger.obligations import DUE, RAO_PER_ALPHA, Obligation, amount_rao, utc_day
@@ -130,6 +130,7 @@ def unsettled_rao(collector_tasks: Mapping[str, int], settled: Iterable[tuple[st
 async def run_burn(obligations: Iterable[Obligation], *, journal: Journal, chain: PayoutChain, config: PayoutConfig,
                    collector_tasks: Mapping[str, int] | Sequence[str], now: float, cap_rao: int,
                    unsettled: int = 0, cannot_know: Sequence[str] = (LIABILITY_HISTORY_UNVERIFIED,), execute: bool = False,
+                   verify_native_rails: Callable[[], Awaitable[bool]] | None = None,
                    signer: Signer | None = None, confirm_rao: int | None = None, wait_seconds: float = 600.0,
                    poll_seconds: float = 12.0, clock=time.time, sleep=asyncio.sleep) -> dict:
     """One surplus burn: settle what is unknown, check the journal and the
@@ -150,13 +151,13 @@ async def run_burn(obligations: Iterable[Obligation], *, journal: Journal, chain
             raise PayoutError("an execution burns as of the clock's time, not another")
         return await _burn(obligations, journal=journal, chain=chain, config=config, collector_tasks=collector_tasks,
                            now=now, cap_rao=cap_rao, unsettled=unsettled, cannot_know=cannot_know, execute=True,
-                           signer=signer, confirm_rao=confirm_rao, wait_seconds=wait_seconds,
+                           verify_native_rails=verify_native_rails, signer=signer, confirm_rao=confirm_rao, wait_seconds=wait_seconds,
                            poll_seconds=poll_seconds, clock=clock, sleep=sleep)
     snapshot = journal if journal.read_only else journal.snapshot()
     try:
         return await _burn(obligations, journal=snapshot, chain=chain, config=config, collector_tasks=collector_tasks,
                            now=now, cap_rao=cap_rao, unsettled=unsettled, cannot_know=cannot_know, execute=False,
-                           signer=None, confirm_rao=confirm_rao, wait_seconds=wait_seconds,
+                           verify_native_rails=None, signer=None, confirm_rao=confirm_rao, wait_seconds=wait_seconds,
                            poll_seconds=poll_seconds, clock=clock, sleep=sleep)
     finally:
         if snapshot is not journal:
@@ -164,7 +165,7 @@ async def run_burn(obligations: Iterable[Obligation], *, journal: Journal, chain
 
 
 async def _burn(obligations, *, journal: Journal, chain: PayoutChain, config: PayoutConfig, collector_tasks, now: float,
-                cap_rao: int, unsettled: int, cannot_know: Sequence[str], execute: bool, signer: Signer | None,
+                cap_rao: int, unsettled: int, cannot_know: Sequence[str], verify_native_rails, execute: bool, signer: Signer | None,
                 confirm_rao: int | None, wait_seconds: float, poll_seconds: float, clock, sleep) -> dict:
     rails = collector_rails(collector_tasks)
     # An execution's day is the clock's (``run_burn`` holds ``now`` to it); a dry run may preview another.
@@ -177,10 +178,14 @@ async def _burn(obligations, *, journal: Journal, chain: PayoutChain, config: Pa
     pending, unreadable = await recover(journal, chain, config, receipt, execute=execute)
     head, expected = await check_journal(journal, chain, config, receipt, pending=pending, unreadable=unreadable)
     await check_collector(chain, config, receipt, head)
+    stake = await chain.collector_stake_rao(head)
+    # Certify the native-only registry after the finalized balance being considered.
+    # A newly declared rail after that read cannot have earned any of that snapshot.
+    if verify_native_rails is not None and not cannot_know and not await verify_native_rails():
+        cannot_know = (LIABILITY_HISTORY_UNVERIFIED,)
     for why in cannot_know:
         if receipt["stopped"] is None:
             receipt["stopped"] = f"what the collector owes cannot be known: {why}. Nothing is burned"
-    stake = await chain.collector_stake_rao(head)
     in_flight = journal.in_flight_rao()
     owed = owed_rao(obligations, journal, rails, now)
     # Without a liability bound the entire balance must be retained.

@@ -502,8 +502,8 @@ def burn_surplus_command(
 ) -> None:
     """Burn the collector's surplus (burn_alpha): its stake beyond what it owes and its reserve, up to a cap.
 
-    The current archive and registry support estimates only. The command retains the full balance
-    until it can establish historical rail coverage and settlement finality. Execution can reconcile previous sends."""
+    A confirmed burn requires a canonical all-native registry. Once a collector rail starts,
+    outstanding work requires settlement finality, and the command retains the full balance."""
     from reliquary.ledger.obligations import RAO_PER_ALPHA
 
     if confirm_rao is not None and not execute:
@@ -567,18 +567,28 @@ async def collect_burn(*, now: float, archives: str, prices: str, network: str, 
                                              else view.pay_ceilings, rates=rates, now=now, days=unsettled_days)
         cannot_know += [f"collector-rail task {task} has no frozen rate or cap to bound its unsettled work"
                         for task in unbounded]
-        # Registry reads contain current declarations only, and late archives can extend
-        # a period that already has settled parts. Neither source certifies the full liability.
-        cannot_know.append(LIABILITY_HISTORY_UNVERIFIED)
+        # Retired tasks retain their declarations. A nonempty canonical all-native registry
+        # certifies that no transfer rail had started; an archive part cannot certify closure.
+        if view is None or rails:
+            cannot_know.append(LIABILITY_HISTORY_UNVERIFIED)
+
+        async def still_native():
+            from reliquary.ledger.sources import read_registry_ceilings
+
+            current = await read_registry_ceilings()
+            return current.present and not current.collector_from
+
         subtensor = await _subtensor(network)
         config = PayoutConfig(netuid=netuid, collector_coldkey=collector_coldkey, collector_hotkey=collector_hotkey,
                               min_transfer_rao=0, reserve_rao=reserve_rao, era_period=era_period)
         chain = _payout_chain(subtensor, netuid=netuid, collector_coldkey=collector_coldkey,
                               collector_hotkey=collector_hotkey)
+        signer = (_wallet_signer(subtensor, wallet_name=wallet_name, wallet_path=wallet_path, netuid=netuid,
+                                 collector_hotkey=collector_hotkey) if execute and not cannot_know else None)
         try:
             receipt = await run_burn(ledger.obligations, journal=journal, chain=chain, config=config,
                                      collector_tasks=rails, now=now, cap_rao=cap_rao, unsettled=unsettled,
-                                     cannot_know=cannot_know, execute=execute, signer=None,
+                                     cannot_know=cannot_know, verify_native_rails=still_native, execute=execute, signer=signer,
                                      confirm_rao=confirm_rao, wait_seconds=wait_seconds)
         except (Exception, asyncio.CancelledError) as exc:
             if execute:

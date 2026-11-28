@@ -475,26 +475,41 @@ def test_collect_burn_fails_closed_when_what_is_owed_cannot_be_known(tmp_path, m
     assert f"task {PAID} was paid by the collector" in receipt["stopped"]
 
 
-def test_current_native_registry_cannot_certify_older_or_removed_rails(tmp_path, monkeypatch, journal):
+@pytest.mark.parametrize("starts_rail", [False, True])
+def test_native_registry_is_checked_after_the_finalized_balance(tmp_path, monkeypatch, journal, starts_rail):
     from typer.testing import CliRunner
+    from reliquary.ledger import sources
 
     chain = FakeChain(stake_rao=20 * ALPHA, owners=OWNERS)
     cli = _quiet_chain(monkeypatch, chain)
-    _view(monkeypatch, present=True, rails={})
     journal.close()
+    observed = []
+    read_balance = chain.collector_stake_rao
 
-    def unexpected_wallet(*args, **kwargs):
-        pytest.fail("a burn with unknown liability history must never open the wallet")
+    async def balance(block):
+        observed.append("balance")
+        return await read_balance(block)
 
-    monkeypatch.setattr(cli, "_wallet_signer", unexpected_wallet)
+    async def registry():
+        rails = {PAID: WORK} if starts_rail and "balance" in observed else {}
+        observed.append("registry")
+        return sources.RegistryView({}, {}, [], list(rails), rails, present=True)
+
+    monkeypatch.setattr(chain, "collector_stake_rao", balance)
+    monkeypatch.setattr(sources, "read_registry_ceilings", registry)
+    monkeypatch.setattr(cli, "_wallet_signer", lambda *a, **kw: FakeSigner())
     result = CliRunner().invoke(cli.ledger_app, [
         "burn-surplus", "--execute", "--wallet-name", "test", "--collector-coldkey", COLLECTOR,
         "--collector-hotkey", COLLECTOR_HOT, "--cap", "5", "--confirm-rao", str(5 * ALPHA),
         "--journal", str(journal.path), "--receipts", str(tmp_path / "receipts")])
-    assert result.exit_code == 3, result.output
-    assert "historical rail coverage" in result.output and not chain.submitted
+    assert observed[:3] == ["registry", "balance", "registry"]
     receipt = json.loads(next((tmp_path / "receipts").glob("*.json")).read_text())
-    assert receipt["planned_rao"] == 0 and receipt["burned"]["rao"] == 0
+    if starts_rail:
+        assert result.exit_code == 3 and "historical rail coverage" in result.output
+        assert receipt["planned_rao"] == 0 and not chain.submitted
+    else:
+        assert result.exit_code == 0 and len(chain.submitted) == 1
+        assert receipt["burned"]["rao"] == 5 * ALPHA
 
 
 def test_collector_status_says_whether_a_tier_landed(monkeypatch):
