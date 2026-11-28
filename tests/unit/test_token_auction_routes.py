@@ -40,7 +40,7 @@ def _auction(clock, ceiling_alpha=0.5):
                                       initial_leases=8), clock=clock, mean_tokens=100)
 
 
-def _route(fake_r2, auction, records, *, prompts=2, slots=1, suspect_until=None):
+def _route(fake_r2, auction, records, *, prompts=2, slots=1, suspect_until=None, lease_observation=None):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
@@ -59,7 +59,7 @@ def _route(fake_r2, auction, records, *, prompts=2, slots=1, suspect_until=None)
         job_id="swe-v1", store=seeded.store, tokenizer=_Tokenizer(), renderer=seeded.renderer,
         verify_signature=lambda request: True, verify_lease_signature=lambda request: request.signature != "bad",
         prompt_job_for=seeded.prompt_job_for, records=records, durable_records=False, auction=auction,
-        suspect_until=suspect_until)
+        suspect_until=suspect_until, lease_observation=lease_observation)
     app.include_router(router)
     return TestClient(app), router
 
@@ -506,3 +506,27 @@ def test_the_miner_asks_without_swap_from_a_validator_that_predates_it():
     _mine(client, _Gen(), max_steps=1, sign_lease=lambda body: "sig", ask_alpha_per_mtoken=0.25)
     assert ["swap" in a for a in client.asks] == [True, False]
     assert client.submitted == [(10, 0)]
+
+def test_observation_binds_original_grant_to_new_acceptance_without_changing_wire(fake_r2, tmp_path):
+    import sqlite3
+    from reliquary.corpus.contract_observation import ContractObservation
+
+    path = tmp_path / "private.sqlite"
+    obs = ContractObservation(path, [])
+    clock = Clock()
+    records = _Records()
+    client, _ = _route(fake_r2, _auction(clock), records, lease_observation=obs)
+    assert _ask(client, "miner", 0.2)["accepted"]
+    lease = _lease(client, "miner")
+    assert lease["leased"]
+    prompt, slot = lease["prompt_index"], lease["slot"]
+    assert not _submit_as(client, "someone-else", prompt, slot)["accepted"]
+    assert _submit_as(client, "miner", prompt, slot)["accepted"]
+    _submit_as(client, "miner", prompt, slot)
+    (sid, record), = records.submissions.items()
+    assert "lease_id" not in record and "granted_at" not in record
+    with sqlite3.connect(path) as db:
+        row, = db.execute("SELECT lease_id,receipt,tokens,received,price,debit FROM observed_draw_grants "
+                          "WHERE receipt IS NOT NULL")
+    assert row == (lease["lease_id"], sid, record["token_count"], record["received_at"],
+                   record["lease_price"], record["lease_debit"])

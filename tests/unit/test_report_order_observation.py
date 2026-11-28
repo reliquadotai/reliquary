@@ -267,3 +267,64 @@ def test_legacy_facts_remain_readable_without_owner_or_conversion_proof(tmp_path
     assert result["orders_without_owner_snapshot"] == 1 and result["tokens_without_owner_snapshot"] == 2
     assert result["paired_tokens"] == result["matched_contract_tokens"] == 0
     assert result["settled_baseline_rao_on_valued_fragments"] is None
+
+
+def test_original_lease_evidence_survives_holds_and_restarts(tmp_path):
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from scripts.report_order_observation import verify_grants
+    from tests.unit.test_draw_leases import _setup
+
+    path, obs, record_archive = observation(tmp_path)
+    held = [False]
+    _, _, _, clock, leases, slots = _setup(held=lambda: held[0])
+    original = leases.grant(MINER, slots, price=0.125, offer=0.1)
+    obs.grants(JOB, [original])
+    held[0] = True
+    leases.expire()
+    clock.now += 20
+    held[0] = False
+    leases.expire()
+    shifted = leases.held(MINER, original.prompt_index, original.slot)
+    assert shifted.granted_at == original.granted_at + 20
+    reopened = ContractObservation(path, [])
+    canonical = {"submission_id": "accepted", "job_id": JOB, "hotkey": MINER,
+                 "prompt_index": shifted.prompt_index, "cursor": shifted.slot, "received_at": clock.now + 1,
+                 "token_count": 3, "lease_price": 0.125, "lease_debit": 0.01}
+    for _ in range(2):
+        reopened.accepted(JOB, shifted.lease_id, canonical)
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT granted,offer,debit FROM observed_draw_grants").fetchall() == [
+            (original.granted_at, 0.1, 0.01)]
+    store = SimpleNamespace(read_submission=AsyncMock(return_value=None), read_verdict=AsyncMock(),
+                            read_voided=AsyncMock(return_value=None))
+    assert asyncio.run(verify_grants(path, JOB, store))["unconfirmed_receipts"] == 1
+    store.read_submission.return_value = canonical
+    store.read_verdict.return_value = {**canonical, "passed": True}
+    assert asyncio.run(verify_grants(path, JOB, store))["passed"] == 1
+    store.read_verdict.return_value["passed"] = False
+    assert asyncio.run(verify_grants(path, JOB, store))["failed"] == 1
+    store.read_voided.return_value = {"voided_at": 2000}
+    assert asyncio.run(verify_grants(path, JOB, store))["voided"] == 1
+    store.read_submission.return_value = {**canonical, "lease_price": 0.5}
+    assert asyncio.run(verify_grants(path, JOB, store))["unconfirmed_receipts"] == 1
+
+    archive(record_archive, 1, 2, [receipt("accepted", 3, canonical["received_at"]),
+                                   receipt("missing-grant", 2, 150)])
+    result = report(path)
+    assert result["settled_tokens_with_original_grant"] == 3
+    assert result["settled_tokens_without_original_grant"] == 2
+    assert not any(value in json.dumps(result) for value in (MINER, JOB, shifted.lease_id, "missing-grant"))
+
+
+def test_lease_evidence_is_not_written_into_shared_storage(tmp_path):
+    from reliquary.corpus.draw_leases import Lease
+
+    path, obs, _ = observation(tmp_path)
+    path.chmod(0o644)
+    lease = Lease("private-lease", MINER, 1, 1, 100, 110)
+    with pytest.raises(PermissionError):
+        obs.grants(JOB, [lease])
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT COUNT(*) FROM observed_draw_grants").fetchone() == (0,)

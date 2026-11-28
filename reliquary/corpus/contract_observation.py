@@ -7,6 +7,8 @@ import json
 import logging
 import os
 import sqlite3
+import stat
+from pathlib import Path
 from contextlib import closing
 from functools import cached_property
 
@@ -43,7 +45,47 @@ class ContractObservation:
                 "CREATE TABLE IF NOT EXISTS missed_snapshots (order_id TEXT PRIMARY KEY, reason TEXT NOT NULL)"
             )
 
+            db.execute("""CREATE TABLE IF NOT EXISTS observed_draw_grants (
+                order_id TEXT NOT NULL, lease_id TEXT NOT NULL, hotkey TEXT NOT NULL,
+                prompt INTEGER NOT NULL, slot INTEGER NOT NULL, granted REAL NOT NULL, expires REAL NOT NULL,
+                price REAL, offer REAL, receipt TEXT, received REAL, tokens INTEGER, debit REAL,
+                PRIMARY KEY(order_id,lease_id), UNIQUE(order_id,receipt))""")
+
         return book
+
+    def _private_path(self):
+        """Permit individual terms only in an owner-controlled database outside a source checkout."""
+        path = Path(self._path)
+        directory = path.parent.stat()
+        if directory.st_uid != os.getuid() or directory.st_mode & 0o022:
+            raise PermissionError("lease observation requires an owner-controlled directory")
+        if any((parent / ".git").exists() for parent in path.resolve().parents):
+            raise PermissionError("lease observation requires a database outside the source checkout")
+        if path.exists() or path.is_symlink():
+            db = path.lstat()
+            if (not stat.S_ISREG(db.st_mode) or db.st_uid != os.getuid()
+                    or db.st_mode & 0o077 or db.st_nlink != 1):
+                raise PermissionError("lease observation requires an owner-controlled database")
+        return self.book.path
+
+    def grants(self, job, leases):
+        # Called with the immutable objects returned by grant, before any hold can shift their clocks.
+        with closing(sqlite3.connect(self._private_path(), timeout=0)) as db, db:
+            db.executemany("""INSERT OR IGNORE INTO observed_draw_grants
+                (order_id,lease_id,hotkey,prompt,slot,granted,expires,price,offer) VALUES (?,?,?,?,?,?,?,?,?)""",
+                [(job, lease.lease_id, lease.hotkey, lease.prompt_index, lease.slot, lease.granted_at,
+                  lease.expires_at, lease.price, lease.offer) for lease in leases])
+
+    def accepted(self, job, lease_id, record):
+        # The native CAS accepted this attempt. A private row alone does not prove publication;
+        # the report joins the canonical judge's settled receipt before counting its tokens.
+        with closing(sqlite3.connect(self._private_path(), timeout=0)) as db, db:
+            db.execute("""UPDATE observed_draw_grants SET receipt=?,received=?,tokens=?,debit=?
+                WHERE order_id=? AND lease_id=? AND hotkey=? AND prompt=? AND slot=? AND receipt IS NULL
+                  AND price IS ? AND granted<=?""",
+                (record["submission_id"], record["received_at"], record["token_count"], record.get("lease_debit"), job, lease_id,
+                 record["hotkey"], record["prompt_index"], record["cursor"], record.get("lease_price"),
+                 record["received_at"]))
 
     @classmethod
     def from_env(cls):
