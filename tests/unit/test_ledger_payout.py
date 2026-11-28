@@ -1230,3 +1230,19 @@ def test_ledger_pay_refuses_a_batch_size_above_the_cap(tmp_path):
     result = CliRunner().invoke(cli.ledger_app, ["pay", "--collector-coldkey", COLLECTOR, "--collector-hotkey",
                                                  COLLECTOR_HOT, "--batch-size", "29"])
     assert result.exit_code == 2 and "28" in result.output
+
+@pytest.mark.parametrize(("overrides", "payable"), [
+    ({}, True), ({"payout_rail": "collector"}, True), ({"payout_rail": "native"}, False),
+    ({"payout_rail": None}, False), ({"task_id": NATIVE}, False), ({"work_period": WORK - 1}, False),
+])
+def test_transfer_corroborates_archived_rail_and_identity(journal, overrides, payable):
+    doc = {"task_id": PAID, "work_period": WORK, "rewards_by_hotkey": {"5A": 0.01},
+           "cap": 0.5, "budget": 0.5, "max_price_per_token": 1e-8, **overrides}
+    ref = ob.ArchiveRef(PAID, WORK, WORK + 1, doc, cp.period_end(WORK) + 600)
+    obligations = ob.build_ledger([ref], ceilings=_ceilings(PAID)).obligations
+    chain = FakeChain(stake_rao=20 * ob.RAO_PER_ALPHA, owners={"5A": "5ColdA"})
+    receipt = _pass(obligations, journal, chain, collector={PAID: WORK})
+    assert receipt["held"]["rail_unconfirmed"]["obligations"] == int(not payable)
+    assert len(chain.submitted) == int(payable)
+    _pass(obligations, journal, chain, collector={PAID: WORK})
+    assert len(chain.submitted) == int(payable)

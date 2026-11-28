@@ -63,9 +63,9 @@ def verdict(sid, hotkey, tokens, received, passed=True):
             "passed": passed, "received_at": received, "audited_at": received + 9000}
 
 
-def settler(records, archives, now, oldest=None, cap=0.1):
+def settler(records, archives, now, oldest=None, cap=0.1, collector_from=None):
     return CorpusPeriodSettler(task_id="eval-x", job_id="eval-x", cap=cap, records=records,
-                               archives=archives, oldest_pending=lambda: oldest,
+                               archives=archives, oldest_pending=lambda: oldest, collector_from=collector_from,
                                genesis=lambda: GENESIS, clock=lambda: now)
 
 
@@ -146,6 +146,17 @@ def test_a_crash_after_choosing_pays_once():
     # at 16 instead, whole, rather than at 10 with most of its pay decayed away.
     assert asyncio.run(settler(records, archives, at(15)).settle_once()) == 2
     assert set(archives.docs) == {(2, 16)} and records.state["pending"] is None
+
+
+@pytest.mark.parametrize(("start", "expected"), [(None, None), (2, "collector"), (3, "native")])
+def test_period_rail_survives_a_publication_restart(start, expected):
+    records, archives = Records(), Archives(fail_once=True)
+    records.verdicts = {"a": verdict("a", "a", 10, at(2))}
+    with pytest.raises(ConnectionError):
+        asyncio.run(settler(records, archives, at(9), collector_from=start).settle_once())
+    assert records.state["pending"].get("payout_rail") == expected
+    asyncio.run(settler(records, archives, at(15)).settle_once())
+    assert archives.docs[(2, 16)].get("payout_rail") == expected
 
 
 def test_a_crash_after_the_write_does_not_write_again():

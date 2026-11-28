@@ -1110,6 +1110,8 @@ async def _pass(obligations: Iterable[Obligation], *, journal: Journal, chain: P
     due = [o for o in obligations if o.due_at <= at and state_at(o, now) == DUE]
     native = [o for o in due if o.task_id not in rails or o.work_period < rails[o.task_id]]
     mine = [o for o in due if o.task_id in rails and o.work_period >= rails[o.task_id]]
+    unconfirmed_rail = [o for o in mine if o.archived_rail not in (None, "collector")]
+    mine = [o for o in mine if o.archived_rail in (None, "collector")]
     unfrozen = [o for o in mine if o.rate_source != RATE_FROZEN]
     mine = [o for o in mine if o.rate_source == RATE_FROZEN]
     rows = journal.rows(o.obligation_id for o in mine)
@@ -1140,7 +1142,7 @@ async def _pass(obligations: Iterable[Obligation], *, journal: Journal, chain: P
         "available_rao": available,
         "due": _count(due), "native_rail": _count(native), "already_past_due": _count(past),
         "deferred_below_minimum": _count(deferred), "unfunded": _count(unfunded), "ownerless": _count(ownerless),
-        "held": {"rate_not_frozen": _listed(unfrozen), "amount_changed": _listed(changed),
+        "held": {"rail_unconfirmed": _listed(unconfirmed_rail), "rate_not_frozen": _listed(unfrozen), "amount_changed": _listed(changed),
                  "to_subnet_owner": _listed(to_owner), "coldkey_refused": _listed(refused)},
         "journal_only": {"obligations": len(journal_only),
                          "rao": sum(int(r["amount_rao"]) for r in journal_only.values()),

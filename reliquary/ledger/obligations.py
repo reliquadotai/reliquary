@@ -260,6 +260,7 @@ class Obligation:
     due_at: float
     # The end of the work period: the immutable instant a payer looks the hotkey's owner up at (D5).
     earn_at: float
+    archived_rail: str | None = None
 
     @property
     def alpha(self) -> float:
@@ -276,7 +277,7 @@ class Obligation:
                 "pool_share": self.pool_share, "alpha_per_share": self.alpha_per_share,
                 "rate_source": self.rate_source, "amount_rao": self.amount_rao, "capped": self.capped,
                 "work_day": self.work_day.isoformat(), "period_end": self.period_end,
-                "earned_at": self.earned_at, "due_at": self.due_at, "earn_at": self.earn_at}
+                "earned_at": self.earned_at, "due_at": self.due_at, "earn_at": self.earn_at, "archived_rail": self.archived_rail}
 
 
 @dataclass(frozen=True, slots=True)
@@ -553,6 +554,13 @@ def build_ledger(archives: Iterable[ArchiveRef], *, ceilings: Mapping[str, Seque
         ref, task = row["ref"], str(row["ref"].task_id)
         where = {"task_id": task, "work_period": int(ref.work_period), "entry_period": int(ref.entry_period),
                  "part": row["part"]}
+        # Old archives rely on the immutable task registration and its first collector period.
+        # An explicit contradictory identity or malformed rail cannot attest a transfer.
+        archived_rail = ref.document.get("payout_rail")
+        if (ref.document.get("task_id") not in (None, task)
+                or ref.document.get("work_period") not in (None, ref.work_period)
+                or ("payout_rail" in ref.document and archived_rail not in ("native", "collector"))):
+            archived_rail = "unknown"
         day = work_day(ref.work_period, genesis)
         due = due_at(day, row["earned"], terms)
         units = _units(ref.document, row["rewards"], ceilings.get(task, ()), row["unit"])
@@ -574,7 +582,7 @@ def build_ledger(archives: Iterable[ArchiveRef], *, ceilings: Mapping[str, Seque
                 pool_share=float(row["paid"][hotkey]), alpha_per_share=float(row["rate"]),
                 rate_source=row["source"], amount_rao=amount, capped=row["capped"], work_day=day,
                 period_end=cp.period_end(int(ref.work_period), genesis), earned_at=row["earned"], due_at=due,
-                earn_at=cp.period_end(int(ref.work_period), genesis)))
+                earn_at=cp.period_end(int(ref.work_period), genesis), archived_rail=archived_rail))
         for reason, count in sorted(unpaid.items()):
             anomalies.append({"kind": reason, **where, "hotkeys": count})
     return Ledger(obligations=tuple(obligations), anomalies=tuple(anomalies), shares=tuple(shares))
