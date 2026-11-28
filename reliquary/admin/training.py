@@ -100,8 +100,8 @@ class CreateTraining(BaseModel):
 def training_refusal(body: CreateTraining, *, customer_env=None) -> str | None:
     """Why the order cannot train (None: it can): a profile that is not an async RL one, an env outside it, or
     an env without live RL rows in the catalog. A customer env (``customer:...``) is outside every profile: it
-    trains when ``customer_env(name, account)`` finds it qualified for RL and the order's own, and the order gives
-    its ``max_new_tokens``."""
+    trains when ``customer_env(name, account)`` finds it qualified for RL and the order's own or public, and
+    the order gives its ``max_new_tokens``."""
     from reliquary.customer_env import is_customer_env
     from reliquary.env_catalog import entry as catalog_entry
     from reliquary.protocol.profiles import DRAW_GUMBEL_MAX, PROFILES
