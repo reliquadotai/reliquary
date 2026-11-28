@@ -533,6 +533,8 @@ class PairedAuditDispatcher:
         # Per executor, when it last delivered a measured result in time for an undecided batch (`_measured`): a lease
         # of it lost after that was granted is witnessed. Per provider, when its losses counted towards a park.
         self._witness: dict[str, float] = {}
+        # Measured, on-time work by model, executor and protocol, including borrowed draw work.
+        self._serving_scores: dict[tuple[ModelKey, str], dict[str, float]] = collections.defaultdict(dict)
         self._parks_by: dict[str, collections.deque] = collections.defaultdict(collections.deque)
         self._seen: dict[str, float] = {}
         self._listeners: list[Callable[[str], Awaitable[Any]]] = []
@@ -556,7 +558,7 @@ class PairedAuditDispatcher:
         self._scored_items: dict[ModelKey, collections.deque] = collections.defaultdict(collections.deque)
         self._busy_spans: dict[ModelKey, collections.deque] = collections.defaultdict(collections.deque)
         # Executors the fleet may release (more live than wanted): leased nothing more, so once their leases
-        # end they are idle for good and no batch waits on a destroyed card. First contact, to pick the newest.
+        # end they are idle for good and no batch waits on a destroyed card. The oldest go (`release_beyond`).
         self._releasing: set[str] = set()
         self.reuse_only_jobs: set[str] = set()
         self._first_seen: dict[str, float] = {}
@@ -694,7 +696,13 @@ class PairedAuditDispatcher:
 
     def heartbeat(self, executor_id: str, document: dict | None = None,
                   detail: dict | None = None) -> None:
-        self._seen[executor_id] = self._clock()
+        now = self._clock()
+        previous = self._documents.get(executor_id)
+        if previous and (now - self._seen[executor_id] > self._live or (detail and detail.get("loaded") is False)):
+            model = (previous.get("model_id"), previous.get("model_revision"))
+            self._serving_scores.pop((model, executor_id), None)
+            self._protocols.pop(executor_id, None)
+        self._seen[executor_id] = now
         self._first_seen.setdefault(executor_id, self._seen[executor_id])
         if document is not None:
             self._documents[executor_id] = document
@@ -930,7 +938,9 @@ class PairedAuditDispatcher:
         batch = lease.batch
         batch.leased.discard(executor_id)
         self._mark_busy(executor_id, batch.model)
+        serving = self._serving_scores[batch.model, executor_id]
         if lease.expires_at <= self._clock():
+            serving.pop(batch.protocol, None)
             # Expired, not swept yet: struck as the sweep would strike it, so no strike depends on the 2 s between an
             # expiry and its sweep. A scored answer is slow, not lost (what the sweep's strike and its take-back add up
             # to); one to the longest lease stays struck, but an answered lease is no evidence against its batch.
@@ -943,11 +953,17 @@ class PairedAuditDispatcher:
             raise LeaseRefused(410, "lease_expired")
         scores = result.scores
         if len(scores) != len(batch.items) or any(_misfit(s, item) for s, item in zip(scores, batch.items)):
+            serving.pop(batch.protocol, None)
             # Not an answer to its lease: a lost result, as an expiry is (struck, benched, counted against the batch).
             if not batch.reuse_auditors_only:
                 await self._lost(lease, why="answered with a result that does not fit", bench=True)
             raise LeaseRefused(422, "result_does_not_fit_the_lease")
         errored = any(s.status == ITEM_ERROR for s in scores)
+        measured = _measured(result, batch.items)
+        if errored:
+            serving.pop(batch.protocol, None)
+        elif measured and not batch.future.done():
+            serving[batch.protocol] = self._clock()
         if not batch.reuse_auditors_only and not errored:
             # Only a scored result is clean and timed: errors answered at once would shorten every card's
             # leases on this model, and clear the strikes of a card that scores nothing.
@@ -964,7 +980,7 @@ class PairedAuditDispatcher:
                         for struck in getattr(queued.losses.get(executor_id), "leases", ()):
                             struck.struck = False
             self._time(lease)
-            if _measured(result, batch.items):
+            if measured:
                 # A witness only for work that counts: an answer to a batch decided or cancelled proves nothing.
                 if not batch.future.done():
                     self._witness[executor_id] = self._clock()
@@ -1068,25 +1084,49 @@ class PairedAuditDispatcher:
             since, busy_model = self._busy_since.pop(executor_id)
             self._busy_spans[busy_model].append((now, now - since))
 
+    def _rented_at(self, document: dict) -> tuple[float, str]:
+        """An executor's age: its registration (made when the fleet rented it), else its first contact with this
+        process. A restart of the control reorders first contacts, never registrations."""
+        at = document.get("registered_at")
+        if isinstance(at, bool) or not isinstance(at, (int, float)) or not math.isfinite(at):
+            at = self._first_seen.get(document["executor_id"], 0.0)
+        return float(at), document["executor_id"]
+
     def reusable_auditor(self, model: ModelKey, protocol: str) -> str | None:
-        """Borrow the baseline only; a surplus executor must be free to leave."""
+        """Borrow one the fleet keeps (the newest claiming ``protocol``); a releasing executor must be free to leave."""
         if self._scorers != 1:
             return None
-        live = self.live_executors(model)
-        if not live:
-            return None
-        executor = min(live, key=lambda d: (self._first_seen.get(d["executor_id"], 0.0),
-                                           d["executor_id"]))["executor_id"]
-        if executor not in self._releasing and protocol in self._protocols.get(executor, ()):
-            return executor
-        return None
+        kept = [d for d in self.live_executors(model) if d["executor_id"] not in self._releasing
+                and protocol in self._protocols.get(d["executor_id"], ())]
+        return max(kept, key=self._rented_at)["executor_id"] if kept else None
 
     def release_beyond(self, model: ModelKey, keep: int | None) -> list[str]:
-        """The newest live executors of ``model`` beyond ``keep`` (None: none), to release."""
-        live = sorted(self.live_executors(model),
-                      key=lambda d: (self._first_seen.get(d["executor_id"], 0.0), d["executor_id"]))
-        ids = [d["executor_id"] for d in live]
-        return ids[max(1, keep):] if keep is not None else []
+        """Release older claimants only when newer retained cards can serve their protocols and quorum.
+        A heartbeat or an empty claim proves liveness; a recent measured result proves the card scores.
+        After a control restart each replacement must supply fresh evidence."""
+        if keep is None:
+            return []
+        serving = sorted((d for d in self.live_executors(model) if d["executor_id"] in self._protocols),
+                         key=self._rented_at, reverse=True)
+        cutoff = self._clock() - self._live
+        proven = []
+        releasing = []
+        for document in serving:
+            executor = document["executor_id"]
+            protocols = set(self._protocols[executor])
+            scores = self._serving_scores.get((model, executor), {})
+            scored_protocols = scores.keys() & protocols
+            compatible = [place for supported, measured, place in proven
+                          if protocols <= supported and scored_protocols <= measured]
+            if len(compatible) >= max(1, keep, self._scorers) and any(
+                    len({p for p, _ in group}) == len({h for _, h in group}) == self._scorers
+                    for group in itertools.combinations(compatible, self._scorers)):
+                releasing.append(executor)
+            else:
+                recent = {p for p in scored_protocols if scores[p] >= cutoff}
+                if recent and not self._strikes[executor]:
+                    proven.append((protocols, recent, _placement(document)))
+        return releasing[::-1]
 
     def set_releasing(self, executor_ids) -> None:
         """The executors leased nothing more: exactly these (a model no longer served keeps none)."""
@@ -1249,6 +1289,7 @@ class PairedAuditDispatcher:
                     continue
                 lease.batch.leased.discard(lease.executor_id)
                 self._mark_busy(lease.executor_id, lease.batch.model)
+                self._serving_scores[lease.batch.model, lease.executor_id].pop(lease.batch.protocol, None)
                 if lease.batch.reuse_auditors_only:
                     logger.info("eval audit lease %s of reuse batch %s expired on executor %s (no strike)",
                                 lease_id[:8], lease.batch.id, lease.executor_id)
@@ -3093,12 +3134,13 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                 max_executors=min(max_executors, allowed.get(model, 1)))
             wanted = sizing.update(key, target)
             entry = document["models"].setdefault(key, {"executors_needed": 0, "live_executors": len(live)})
-            entry["reusable_draw_auditor"] = dispatcher.reusable_auditor(model, AUDIT_PROTOCOL_V3)
-            # Beyond what is wanted (at least the scorers a batch needs), the newest executors lease nothing more;
+            # Beyond what is wanted (at least the scorers a batch needs), the oldest executors lease nothing more;
             # the fleet releases one only once it holds no lease (`releasing` and `idle_executors`).
             releasing = dispatcher.release_beyond(
                 model, None if wanted is None else max(wanted, dispatcher.scorers))
             released.extend(releasing)
+            reusable = dispatcher.reusable_auditor(model, AUDIT_PROTOCOL_V3)
+            entry["reusable_draw_auditor"] = None if reusable in releasing else reusable
             entry.update({"executors_allowed": min(max_executors, allowed.get(model, 1)),
                           "expected_audits": None if expected is None else round(expected),
                           "items_per_second": rate, "executors_wanted": wanted,
