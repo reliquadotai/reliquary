@@ -44,10 +44,12 @@ def env_id(account: str, name: str, sha256: str) -> EnvId:
     return parse_env_id(f"{PREFIX}{account}/{name}@{sha256}")
 
 
-def check_order_env(env: str, *, account: str, product: str, uses: tuple[str, ...] | list[str]) -> EnvId:
-    """The order's customer env, or ValueError: only its own account's, only for a use it qualified for."""
+def check_order_env(env: str, *, account: str, product: str, uses: tuple[str, ...] | list[str],
+                    public: bool = False) -> EnvId:
+    """The order's customer env, or ValueError: its own account's or a public version, only for a use it
+    qualified for."""
     parsed = parse_env_id(env)
-    if parsed.account != account:
+    if parsed.account != account and not public:
         raise ValueError("customer_env_not_yours")
     if product not in USES:
         raise ValueError(f"unknown product {product!r}")

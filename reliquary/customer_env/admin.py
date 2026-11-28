@@ -30,6 +30,15 @@ class SubmitVersion(BaseModel):
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class Visibility(BaseModel):
+    """The owner's change (the platform checked who asks): ``public`` is final once true."""
+    model_config = ConfigDict(extra="forbid")
+    env_id: str = Field(min_length=1, max_length=300)
+    account: str = Field(min_length=1, max_length=128)
+    public: bool | None = None
+    listed: bool | None = None
+
+
 class OrderSets(BaseModel):
     model_config = ConfigDict(extra="forbid")
     env_id: str = Field(min_length=1, max_length=300)
@@ -152,7 +161,23 @@ def add_routes(router: APIRouter, envs: CustomerEnvs | None, *, deliveries, eval
         envs_ = need()
         if not ACCOUNT_RE.match(account):
             raise HTTPException(422, "bad account")
-        return {"versions": [r.public() for r in envs_.registry.for_account(account)]}
+        return {"versions": [r.view() for r in envs_.registry.for_account(account)]}
+
+    @router.get("/customer-envs/catalog")
+    async def catalog() -> dict:
+        return {"versions": [r.view() for r in need().registry.catalog()]}
+
+    @router.post("/customer-envs/visibility")
+    async def visibility(body: Visibility) -> dict:
+        envs_ = need()
+        try:
+            env = str(parse_env_id(body.env_id))
+            return envs_.registry.publish(env, account=body.account, public=body.public,
+                                          listed=body.listed).view()
+        except KeyError:
+            raise HTTPException(404, "customer_env_unknown") from None
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)[:500]) from None
 
     def _record(raw: str):
         envs_ = need()
@@ -167,14 +192,16 @@ def add_routes(router: APIRouter, envs: CustomerEnvs | None, *, deliveries, eval
 
     @router.get("/customer-envs/{raw:path}")
     async def one(raw: str) -> dict:
-        return _record(raw)[1].public()
+        return _record(raw)[1].view()
 
     @router.delete("/customer-envs/{raw:path}")
     async def disable(raw: str) -> dict:
         envs_, record = _record(raw)
         if record.status in ("queued", "building", "qualifying"):
             raise HTTPException(409, "customer_env_qualifying")
-        return envs_.registry.update(record.env_id, status="disabled").public()
+        if record.public:  # other accounts order it: its owner unlists it instead
+            raise HTTPException(409, "customer_env_public_is_final: unlist it instead")
+        return envs_.registry.update(record.env_id, status="disabled").view()
 
     @router.post("/customer-envs/order-sets")
     async def order_sets(body: OrderSets) -> dict:
@@ -220,5 +247,5 @@ class _SubnetErrors:
         await create(f"reliquary/customer-envs/order-errors/{key}", body)
 
 
-__all__ = ["CustomerEnvs", "MAX_IN_FLIGHT_PER_ACCOUNT", "OrderSets", "SubmitVersion", "add_routes",
+__all__ = ["CustomerEnvs", "MAX_IN_FLIGHT_PER_ACCOUNT", "OrderSets", "SubmitVersion", "Visibility", "add_routes",
            "from_environment", "order_resolver"]

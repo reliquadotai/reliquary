@@ -54,15 +54,26 @@ Each account has a private environment hub on the platform:
 * **Push**: a `verifiers` v1 package (a source archive with `pyproject.toml` and a lockfile), or an import from
   the Prime Environments Hub by `owner/name@version` (we fetch the wheel once and treat it like a push).
 * **Version** = sha256 of the archive. A version is immutable; an order pins it, with the image digest it built.
-* **Visibility**: private to the account (and its organisation's members). No sharing with other accounts and
-  no public listing for now.
+* **Visibility**: private to the account (and its organisation's members) by default. Its owner may make a
+  qualified version **public**: any account may then order it (batch, evaluation, RL), never change it, and pays
+  its scoring like its own. Public is final for that version (orders placed on it keep it); the owner may take it
+  out of the catalog (**listed**) for new users to find, not out of service. A version is public only with a
+  license, and its prompts are then visible to whoever orders it: a hidden benchmark stays private.
+* **Source**: an imported env says where it comes from (`huggingface` or `prime_hub`, the upstream owner, name,
+  link and revision, the upstream license). It is part of the archive, so frozen in the version's sha256, and is
+  shown wherever the version is listed: an import is never shown as ours, the account that imported it is not
+  its author.
 * **Uses**: one environment serves every product. A qualified version may serve RL, batch and evaluation alike:
   RL is a task like any other (see Determinism below).
 * **Secrets**: the customer may attach secrets (an API key for their judge or their tools). They are stored
   encrypted and injected only into that environment's sandboxes.
 
 A qualified version becomes a catalog entry owned by the account: `customer:<account>/<name>@<sha256[:12]>`. Only
-that account's orders may name it.
+that account's orders may name it, unless it is public.
+
+Our public catalog of imported envs (Hugging Face Harbor datasets, the Prime Hub) is a Reliquary account that
+imports them as any customer would and publishes those that pass: a redistributable license, no network, no
+judge, examples (or reference solutions) that score as expected.
 
 ## The package
 
@@ -70,7 +81,9 @@ A source archive (`.tar.gz`, at most 50 MB packed, 200 MB unpacked; regular file
 absolute path, no `..`, no link, no device) holding:
 
 * `pyproject.toml`, with `[tool.reliquary]`: `taskset` (the verifiers v1 taskset id it registers), optional
-  `args` (the taskset's config fields) and `kind` (`single_turn`, the default, or `agentic`);
+  `args` (the taskset's config fields), `kind` (`single_turn`, the default, or `agentic`), `license` (an SPDX
+  id; else `[tool.reliquary.source] license`, else `[project] license` when it is a short name) and, for an
+  import, `[tool.reliquary.source]`: `hub`, `owner`, `name`, optional `url` (https), `revision`, `license`;
 * `requirements.lock`: every dependency pinned with `--hash=sha256:` (pip `--require-hashes` format);
 * `examples.jsonl`: 2 to 64 lines `{"key", "answer", "expected_score"}`, at least one at or above 0.5 and one below;
 * the package's sources.
@@ -86,17 +99,23 @@ The platform stores the archive in its bucket under `customer-envs/<account>/<na
   `sha256`) the qualification. Answers `{env_id, status}`.
 * `GET /admin/v1/customer-envs?account=<id>`: that account's versions.
 * `GET /admin/v1/customer-envs/<env_id>`: one version: `{env_id, account, name, sha256, kind, status, reason,
-  uses, image_digest, prompt_set, examples, cost, created_at, qualified_at}`.
+  uses, image_digest, prompt_set, examples, cost, created_at, qualified_at, license, source, public, listed,
+  published_at}`.
   `status`: `queued` | `building` | `qualifying` | `qualified` | `refused` | `disabled`; `reason` says why a
   refusal (`package_invalid`, `build_failed`, `start_failed`, `freeze_failed`, `examples_failed`,
   `infrastructure` (retried, never billed)); on a qualified version, `nondeterministic` is a note, not a
   refusal.
   `uses` ⊆ `rl`, `batch`, `eval`. `prompt_set`: `{count, sha256}`. `cost`: `{qualification_cpu_seconds,
   scoring_cpu_ms_per_item}`.
-* `DELETE /admin/v1/customer-envs/<env_id>`: disables it; running orders keep their pinned version.
+* `DELETE /admin/v1/customer-envs/<env_id>`: disables it; running orders keep their pinned version. Refused
+  (409) for a public version: its owner unlists it instead.
+* `POST /admin/v1/customer-envs/visibility` `{env_id, account, public?, listed?}`: the owner's change (the
+  platform checked who asks). `public: true` needs a qualified version with a license, lists it unless
+  `listed: false`, and is final (409 `customer_env_public_is_final`); `listed: true` needs public.
+* `GET /admin/v1/customer-envs/catalog`: the public, listed, qualified versions, newest published first.
 
 An order names `env: "customer:<account>/<name>@<sha256>"`; the admin refuses it unless the order's account is
-`<account>` and the version's `uses` has the order's product.
+`<account>` or the version is public, and the version's `uses` has the order's product.
 
 ## Build
 
