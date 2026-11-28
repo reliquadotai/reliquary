@@ -10,6 +10,7 @@ import pytest
 
 from reliquary.corpus.audit_policy import AuditParams
 from reliquary.protocol.profiles import TOPLOC_DEPLOYED_DEFAULTS as PROOF
+from reliquary.validator.corpus_audit_protocol import AUDIT_PROTOCOL, AUDIT_PROTOCOL_V3
 from reliquary.validator.corpus_auditor import CorpusAuditor
 from reliquary.validator.eval_control import (
     MIN_MEASURED_BUSY_SECONDS,
@@ -173,18 +174,91 @@ def test_an_executor_to_release_is_leased_nothing_more():
 
     async def go():
         d = _dispatcher(clock)
-        d.heartbeat("old", _executor("old"))
+        assert d.claim(_executor("old")) is None             # claims: its model is loaded (nothing to lease yet)
         clock.now += 10
-        d.heartbeat("new", _executor("new"))
+        assert d.claim(_executor("new")) is None
         assert d.release_beyond(MODEL_A, None) == []        # nothing wanted known: none released
         assert d.release_beyond(MODEL_A, 2) == []
-        assert d.release_beyond(MODEL_A, 0) == ["new"]      # at least one kept, the newest goes
-        d.set_releasing(["new"])
+        assert d.release_beyond(MODEL_A, 0) == ["old"]      # at least one kept, the oldest goes
+        d.set_releasing(["old"])
         scoring = asyncio.ensure_future(d.view(*MODEL_A, PROOF).score(ITEMS))
         await asyncio.sleep(0)
-        assert d.claim(_executor("new")) is None
-        assert d.claim(_executor("old")) is not None
+        assert d.claim(_executor("old")) is None
+        assert d.claim(_executor("new")) is not None
         d.set_releasing([])                                  # wanted again: leased as before
         scoring.cancel()
+
+    asyncio.run(go())
+
+
+def _rented(eid, at, model=MODEL_A):
+    """An executor's registration as the directory reads it: made when the fleet rented the card."""
+    return {**_executor(eid, model=model), "registered_at": at}
+
+
+def test_the_oldest_rented_cards_are_released_first():
+    """The newest card runs the image the fleet rents now: it is kept, so a new image replaces the old one.
+    Age is the registration: a restarted control hears from its cards in any order."""
+    clock = _Clock()
+    d = _dispatcher(clock)
+    for eid, rented_at in (("c", 300.0), ("b", 200.0), ("a", 100.0)):  # first contact: newest first
+        assert d.claim(_rented(eid, rented_at)) is None
+        clock.now += 10
+    assert d.release_beyond(MODEL_A, 1) == ["a", "b"]
+    assert d.release_beyond(MODEL_A, 2) == ["a"]
+    assert d.release_beyond(MODEL_A, 3) == []
+    assert d.release_beyond(MODEL_A, 0) == ["a", "b"]                 # at least one kept
+    clock.now += 1000                                                # "c" falls silent: no longer live
+    for eid, rented_at in (("a", 100.0), ("b", 200.0)):
+        d.claim(_rented(eid, rented_at))
+    assert d.release_beyond(MODEL_A, 1) == ["a"]
+
+
+def test_a_card_still_loading_its_model_is_neither_kept_nor_released():
+    """Until the new card claims, the old one keeps serving: a card that never loads displaces nothing."""
+    clock = _Clock()
+    d = _dispatcher(clock)
+    d.claim(_rented("old", 100.0))
+    d.heartbeat("new", _rented("new", 200.0))        # live, its model still loading
+    assert d.release_beyond(MODEL_A, 1) == []
+    d.heartbeat("next", _rented("next", 300.0))
+    assert d.release_beyond(MODEL_A, 1) == []
+    d.claim(_rented("new", 200.0))                   # loaded
+    assert d.release_beyond(MODEL_A, 1) == ["old"]
+
+
+def test_the_borrowed_draw_auditor_is_a_card_the_fleet_keeps():
+    clock = _Clock()
+    d = _dispatcher(clock)
+    draw = (AUDIT_PROTOCOL, AUDIT_PROTOCOL_V3)
+    d.claim(_rented("old", 100.0), draw)
+    d.claim(_rented("new", 200.0), draw)
+    assert d.reusable_auditor(MODEL_A, AUDIT_PROTOCOL_V3) == "new"   # the one release_beyond keeps
+    d.claim(_rented("legacy", 300.0))                                 # newest, but claims no draw audit
+    assert d.reusable_auditor(MODEL_A, AUDIT_PROTOCOL_V3) == "new"
+    d.set_releasing(["new"])
+    assert d.reusable_auditor(MODEL_A, AUDIT_PROTOCOL_V3) == "old"
+    d.set_releasing(["old", "new"])
+    assert d.reusable_auditor(MODEL_A, AUDIT_PROTOCOL_V3) is None
+    pair = PairedAuditDispatcher(directory=SimpleNamespace(revoke_locally=lambda e: None), clock=clock,
+                                 scorers=2)
+    pair.claim(_rented("new", 200.0), draw)
+    assert pair.reusable_auditor(MODEL_A, AUDIT_PROTOCOL_V3) is None  # only a single scorer is borrowed
+
+
+def test_a_borrowed_batch_goes_to_the_card_the_fleet_keeps():
+    clock = _Clock()
+
+    async def go():
+        d = _dispatcher(clock)
+        d.reuse_only_jobs.add("borrow")
+        d.claim(_rented("old", 100.0))
+        clock.now += 10
+        d.claim(_rented("new", 200.0))
+        borrow = asyncio.ensure_future(d.view(*MODEL_A, PROOF, "borrow").score(ITEMS))
+        await asyncio.sleep(0)
+        assert d.claim(_rented("old", 100.0)) is None    # released next: it borrows nothing
+        assert d.claim(_rented("new", 200.0)) is not None
+        borrow.cancel()
 
     asyncio.run(go())
