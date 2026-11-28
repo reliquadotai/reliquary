@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
 
 from reliquary.constants import (
@@ -50,7 +51,9 @@ class RegisteredHotkeys:
     def __init__(self, *, load: Callable[[], Awaitable[set[str] | Mapping[str, str | None]]],
                  clock: Callable[[], float] = time.time,
                  ttl_seconds: float = REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
+                 keep_owner_history: bool = False,
                  grace_seconds: float = REGISTERED_HOTKEY_STALE_GRACE_SECONDS) -> None:
+        self._owner_history = deque(maxlen=8) if keep_owner_history else None
         self._load = load
         self._clock = clock
         self._ttl = ttl_seconds
@@ -85,6 +88,8 @@ class RegisteredHotkeys:
         if isinstance(hotkeys, Mapping):
             self._coldkeys = {hotkey: coldkey for hotkey, coldkey in hotkeys.items() if coldkey}
         self._refreshed_at = self._clock()
+        if self._owner_history is not None:
+            self._owner_history.append((self._refreshed_at, self._coldkeys if isinstance(hotkeys, Mapping) else None))
         return True
 
     def coldkey(self, hotkey: str) -> str | None:
@@ -95,10 +100,14 @@ class RegisteredHotkeys:
         """Every hotkey's coldkey, as the last snapshot read them."""
         return dict(self._coldkeys)
 
-    def fresh_coldkeys(self) -> dict[str, str] | None:
-        if self._refreshed_at is None or self._clock() - self._refreshed_at > self._ttl:
-            return None
-        return self.coldkeys()
+    def owners_at(self, opened_at):
+        """Newest chain read already completed at the opening second, within the cache TTL."""
+        for observed_at, owners in reversed(self._owner_history or ()):
+            if observed_at <= opened_at:
+                if owners is not None and opened_at - observed_at <= self._ttl:
+                    return observed_at, dict(owners)
+                break
+        return None
 
     async def refresh_forever(self) -> None:
         while True:

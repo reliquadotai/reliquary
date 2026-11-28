@@ -34,6 +34,7 @@ def test_admin_freezes_new_observation_keeps_quote_and_replays_old_task(admin, p
     entry = admin.registry["entries"][body["job_id"]]
     marker = entry.params[contract_spec.PARAM]
     assert marker["market"] == MODEL + "|turn" and marker["mode"] == "observation"
+    assert marker["opening_valuation"] == {key: entry.params[key] for key in (cp.MAX_PRICE_PARAM, cp.MAX_PRICE_EMISSION_PARAM)}
     assert marker["evaluation"] is True and marker["max_tokens"] == 5 * 4 * 512
     assert (marker["budget_rao"], marker["ceiling_micro"]) == contract_spec.period_envelope(entry.params)
     assert entry.params[cp.MAX_PRICE_USD_OUTPUT_PARAM] == CEILING["output"]

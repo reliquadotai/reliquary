@@ -330,7 +330,7 @@ def test_a_drained_eval_job_is_unwired_and_releases_what_it_held(world, monkeypa
             directory=EvalExecutorDirectory(list_documents=lambda: asyncio.sleep(0, [])),
             verify_signature=lambda request: True,
             tokenizer_for=lambda repo, revision: (_Tokenizer(), 100), read_entries=read_entries,
-            contract_observation=observation, current_owners=lambda: {"first": "owner"})
+            contract_observation=observation, owners_at=lambda at: (at - 1, {"first": "owner"}))
         await job_set.refresh()
         assert sorted(app.state.eval_served) == ["order-eval-a", "order-eval-b"]
         if observe:
@@ -345,6 +345,9 @@ def test_a_drained_eval_job_is_unwired_and_releases_what_it_held(world, monkeypa
         await job_set.refresh()
         assert job_set.served == {}
         if observe:
+            final = await BucketRecordStore().read_final_status("order-eval-a")
+            assert observation.book.order("order-eval-a")["closed_at"] == final["observation_closed_at"]
+            assert "observation_closed_at" not in await BucketRecordStore().read_final_status("order-eval-b")
             assert observation.book.summary("order-eval-a")["min_micro"] == 3000
         assert app.state.eval_served == {} and app.state.eval_tokenizers == {}
         assert dispatcher._listeners == [] and ps._loaded == {}

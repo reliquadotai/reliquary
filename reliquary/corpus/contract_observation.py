@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
 import sqlite3
 from contextlib import closing
@@ -22,6 +24,7 @@ DB_ENV = "RELIQUARY_ORDER_OBSERVATION_DB"
 class ContractObservation:
     def __init__(self, path, markets):
         self.book = ContractBook(path)
+        self._close_cursor = ""
         self.markets = frozenset(markets)
         with closing(sqlite3.connect(self.book.path)) as db:
             db.execute("""CREATE TABLE IF NOT EXISTS observed_periods (
@@ -48,7 +51,7 @@ class ContractObservation:
             ],
         )
 
-    def open(self, entry, owners):
+    def open(self, entry, owner_snapshot):
         spec = entry.params.get(PARAM)
         if not spec:
             return
@@ -57,15 +60,18 @@ class ContractObservation:
             raise ValueError("not an observation order")
         if self.book.order(entry.job_id) is not None:
             return
-        if owners is None:
+        owners = {}
+        observed_at = None
+        if owner_snapshot is not None and owner_snapshot[0] <= spec["opened_at"]:
+            observed_at, owners = owner_snapshot
+        if observed_at is None:
             with closing(sqlite3.connect(self.book.path, timeout=1)) as db, db:
                 db.execute(
                     "INSERT OR IGNORE INTO missed_snapshots VALUES (?,?)",
                     (entry.job_id, "registration_unavailable"),
                 )
-            owners = {}
         self.book.open_order(
-            entry.job_id, spec["market"], eligible_owners=owners, **open_kwargs(spec)
+            entry.job_id, spec["market"], eligible_owners=owners, owners_observed_at=observed_at, **open_kwargs(spec)
         )
 
     def close(self, job_id, at, final):
@@ -74,14 +80,36 @@ class ContractObservation:
             counts = final if final.get("counts_complete") is True else {}
             with closing(sqlite3.connect(self.book.path, timeout=1)) as db, db:
                 db.execute(
-                    "INSERT OR REPLACE INTO observed_closures VALUES (?,?,?)",
+                    "INSERT OR IGNORE INTO observed_closures VALUES (?,?,?)",
                     (job_id, counts.get("verified_tokens"), counts.get("settled")),
                 )
 
+    def _unclosed_page(self):
+        with closing(sqlite3.connect(self.book.path, timeout=1)) as db:
+            page = db.execute("""SELECT o.order_id FROM orders o
+                LEFT JOIN observed_closures c ON c.order_id=o.order_id
+                WHERE c.order_id IS NULL AND o.order_id>? ORDER BY o.order_id LIMIT 8""",
+                (self._close_cursor,)).fetchall()
+        self._close_cursor = page[-1][0] if len(page) == 8 else ""
+        return [row[0] for row in page]
+
+    async def recover_closures(self, records, active=()):
+        """Retry local copies of durable finals independently of the live jobs and fleet."""
+        for job_id in await asyncio.to_thread(self._unclosed_page):
+            if job_id in active:
+                continue
+            try:
+                final = await records.read_final_status(job_id)
+                if final is not None and final.get("observation_closed_at") is not None:
+                    await asyncio.to_thread(self.close, job_id, final["observation_closed_at"], final)
+            except Exception:
+                logging.getLogger(__name__).exception("could not reconcile a local observation closure")
+
     def recorder(self, entry):
         """A compact copy of the authoritative archive and its matching verified work, kept locally."""
-        initial_price = entry.params.get(MAX_PRICE_PARAM)
-        initial_rate = entry.params[MAX_PRICE_EMISSION_PARAM]
+        valuation = entry.params.get(PARAM, {}).get("opening_valuation", {})
+        initial_price = valuation.get(MAX_PRICE_PARAM)
+        initial_rate = valuation.get(MAX_PRICE_EMISSION_PARAM)
 
         def record(archive, ids, batch):
             rows = None
@@ -102,7 +130,7 @@ class ContractObservation:
                     rows = None
             rate = (
                 initial_rate
-                if initial_price == archive.get("max_price_per_token")
+                if initial_price is not None and initial_price == archive.get("max_price_per_token")
                 else None
             )
             document = json.dumps(
@@ -110,6 +138,7 @@ class ContractObservation:
                     "tokens": archive["tokens"],
                     "rewards_by_hotkey": archive["rewards_by_hotkey"],
                     "miner_alpha_per_period": rate,
+                    "valuation_source": "opening_declaration" if rate is not None else None,
                     "deliveries": rows,
                 },
                 allow_nan=False,

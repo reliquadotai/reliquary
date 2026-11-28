@@ -1,13 +1,16 @@
+import asyncio
 import json
 import sqlite3
 from types import SimpleNamespace
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from reliquary.corpus.contract_observation import ContractObservation
 from reliquary.protocol.signatures import build_corpus_lease_binding
-from reliquary.validator.corpus_periods import MAX_PRICE_EMISSION_PARAM
+from reliquary.validator.corpus_periods import MAX_PRICE_EMISSION_PARAM, MAX_PRICE_PARAM
+from reliquary.validator.corpus_registration import RegisteredHotkeys
 from reliquary.validator.standing_offers import standing_offers_router
 
 
@@ -82,7 +85,22 @@ def test_signed_offer_before_opening_changes_only_future_orders(tmp_path):
     missing = SimpleNamespace(job_id="unobserved", params=entry.params)
     observation.open(missing, None)
     assert observation.book.contracts("unobserved") == []
-    observation.open(entry, {"miner": "owner"})
+    owners = {"miner": "owner"}
+    timestamps = [10.5]
+    async def load_owners():
+        return dict(owners)
+    registry = RegisteredHotkeys(load=load_owners, clock=lambda: timestamps[0], keep_owner_history=True)
+    asyncio.run(registry.refresh())
+    owners["miner"] = "next-owner"
+    timestamps[0] = 12
+    asyncio.run(registry.refresh())
+    assert registry.owners_at(12) == (12, {"miner": "next-owner"})
+    assert registry.owners_at(10) is None
+    observation.open(entry, registry.owners_at(11))
+    too_late = SimpleNamespace(job_id="after-rotation", params=entry.params)
+    observation.open(too_late, registry.owners_at(12))
+    assert observation.book.contracts("after-rotation") == []
+
     original = observation.book.contract("order-1", "miner")
     assert original["price_micro"] == 3000 and original["q"] == 1.0
     now[0] = 12
@@ -90,7 +108,7 @@ def test_signed_offer_before_opening_changes_only_future_orders(tmp_path):
     signed = build_corpus_lease_binding(changed)
     assert client.put(url, json=changed).status_code == 200
     reopened = ContractObservation(tmp_path / "offers.db", [market])
-    reopened.open(entry, {})
+    reopened.open(entry, None)
     assert reopened.book.contract("order-1", "miner") == original
     reopened.close(
         "order-1", 30, {"counts_complete": True, "verified_tokens": 7, "settled": 2}
@@ -104,11 +122,14 @@ def test_signed_offer_before_opening_changes_only_future_orders(tmp_path):
 
 def test_archive_observation_is_private_and_recoverable(tmp_path):
     observation = ContractObservation(tmp_path / "observation.db", [])
-    capture = observation.recorder(
-        SimpleNamespace(job_id="order", params={MAX_PRICE_EMISSION_PARAM: 1.0})
-    )
+    marker = {"opening_valuation": {MAX_PRICE_PARAM: 0.001, MAX_PRICE_EMISSION_PARAM: 1.0}}
+    # After a restart the live registry can carry a different conversion or none.
+    capture = observation.recorder(SimpleNamespace(job_id="order", params={
+        "order_contract": marker, MAX_PRICE_PARAM: 0.002, MAX_PRICE_EMISSION_PARAM: 9,
+    }))
     archive = {
         "tokens": 7,
+        "max_price_per_token": 0.001,
         "rewards_by_hotkey": {"a": 0.01},
         "work_period": 10,
         "entry_period": 12,
@@ -140,6 +161,31 @@ def test_archive_observation_is_private_and_recoverable(tmp_path):
                 "SELECT document FROM observed_periods ORDER BY entry_period"
             )
         ]
+    assert first["miner_alpha_per_period"] == 1.0 and first["valuation_source"] == "opening_declaration"
     assert [r["id"] for r in first["deliveries"]] == ["accepted"]
     assert second["deliveries"] is None
     assert repriced["miner_alpha_per_period"] is None
+
+@pytest.mark.parametrize("failed_write", ["UPDATE ON orders", "INSERT ON observed_closures"])
+def test_recovery_uses_certified_time_after_failed_closure(tmp_path, failed_write):
+    obs = ContractObservation(tmp_path / "book.db", [])
+    obs.book.open_order("order", "model|turn", opened_at=100, duration_s=100, target_rate=1,
+                        max_tokens=2, budget_rao=2, ceiling_micro=1, new_rate_cap=1)
+    final = {"observation_closed_at": 103, "counts_complete": True, "verified_tokens": 2, "settled": 1}
+    with sqlite3.connect(obs.book.path) as db:
+        db.execute(f"CREATE TRIGGER simulate_failure BEFORE {failed_write} "
+                   "BEGIN SELECT RAISE(ABORT, 'interrupted'); END")
+    with pytest.raises(sqlite3.IntegrityError, match="interrupted"):
+        obs.close("order", 103, final)
+    with sqlite3.connect(obs.book.path) as db:
+        db.execute("DROP TRIGGER simulate_failure")
+    async def read_final(job_id):
+        assert job_id == "order"
+        return final
+    restarted = ContractObservation(obs.book.path, [])
+    records = SimpleNamespace(read_final_status=read_final)
+    asyncio.run(restarted.recover_closures(records))
+    asyncio.run(restarted.recover_closures(records))
+    assert restarted.book.order("order")["closed_at"] == 103
+    with sqlite3.connect(obs.book.path) as db:
+        assert db.execute("SELECT verified_tokens,settled FROM observed_closures").fetchall() == [(2, 1)]

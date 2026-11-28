@@ -45,6 +45,8 @@ CREATE TABLE IF NOT EXISTS offer_versions (
 CREATE INDEX IF NOT EXISTS historic_offers ON offer_versions (market,hotkey,effective_at,id);
 CREATE TABLE IF NOT EXISTS orders (
  order_id TEXT PRIMARY KEY, market TEXT NOT NULL, spec TEXT NOT NULL, closed_at INTEGER);
+CREATE TABLE IF NOT EXISTS opening_owner_reads (
+ order_id TEXT PRIMARY KEY REFERENCES orders, observed_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS snapshot (
  order_id TEXT NOT NULL REFERENCES orders, hotkey TEXT NOT NULL, coldkey TEXT NOT NULL,
  price_micro INTEGER NOT NULL, offer_rate INTEGER NOT NULL, offer_slots INTEGER NOT NULL,
@@ -207,6 +209,7 @@ class ContractBook:
         q_min=0.01,
         trust_tokens=10_000_000,
         eligible_owners=None,
+        owners_observed_at=None,
     ):
         _key(order_id, "order_id")
         _key(market, "market")
@@ -250,6 +253,10 @@ class ContractBook:
                     raise ValueError("conflicting order opening")
                 return self._contracts(db, order_id)
             db.execute("INSERT INTO orders VALUES (?,?,?,NULL)", (order_id, market, _json(spec)))
+            if owners_observed_at is not None:
+                if eligible_owners is None or not 0 <= owners_observed_at <= opened_at:
+                    raise ValueError("ownership must have been observed by the opening second")
+                db.execute("INSERT INTO opening_owner_reads VALUES (?,?)", (order_id, owners_observed_at))
             candidates = self._candidates(db, spec, opened_at, eligible_owners)
             for c in candidates:
                 db.execute(

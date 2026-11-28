@@ -87,7 +87,7 @@ def _load_periods(db, job, counts):
         volume = _tokens(row["tokens"])
         counts["captured_period_fragments"] += 1
         counts["settled_tokens"] += volume
-        rate = row["miner_alpha_per_period"]
+        rate = row["miner_alpha_per_period"] if row.get("valuation_source") == "opening_declaration" else None
         rate = _number(rate, "frozen emission") * 10**9 if rate is not None else None
         rewards = row["rewards_by_hotkey"]
         if not isinstance(rewards, dict):
@@ -138,7 +138,7 @@ def _load_periods(db, job, counts):
     return receipts, complete
 
 
-def _measure(db, order, counts):
+def _measure(db, order, counts, owner_known):
     job, spec_json, closed = order
     spec = json.loads(spec_json)
     deadline = spec["opened_at"] + spec["duration_s"]
@@ -167,10 +167,15 @@ def _measure(db, order, counts):
         counts["orders_with_matching_final_tokens" if reconciled else "orders_with_final_token_gap"] += 1
     if not complete:
         counts["orders_with_incomplete_detail"] += 1
+    if not owner_known:
+        counts["orders_without_owner_snapshot"] += 1
+        counts["tokens_without_owner_snapshot"] += sum(r.tokens for r in receipts.values())
     if not complete or not reconciled:
         counts["unmatched_incomplete_history_tokens"] += sum(r.tokens for r in receipts.values())
         return
 
+    if not owner_known:
+        return
     capacity, funds = spec["max_tokens"], spec["budget_rao"] * 1000
     # Fragments can settle in a different order from when the work arrived.
     for r in sorted(receipts.values(), key=lambda r: (r.at, r.sid)):
@@ -205,15 +210,20 @@ def report(path, *, order_id=None):
         if order_id is not None:
             sql += " WHERE order_id=?"
         rows = db.execute(sql, (order_id,) if order_id is not None else ())
+        has_owner_reads = db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='opening_owner_reads'"
+        ).fetchone()
         for row in rows:
             counts["orders"] += 1
-            if db.execute("SELECT 1 FROM missed_snapshots WHERE order_id=?", (row[0],)).fetchone():
-                counts["orders_without_owner_snapshot"] += 1
-            _measure(db, row, counts)
+            owner_known = has_owner_reads and db.execute(
+                "SELECT 1 FROM opening_owner_reads WHERE order_id=? AND observed_at<=?",
+                (row[0], json.loads(row[1])["opened_at"]),
+            ).fetchone()
+            _measure(db, row, counts, owner_known)
         if order_id is not None and not counts["orders"]:
             raise ValueError("the requested order is absent from this observation file")
     paired = counts["paired_tokens"]
-    reasons = ("orders", "orders_without_owner_snapshot", "captured_period_fragments", "valued_fragments", "fragments_missing_valuation",
+    reasons = ("orders", "orders_without_owner_snapshot", "tokens_without_owner_snapshot", "captured_period_fragments", "valued_fragments", "fragments_missing_valuation",
                "settled_tokens", "fragments_without_receipts", "fragments_with_volume_mismatch",
                "receipt_tokens", "audited_receipt_tokens", "orders_with_incomplete_detail",
                "tokens_missing_receipt_time", "orders_without_final_verified_total", "orders_with_matching_final_tokens",
@@ -227,6 +237,7 @@ def report(path, *, order_id=None):
         "matched_nominal_contract_millirao": counts["matched_contract_millirao"] if counts["matched_contract_tokens"] else None,
         "paired_nominal_observed_millirao_floor": math.floor(counts["paired_observed_millirao"]) if paired else None,
         "paired_nominal_contract_millirao": counts["paired_contract_millirao"] if paired else None,
+        "ownership_basis": "last completed registry read known by the opening second within the registration cache TTL; rotations between reads are unobserved",
         "coverage_basis": "pairing requires complete receipt details and captured tokens equal to the authoritative final count",
         "settlement_basis": "archived net shares valued at the opening emission when the archived ceiling matches, floored to rao per miner per fragment",
         "comparison_basis": "gross prices at original receipt times; elapsed-rate envelope is a conservative heuristic for bursty arrivals",

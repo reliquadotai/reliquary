@@ -500,6 +500,9 @@ class CorpusJobSet:
             last = self._status_cache.get(job_id)
             final = {**(last[1] if last else {"job_id": job_id}), "state": "drained",
                      "counts_complete": False}
+        observed = (getattr(getattr(wiring, "entry", None), "params", None) or {}).get("order_contract", {}).get("mode") == "observation"
+        if observed:
+            final["observation_closed_at"] = int(self._clock())
         if self._finals is not None:
             # A durable settlement can become visible before the local totals catch up.
             if final["audited"] > final["settled"]:
@@ -515,7 +518,12 @@ class CorpusJobSet:
                 if final["audited"] < final["settled"]:
                     final["counts_complete"] = False
                 # Kept before anything is released: a restart serves it.
-                await self._finals.write_final_status(job_id, final)
+                created = await self._finals.write_final_status(job_id, final)
+                if observed and created is False:
+                    # A previous process already certified the final. Its timestamp owns the closure.
+                    final = await self._finals.read_final_status(job_id)
+                    if final is None:
+                        return
             except Exception:
                 logger.exception("corpus job %s: final status not written; retrying", job_id)
                 return

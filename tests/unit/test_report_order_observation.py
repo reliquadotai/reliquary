@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from reliquary.corpus.contract_observation import ContractObservation
-from reliquary.validator.corpus_periods import MAX_PRICE_EMISSION_PARAM
+from reliquary.validator.corpus_periods import MAX_PRICE_EMISSION_PARAM, MAX_PRICE_PARAM
 from scripts.report_order_observation import report
 
 JOB = "private-order-example"
@@ -37,8 +37,9 @@ def observation(tmp_path):
         budget_rao=1000,
         ceiling_micro=2000,
         new_rate_cap=2,
+        eligible_owners={MINER: "private-owner-example"}, owners_observed_at=90,
     )
-    entry = SimpleNamespace(job_id=JOB, params={MAX_PRICE_EMISSION_PARAM: 2.0})
+    entry = SimpleNamespace(job_id=JOB, params={"order_contract": {"opening_valuation": {MAX_PRICE_PARAM: 0.2, MAX_PRICE_EMISSION_PARAM: 2.0}}})
     return path, obs, obs.recorder(entry)
 
 
@@ -62,6 +63,7 @@ def archive(
     record(
         {
             "work_period": work_period,
+            "max_price_per_token": 0.2,
             "entry_period": entry_period,
             "tokens": sum(r["token_count"] for _, r in entries),
             "rewards_by_hotkey": {MINER: rewards},
@@ -248,3 +250,20 @@ def test_market_supply_before_first_order_handles_withdrawals_and_shared_owners(
         assert json.loads(output) == {
             "before_unix_second": cutoff, "active_offers": active, "offering_coldkeys": 1
         }
+
+def test_legacy_facts_remain_readable_without_owner_or_conversion_proof(tmp_path):
+    path, obs, _ = observation(tmp_path)
+    old = obs.recorder(SimpleNamespace(job_id=JOB, params={MAX_PRICE_EMISSION_PARAM: 99}))
+    archive(old, 0, 0, [receipt("r", 2, 140)])
+    close(obs, verified=2, settled=1)
+    result = report(path)
+    assert result["receipt_tokens"] == 2 and result["fragments_missing_valuation"] == 1
+    assert result["matched_tokens_without_observed_price_or_rate"] == 2
+    # A previously recorded rate had no source and a previously recorded award had no read time.
+    with sqlite3.connect(path) as db:
+        db.execute("DROP TABLE opening_owner_reads")
+        db.execute("UPDATE observed_periods SET document=json_set(json_remove(document, '$.valuation_source'), '$.miner_alpha_per_period',99)")
+    result = report(path)
+    assert result["orders_without_owner_snapshot"] == 1 and result["tokens_without_owner_snapshot"] == 2
+    assert result["paired_tokens"] == result["matched_contract_tokens"] == 0
+    assert result["settled_baseline_rao_on_valued_fragments"] is None

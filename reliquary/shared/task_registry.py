@@ -451,6 +451,9 @@ def add_task(
             raise RegistryError("a new order_contract requires auction pricing")
         budget, ceiling = period_envelope(entry.params)
         marker = entry.params["order_contract"]
+        valuation = marker.get("opening_valuation")
+        if valuation is not None and any(entry.params.get(key) != value for key, value in valuation.items()):
+            raise RegistryError("order_contract valuation differs from the opening terms")
         if marker["budget_rao"] > budget or marker["ceiling_micro"] > ceiling:
             raise RegistryError("order_contract exceeds its opening cap or price")
     if entry.task_id in entries:

@@ -2615,7 +2615,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                        order_jobs=None, sandbox=None, sandbox_down: str | None = None,
                        model_dir_for=None, signed_wiring=None, suite_replayer_for=None,
                        operator_of: Callable[[str], str | None] | None = None, order_judge=None,
-                       contract_observation=None, current_owners=None):
+                       contract_observation=None, owners_at=None):
     """The app and the job set of the eval control. Each wired job gets its own
     tokenizer, renderer, router, auditor (an executor pair per batch) and
     settler; ``read_entries`` makes the set hot.
@@ -2838,7 +2838,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             dispatcher.reuse_only_jobs.add(job.job_id)
         if contract_observation is not None and entry.params.get("order_contract"):
             try:
-                owners = current_owners() if current_owners else None
+                owners = owners_at(entry.params["order_contract"]["opened_at"]) if owners_at else None
                 await asyncio.to_thread(contract_observation.open, entry, owners)
             except Exception:
                 logger.exception("could not observe opening of %s", job.job_id)
@@ -2946,8 +2946,9 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                    for o in served.values()):
             tokenizers.pop(key, None)
         if contract_observation is not None and w.entry.params.get("order_contract"):
-            await asyncio.to_thread(contract_observation.close, w.job.job_id, int(clock()),
-                                    job_set.finished.get(w.job.job_id, {}))
+            final = job_set.finished.get(w.job.job_id, {})
+            if final.get("observation_closed_at") is not None:
+                await asyncio.to_thread(contract_observation.close, w.job.job_id, final["observation_closed_at"], final)
 
     async def guarded(w, coroutine):
         """One job's background work: a failure flags the job, never the process."""
@@ -3221,6 +3222,13 @@ async def run_eval_control(*, netuid: int, http_host: str, http_port: int,
         verify_corpus_signature,
         verify_corpus_skip_signature,
     )
+    from reliquary.corpus.contract_observation import ContractObservation
+
+    try:
+        contract_observation = ContractObservation.from_env()
+    except Exception:
+        logger.exception("local contract observation is unavailable")
+        contract_observation = None
     registered = None
     if registration_gate:
         from reliquary.validator.corpus_registration import (
@@ -3228,7 +3236,8 @@ async def run_eval_control(*, netuid: int, http_host: str, http_port: int,
             load_registered_hotkeys,
         )
 
-        registered = RegisteredHotkeys(load=lambda: load_registered_hotkeys(netuid))
+        registered = RegisteredHotkeys(load=lambda: load_registered_hotkeys(netuid),
+                                       keep_owner_history=contract_observation is not None)
         await registered.refresh()
     directory = EvalExecutorDirectory()
     dispatcher = PairedAuditDispatcher(
@@ -3262,16 +3271,10 @@ async def run_eval_control(*, netuid: int, http_host: str, http_port: int,
     order_judge = (OrderJudgeFront.from_env(
         dispatcher=dispatcher, coldkeys=registered.coldkeys if registered is not None else None)
         if order_judge_enabled() else None)
-    from reliquary.corpus.contract_observation import ContractObservation
-
-    try:
-        contract_observation = ContractObservation.from_env()
-    except Exception:
-        logger.exception("local contract observation is unavailable")
-        contract_observation = None
+    order_records = BucketRecordStore(max_pool_connections=ORDER_POOL_CONNECTIONS)
     app, job_set = build_eval_control(
         # Every order's auditors and the miners' intake share these connections (`ORDER_POOL_CONNECTIONS`).
-        store=BucketJobStore(), records=BucketRecordStore(max_pool_connections=ORDER_POOL_CONNECTIONS),
+        store=BucketJobStore(), records=order_records,
         dispatcher=dispatcher,
         directory=directory, verify_signature=verify_corpus_signature,
         verify_skip_signature=verify_corpus_skip_signature, qualifications=qualifications,
@@ -3280,7 +3283,7 @@ async def run_eval_control(*, netuid: int, http_host: str, http_port: int,
         settle_archives=archives, read_entries=read_entries,
         refresh_every_seconds=refresh_every_seconds or 60.0, sandbox=sandbox, sandbox_down=sandbox_down,
         order_judge=order_judge, contract_observation=contract_observation,
-        current_owners=registered.fresh_coldkeys if registered is not None else None)
+        owners_at=registered.owners_at if registered is not None else None)
 
     async def refresh_qualifications():
         while True:
@@ -3293,6 +3296,15 @@ async def run_eval_control(*, netuid: int, http_host: str, http_port: int,
     background = [dispatcher.run(write_status=write_control_status,
                                  status_of=app.state.control_status), refresh_qualifications(),
                   job_set.run()]
+    if contract_observation is not None:
+        async def recover_observations():
+            while True:
+                try:
+                    await contract_observation.recover_closures(order_records, job_set.served)
+                except Exception:
+                    logger.exception("local observation closure recovery unavailable; retrying")
+                await asyncio.sleep(60)
+        background.append(recover_observations())
     if registered is not None:
         background.append(registered.refresh_forever())
     if sandbox is not None:

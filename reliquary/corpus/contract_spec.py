@@ -62,8 +62,15 @@ def open_kwargs(spec):
 
 
 def validate_spec(spec):
-    if not isinstance(spec, Mapping) or set(spec) != {"version", "mode", "market", *OPEN_FIELDS}:
+    required = {"version", "mode", "market", *OPEN_FIELDS}
+    if not isinstance(spec, Mapping) or set(spec) not in (required, required | {"opening_valuation"}):
         raise ValueError("invalid fields in order_contract")
+    if "opening_valuation" in spec:
+        valuation = spec["opening_valuation"]
+        if not isinstance(valuation, Mapping) or set(valuation) != {cp.MAX_PRICE_PARAM, cp.MAX_PRICE_EMISSION_PARAM}:
+            raise ValueError("invalid opening valuation")
+        for value in valuation.values():
+            _ratio(value)
     if type(spec["version"]) is not int or spec["version"] != 1:
         raise ValueError("unknown order_contract version")
     if spec["mode"] not in ("observation", "pilot"):
@@ -109,6 +116,7 @@ def declaration(config, job, params, *, opened_at, evaluation):
         "opened_at": opened_at,
         "max_tokens": max_tokens,
         "budget_rao": budget,
+        "opening_valuation": {key: params[key] for key in (cp.MAX_PRICE_PARAM, cp.MAX_PRICE_EMISSION_PARAM)},
         "ceiling_micro": ceiling,
         "evaluation": evaluation,
         "audit_cost_micro": 0,
