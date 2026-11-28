@@ -225,3 +225,26 @@ def test_cli_exports_aggregate_and_never_creates_a_missing_database(tmp_path):
     with pytest.raises(sqlite3.OperationalError):
         report(missing)
     assert not missing.exists()
+
+
+def test_market_supply_before_first_order_handles_withdrawals_and_shared_owners(tmp_path):
+    path = tmp_path / "standing.sqlite"
+    book = ContractObservation(path, ["market"]).book
+    for market, hotkey, owner, at, slots in [
+        ("market", "first", "one-owner", 10, 1),
+        ("market", "second", "one-owner", 11, 1),
+        ("market", "second", "one-owner", 12, 0),
+        ("market", "third", "another-owner", 12, 1),
+        ("market", "third", "another-owner", 12, 0),
+        ("another-market", "other", "separate-owner", 10, 1),
+    ]:
+        book.post_offer(market, hotkey, owner, price_micro=1000, rate=slots, slots=slots, at=at)
+    script = Path(__file__).resolve().parents[2] / "scripts/report_order_observation.py"
+    for cutoff, active in [(12, 2), (13, 1)]:
+        output = subprocess.check_output(
+            [sys.executable, str(script), str(path), "--market", "market", "--before", str(cutoff)],
+            text=True,
+        )
+        assert json.loads(output) == {
+            "before_unix_second": cutoff, "active_offers": active, "offering_coldkeys": 1
+        }

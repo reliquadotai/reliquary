@@ -21,6 +21,7 @@ import argparse
 import json
 import math
 import sqlite3
+import time
 from collections import Counter, defaultdict
 from contextlib import closing
 from dataclasses import dataclass
@@ -232,13 +233,42 @@ def report(path, *, order_id=None):
     }
 
 
+def standing_supply(path, market, before):
+    """Count declared supply before an opening second, without revealing individual offers."""
+    if before < 0 or before >= 2**63:
+        raise ValueError("opening second is outside the supported range")
+    with closing(sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)) as db:
+        active, owners = db.execute(
+            """WITH versions AS (
+                 SELECT coldkey, rate, slots, ROW_NUMBER() OVER (
+                   PARTITION BY hotkey ORDER BY effective_at DESC, id DESC
+                 ) AS latest
+                 FROM offer_versions WHERE market = ? AND effective_at < ?
+               )
+               SELECT COUNT(*), COUNT(DISTINCT coldkey) FROM versions
+               WHERE latest = 1 AND rate > 0 AND slots > 0""",
+            (market, before),
+        ).fetchone()
+    return {"before_unix_second": before, "active_offers": active, "offering_coldkeys": owners}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("database", type=Path)
-    parser.add_argument("--order", help="restrict the aggregate to one local order")
+    select = parser.add_mutually_exclusive_group()
+    select.add_argument("--order", help="restrict the aggregate to one local order")
+    select.add_argument("--market", help="count posted standing offers for a market before opening; eligibility is checked at opening")
+    parser.add_argument("--before", type=int, help="exclusive opening second for --market (default: current Unix time)")
     args = parser.parse_args()
+    if args.before is not None and args.market is None:
+        parser.error("--before requires --market")
     try:
-        print(json.dumps(report(args.database, order_id=args.order), indent=2, allow_nan=False))
+        if args.market is None:
+            result = report(args.database, order_id=args.order)
+        else:
+            cutoff = int(time.time()) if args.before is None else args.before
+            result = standing_supply(args.database, args.market, cutoff)
+        print(json.dumps(result, indent=2, allow_nan=False))
     except (ValueError, KeyError, sqlite3.Error, TypeError) as exc:
         parser.exit(2, f"could not read order observations: {exc}\n")
 
