@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import time
 
 from fastapi import APIRouter, HTTPException
@@ -12,8 +13,7 @@ from reliquary.protocol.signatures import verify_corpus_lease_signature
 
 
 def standing_offers_router(
-    book,
-    markets,
+    observation,
     *,
     registration,
     operator_of,
@@ -24,7 +24,7 @@ def standing_offers_router(
 
     @router.put("/corpus/standing-offer")
     async def put_offer(body: StandingOfferRequest) -> dict:
-        if body.market not in markets:
+        if body.market not in observation.markets:
             raise HTTPException(404, "market_not_served")
         if (body.slots == 0) != (body.tokens_per_second == 0):
             raise HTTPException(422, "withdraw_with_zero_rate_and_slots")
@@ -40,18 +40,16 @@ def standing_offers_router(
             raise HTTPException(503, "owner_unavailable")
         if owner != body.coldkey:
             raise HTTPException(403, "owner_changed")
-        try:
-            await asyncio.to_thread(
-                book.post_offer,
-                body.market,
-                body.miner_hotkey,
-                owner,
-                price_micro=body.micro_alpha_per_mtoken,
-                rate=body.tokens_per_second,
-                slots=body.slots,
-                sequence=body.sequence,
-                at=int(clock()),
+        def record():
+            observation.book.post_offer(
+                body.market, body.miner_hotkey, owner, price_micro=body.micro_alpha_per_mtoken,
+                rate=body.tokens_per_second, slots=body.slots, sequence=body.sequence, at=int(clock()),
             )
+
+        try:
+            await asyncio.to_thread(record)
+        except (sqlite3.Error, OSError) as exc:
+            raise HTTPException(503, "observation_unavailable") from exc
         except ValueError as exc:
             raise HTTPException(409, "offer_conflict") from exc
         return {"accepted": True, "sequence": body.sequence, "mode": "observation"}

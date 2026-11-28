@@ -8,6 +8,7 @@ import logging
 import os
 import sqlite3
 from contextlib import closing
+from functools import cached_property
 
 from reliquary.corpus.contract_spec import (
     MARKETS_ENV,
@@ -23,10 +24,16 @@ DB_ENV = "RELIQUARY_ORDER_OBSERVATION_DB"
 
 class ContractObservation:
     def __init__(self, path, markets):
-        self.book = ContractBook(path)
+        self._path = path
         self._close_cursor = ""
         self.markets = frozenset(markets)
-        with closing(sqlite3.connect(self.book.path)) as db:
+
+    @cached_property
+    def book(self):
+        # Called from the observation worker threads. A busy local book must never stall
+        # validator startup or its registry refresh; the next call can retry initialization.
+        book = ContractBook(self._path, timeout=0)
+        with closing(sqlite3.connect(book.path, timeout=0)) as db:
             db.execute("""CREATE TABLE IF NOT EXISTS observed_periods (
                 order_id TEXT NOT NULL, work_period INTEGER NOT NULL, entry_period INTEGER NOT NULL,
                 document TEXT NOT NULL, PRIMARY KEY (order_id, work_period, entry_period))""")
@@ -35,6 +42,8 @@ class ContractObservation:
             db.execute(
                 "CREATE TABLE IF NOT EXISTS missed_snapshots (order_id TEXT PRIMARY KEY, reason TEXT NOT NULL)"
             )
+
+        return book
 
     @classmethod
     def from_env(cls):
@@ -65,7 +74,7 @@ class ContractObservation:
         if owner_snapshot is not None and owner_snapshot[0] <= spec["opened_at"]:
             observed_at, owners = owner_snapshot
         if observed_at is None:
-            with closing(sqlite3.connect(self.book.path, timeout=1)) as db, db:
+            with closing(sqlite3.connect(self.book.path, timeout=0)) as db, db:
                 db.execute(
                     "INSERT OR IGNORE INTO missed_snapshots VALUES (?,?)",
                     (entry.job_id, "registration_unavailable"),
@@ -78,14 +87,14 @@ class ContractObservation:
         if self.book.order(job_id) is not None:
             self.book.close(job_id, at=at, observed_only=True)
             counts = final if final.get("counts_complete") is True else {}
-            with closing(sqlite3.connect(self.book.path, timeout=1)) as db, db:
+            with closing(sqlite3.connect(self.book.path, timeout=0)) as db, db:
                 db.execute(
                     "INSERT OR IGNORE INTO observed_closures VALUES (?,?,?)",
                     (job_id, counts.get("verified_tokens"), counts.get("settled")),
                 )
 
     def _unclosed_page(self):
-        with closing(sqlite3.connect(self.book.path, timeout=1)) as db:
+        with closing(sqlite3.connect(self.book.path, timeout=0)) as db:
             page = db.execute("""SELECT o.order_id FROM orders o
                 LEFT JOIN observed_closures c ON c.order_id=o.order_id
                 WHERE c.order_id IS NULL AND o.order_id>? ORDER BY o.order_id LIMIT 8""",
@@ -143,7 +152,7 @@ class ContractObservation:
                 },
                 allow_nan=False,
             )
-            with closing(sqlite3.connect(self.book.path, timeout=1)) as db, db:
+            with closing(sqlite3.connect(self.book.path, timeout=0)) as db, db:
                 db.execute(
                     "INSERT OR IGNORE INTO observed_periods VALUES (?,?,?,?)",
                     (

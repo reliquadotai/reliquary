@@ -2967,7 +2967,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
     if contract_observation is not None:
         from reliquary.validator.standing_offers import standing_offers_router
 
-        app.include_router(standing_offers_router(contract_observation.book, contract_observation.markets,
+        app.include_router(standing_offers_router(contract_observation,
                                                  registration=registration, operator_of=operator_of, clock=clock))
     if sandbox is not None:
         routes.sandbox_hotkey = getattr(sandbox, "validator_hotkey", None)

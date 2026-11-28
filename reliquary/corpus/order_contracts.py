@@ -93,8 +93,9 @@ CREATE INDEX IF NOT EXISTS performance_owner ON performance (coldkey, at);
 class ContractBook:
     """A durable book. Each mutation is a single SQLite write transaction."""
 
-    def __init__(self, path):
+    def __init__(self, path, *, timeout=30):
         self.path = Path(path)
+        self._timeout = timeout
         if str(path) == ":memory:":
             raise ValueError("a durable database path is required")
         fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
@@ -104,7 +105,7 @@ class ContractBook:
 
     @contextmanager
     def _db(self, *, write=False):
-        db = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+        db = sqlite3.connect(self.path, timeout=self._timeout, isolation_level=None)
         db.row_factory = sqlite3.Row
         try:
             db.execute("PRAGMA foreign_keys=ON")

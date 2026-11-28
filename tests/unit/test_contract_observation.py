@@ -35,8 +35,7 @@ def test_signed_offer_before_opening_changes_only_future_orders(tmp_path):
     app = FastAPI()
     app.include_router(
         standing_offers_router(
-            observation.book,
-            [market],
+            observation,
             registration=registration,
             operator_of=lambda _: "owner",
             verify=lambda row: build_corpus_lease_binding(row) == signed,
@@ -189,3 +188,22 @@ def test_recovery_uses_certified_time_after_failed_closure(tmp_path, failed_writ
     assert restarted.book.order("order")["closed_at"] == 103
     with sqlite3.connect(obs.book.path) as db:
         assert db.execute("SELECT verified_tokens,settled FROM observed_closures").fetchall() == [(2, 1)]
+
+
+def test_busy_local_book_does_not_delay_initialization_and_can_recover(tmp_path, monkeypatch):
+    from reliquary.corpus.contract_observation import DB_ENV
+    from reliquary.corpus.contract_spec import MARKETS_ENV
+
+    path = tmp_path / "busy.db"
+    monkeypatch.setenv(DB_ENV, str(path))
+    monkeypatch.setenv(MARKETS_ENV, json.dumps({"model|turn": {"mode": "observation"}}))
+    with sqlite3.connect(path) as lock:
+        lock.execute("BEGIN EXCLUSIVE")
+        observer = ContractObservation.from_env()
+        app = FastAPI()
+        app.include_router(standing_offers_router(observer, registration=None, operator_of=None))
+        async def while_locked():
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                await asyncio.wait_for(observer.recover_closures(None), timeout=1)
+        asyncio.run(while_locked())
+    assert observer.book.order("absent") is None
