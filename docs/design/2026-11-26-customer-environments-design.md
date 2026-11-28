@@ -56,8 +56,8 @@ Each account has a private environment hub on the platform:
 * **Version** = sha256 of the archive. A version is immutable; an order pins it, with the image digest it built.
 * **Visibility**: private to the account (and its organisation's members). No sharing with other accounts and
   no public listing for now.
-* **Uses**: one environment serves every product. Qualification (below) decides which uses it may have, as the
-  catalog does for ours (`env_catalog.py`: `rl`, `batch`, `eval` rows).
+* **Uses**: one environment serves every product. A qualified version may serve RL, batch and evaluation alike:
+  RL is a task like any other (see Determinism below).
 * **Secrets**: the customer may attach secrets (an API key for their judge or their tools). They are stored
   encrypted and injected only into that environment's sandboxes.
 
@@ -89,7 +89,8 @@ The platform stores the archive in its bucket under `customer-envs/<account>/<na
   uses, image_digest, prompt_set, examples, cost, created_at, qualified_at}`.
   `status`: `queued` | `building` | `qualifying` | `qualified` | `refused` | `disabled`; `reason` says why a
   refusal (`package_invalid`, `build_failed`, `start_failed`, `freeze_failed`, `examples_failed`,
-  `nondeterministic` (then `uses` still holds `eval`), `infrastructure` (retried, never billed)).
+  `infrastructure` (retried, never billed)); on a qualified version, `nondeterministic` is a note, not a
+  refusal.
   `uses` ⊆ `rl`, `batch`, `eval`. `prompt_set`: `{count, sha256}`. `cost`: `{qualification_cpu_seconds,
   scoring_cpu_ms_per_item}`.
 * `DELETE /admin/v1/customer-envs/<env_id>`: disables it; running orders keep their pinned version.
@@ -165,9 +166,11 @@ Run once per version, in the customer's sandbox, before any order may use it:
 3. Freeze the prompts.
 4. **Examples**: the push carries a few examples, `{problem_id, completion, expected_score}`, at least one
    scoring high and one low. Each must score as expected. No model runs during qualification: it needs no GPU.
-5. **Determinism**: grade the examples twice, in two fresh sandboxes; any difference refuses the
-   environment for RL (it may still serve evaluations and annotation, marked non-reproducible). An LLM judge
-   is non-reproducible by construction.
+5. **Determinism**: grade the examples twice, in two fresh sandboxes; a difference is reported
+   (`reason: nondeterministic`) and refuses nothing. One reward host scores each completion and the validators
+   receive its floats: nobody re-scores it, so there is no second score to disagree with, and the miner's
+   tokens are fixed by the draw, so a noisy grader gives it nothing to exploit. An LLM judge is
+   non-reproducible by construction; training on one is the customer's choice.
 6. Measure scoring time and sandbox seconds per item: the order's price includes them.
 
 The steps run cheapest first and stop at the first failure, with its reason. The result is a signed

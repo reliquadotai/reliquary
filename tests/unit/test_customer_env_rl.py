@@ -71,6 +71,15 @@ def test_rows_must_match_a_version_qualified_for_rl(record, body, reason):
         load_rows(str(ENV), read=bucket(record, body), rows_dir="")
 
 
+def test_a_row_with_a_system_prompt_is_served_to_rl_with_it():
+    rows = [dict(ROWS[0], system="Answer with a number."), ROWS[1]]
+    body = b"".join(json.dumps(r).encode() + b"\n" for r in rows)
+    record = {"status": "qualified", "uses": ["rl"], "prompt_set": {"sha256": hashlib.sha256(body).hexdigest()}}
+    env = CustomerEnvironment(str(ENV), rows=load_rows(str(ENV), read=bucket(record, body), rows_dir=""))
+    assert env.get_problem(0)["system"] == "Answer with a number."
+    assert "system" not in env.get_problem(1)
+
+
 def test_the_registry_knows_a_customer_env_by_its_id():
     from reliquary.environment.registry import find_environment_spec, get_environment_spec
 

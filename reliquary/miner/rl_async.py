@@ -1321,7 +1321,8 @@ class VllmGroupGenerator:
         if env is None:
             env = self._envs[lease.environment] = load_environment(lease.environment)
         problem = env.get_problem(lease.prompt_idx)
-        return encode_prompt(self.tokenizer, problem["prompt"], thinking=lease.thinking())
+        return encode_prompt(self.tokenizer, problem["prompt"], thinking=lease.thinking(),
+                             system=problem.get("system") or None)
 
     def generate(self, leases: Sequence[HeldLease]) -> list[list[list[int]]]:
         from reliquary.protocol.rl_draw import lease_extra_args

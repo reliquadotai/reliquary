@@ -364,6 +364,7 @@ def _render_environment_prompt(env: Any, tokenizer: Any, prompt_idx: int) -> str
         tokenizer,
         str(problem["prompt"]),
         thinking=thinking_for_environment(str(getattr(env, "name", ""))),
+        system=problem.get("system") or None,
     )
 
 

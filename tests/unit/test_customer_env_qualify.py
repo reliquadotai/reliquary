@@ -120,7 +120,7 @@ def test_a_failure_of_ours_is_infrastructure_and_is_queued_again(tmp_path):
     assert created and again.status == "queued"
 
 
-def test_a_nondeterministic_grader_serves_evaluations_only(tmp_path):
+def test_a_nondeterministic_grader_is_reported_and_still_serves_every_use(tmp_path):
     calls = {"n": 0}
 
     def flaky(image):
@@ -129,9 +129,8 @@ def test_a_nondeterministic_grader_serves_evaluations_only(tmp_path):
 
     q, registry, store, env = setup(tmp_path, open_worker=flaky)
     record = q.run(str(env))
-    assert (record.status, record.reason, record.uses) == ("qualified", "nondeterministic", ["eval"])
-    with pytest.raises(ValueError, match="not_qualified_for: rl"):
-        resolve(registry, str(env), account="acct", product="rl")
+    assert (record.status, record.reason, record.uses) == ("qualified", "nondeterministic", ["rl", "batch", "eval"])
+    assert resolve(registry, str(env), account="acct", product="rl").env_id == str(env)
 
 
 class _Shifted:

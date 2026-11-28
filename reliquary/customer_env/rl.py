@@ -110,10 +110,7 @@ def load_rows(env_id: str, *, read=_bucket_get, rows_dir: str | None = None, row
         body = read(subnet_key(env, "prompts.jsonl"))
     if body is None or hashlib.sha256(body).hexdigest() != record["prompt_set"]["sha256"]:
         raise RuntimeError(f"{env_id}: its frozen rows are missing or changed")
-    rows = [json.loads(line) for line in body.splitlines() if line.strip()]
-    if any(r.get("system") for r in rows):
-        raise RuntimeError(f"{env_id}: rows with a system prompt are not served to RL")
-    return rows
+    return [json.loads(line) for line in body.splitlines() if line.strip()]
 
 
 class CustomerEnvironment:
@@ -137,8 +134,11 @@ class CustomerEnvironment:
     def get_problem(self, index: int) -> dict:
         rows = self._all()
         row = rows[int(index) % len(rows)]
-        return {"prompt": row["prompt"], "ground_truth": "", "id": row["prompt_sha256"][:16],
-                "environment": self.name, "key": row["key"], "prompt_sha256": row["prompt_sha256"]}
+        problem = {"prompt": row["prompt"], "ground_truth": "", "id": row["prompt_sha256"][:16],
+                   "environment": self.name, "key": row["key"], "prompt_sha256": row["prompt_sha256"]}
+        if row.get("system"):
+            problem["system"] = row["system"]
+        return problem
 
     def compute_reward(self, problem: dict, completion: str) -> float:
         return score_customer_answers(problem, [completion], scorer=self._scorer)[0]

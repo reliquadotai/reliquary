@@ -5,8 +5,12 @@
 3. the worker starts in its sandbox and loads the taskset    -> start_failed
 4. the prompts freeze into rows                              -> freeze_failed
 5. every example scores as the customer says                 -> examples_failed
-6. a second, fresh sandbox scores the examples identically   -> else nondeterministic: eval only
+6. a second, fresh sandbox scores the examples identically   -> else reported nondeterministic
 7. scoring time per item, for the price
+
+A qualified version serves every use: RL is a task like any other. One reward host scores each completion and
+the validators receive its floats, so nobody re-scores it and a nondeterministic grader (an LLM judge) is a
+training choice of the customer's, reported (``reason``) but not refused.
 
 No model runs and no GPU is used. A failure of ours (bucket, registry, sandbox capacity) is ``infrastructure``:
 retried, never billed.
@@ -134,10 +138,7 @@ class Qualifier:
         body = rows_body(rows)
         rows_sha = hashlib.sha256(body).hexdigest()
         self._store.create_bytes(subnet_key(env, "prompts.jsonl"), body)
-        uses = list(USES) if deterministic else ["eval"]
-        if any(r.get("system") for r in rows) and "rl" in uses:
-            # An RL problem is one user turn: a system prompt would be silently dropped.
-            uses.remove("rl")
+        uses = list(USES)
         final = self._registry.update(
             record.env_id, status="qualified", reason=None if deterministic else "nondeterministic",
             detail=None if deterministic else "two fresh sandboxes scored the examples differently",
