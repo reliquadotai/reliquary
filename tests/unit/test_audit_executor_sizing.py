@@ -10,7 +10,7 @@ import pytest
 
 from reliquary.corpus.audit_policy import AuditParams
 from reliquary.protocol.profiles import TOPLOC_DEPLOYED_DEFAULTS as PROOF
-from reliquary.validator.corpus_audit_protocol import AUDIT_PROTOCOL, AUDIT_PROTOCOL_V3
+from reliquary.validator.corpus_audit_protocol import AUDIT_PROTOCOL, AUDIT_PROTOCOL_V3, AuditResult
 from reliquary.validator.corpus_auditor import CorpusAuditor
 from reliquary.validator.eval_control import (
     MIN_MEASURED_BUSY_SECONDS,
@@ -78,11 +78,11 @@ def _dispatcher(clock):
                                  scorers=1)
 
 
-async def _lease(d, clock, seconds, model=MODEL_A, executor="a"):
+async def _lease(d, clock, seconds, model=MODEL_A, executor="a", *, document=None, protocols=(AUDIT_PROTOCOL,)):
     """One batch of ITEMS (2 items) scored by ``executor`` in ``seconds``."""
     scoring = asyncio.ensure_future(d.view(*model, PROOF).score(ITEMS))
     await asyncio.sleep(0)
-    lease = d.claim(_executor(executor, model=model))
+    lease = d.claim(document or _executor(executor, model=model), protocols)
     clock.now += seconds
     await d.result(executor, lease["lease_id"], _honest())
     await scoring
@@ -179,6 +179,8 @@ def test_an_executor_to_release_is_leased_nothing_more():
         assert d.claim(_executor("new")) is None
         assert d.release_beyond(MODEL_A, None) == []        # nothing wanted known: none released
         assert d.release_beyond(MODEL_A, 2) == []
+        assert d.release_beyond(MODEL_A, 0) == []
+        await _lease(d, clock, 1, executor="new")
         assert d.release_beyond(MODEL_A, 0) == ["old"]      # at least one kept, the oldest goes
         d.set_releasing(["old"])
         scoring = asyncio.ensure_future(d.view(*MODEL_A, PROOF).score(ITEMS))
@@ -202,8 +204,7 @@ def test_the_oldest_rented_cards_are_released_first():
     clock = _Clock()
     d = _dispatcher(clock)
     for eid, rented_at in (("c", 300.0), ("b", 200.0), ("a", 100.0)):  # first contact: newest first
-        assert d.claim(_rented(eid, rented_at)) is None
-        clock.now += 10
+        asyncio.run(_lease(d, clock, 10, executor=eid, document=_rented(eid, rented_at)))
     assert d.release_beyond(MODEL_A, 1) == ["a", "b"]
     assert d.release_beyond(MODEL_A, 2) == ["a"]
     assert d.release_beyond(MODEL_A, 3) == []
@@ -211,6 +212,8 @@ def test_the_oldest_rented_cards_are_released_first():
     clock.now += 1000                                                # "c" falls silent: no longer live
     for eid, rented_at in (("a", 100.0), ("b", 200.0)):
         d.claim(_rented(eid, rented_at))
+    assert d.release_beyond(MODEL_A, 1) == []  # stale results after reconnection
+    asyncio.run(_lease(d, clock, 1, executor="b", document=_rented("b", 200.0)))
     assert d.release_beyond(MODEL_A, 1) == ["a"]
 
 
@@ -223,7 +226,9 @@ def test_a_card_still_loading_its_model_is_neither_kept_nor_released():
     assert d.release_beyond(MODEL_A, 1) == []
     d.heartbeat("next", _rented("next", 300.0))
     assert d.release_beyond(MODEL_A, 1) == []
-    d.claim(_rented("new", 200.0))                   # loaded
+    d.claim(_rented("new", 200.0))                   # loaded; still no measured result
+    assert d.release_beyond(MODEL_A, 1) == []
+    asyncio.run(_lease(d, clock, 1, executor="new", document=_rented("new", 200.0)))
     assert d.release_beyond(MODEL_A, 1) == ["old"]
 
 
@@ -260,5 +265,109 @@ def test_a_borrowed_batch_goes_to_the_card_the_fleet_keeps():
         assert d.claim(_rented("old", 100.0)) is None    # released next: it borrows nothing
         assert d.claim(_rented("new", 200.0)) is not None
         borrow.cancel()
+
+    asyncio.run(go())
+
+
+def test_new_card_must_cover_the_protocols_of_the_one_leaving():
+    clock = _Clock()
+    d = _dispatcher(clock)
+    draw = (AUDIT_PROTOCOL, AUDIT_PROTOCOL_V3)
+    d.claim(_rented("old", 100.0), draw)
+    asyncio.run(_lease(d, clock, 1, executor="new", document=_rented("new", 200.0)))
+    assert d.release_beyond(MODEL_A, 1) == []
+    d.claim(_rented("new", 200.0), draw)
+    assert d.release_beyond(MODEL_A, 1) == ["old"]
+
+
+def test_restart_waits_for_a_new_score_even_when_registered_age_is_known():
+    clock = _Clock()
+    for _ in range(2):
+        d = _dispatcher(clock)
+        d.claim(_rented("new", 200.0))
+        d.claim(_rented("old", 100.0))
+        assert d.release_beyond(MODEL_A, 1) == []
+        asyncio.run(_lease(d, clock, 1, executor="new", document=_rented("new", 200.0)))
+        assert d.release_beyond(MODEL_A, 1) == ["old"]
+
+@pytest.mark.parametrize("status", ["error", "proof_undecodable"])
+def test_an_answer_without_a_measure_never_displaces_a_working_card(status):
+    clock = _Clock()
+
+    async def go():
+        d = _dispatcher(clock)
+        await _lease(d, clock, 1, executor="old", document=_rented("old", 100.0))
+        if status == "error":
+            await _lease(d, clock, 1, executor="new", document=_rented("new", 200.0))
+            assert d.release_beyond(MODEL_A, 1) == ["old"]
+        scoring = asyncio.ensure_future(d.view(*MODEL_A, PROOF).score(ITEMS))
+        await asyncio.sleep(0)
+        lease = d.claim(_rented("new", 200.0))
+        result = AuditResult.model_validate({"scores": [{"status": status} for _ in ITEMS]})
+        await d.result("new", lease["lease_id"], result)
+        assert d.release_beyond(MODEL_A, 1) == []
+        scoring.cancel()
+
+    asyncio.run(go())
+
+
+def test_release_preserves_distinct_hosts_for_paired_scoring():
+    clock = _Clock()
+    d = PairedAuditDispatcher(directory=SimpleNamespace(), clock=clock, scorers=2)
+    old = _rented("old", 100)
+    replacements = [_rented("new", 200), {**_rented("next", 300), "host": "host-new"}]
+
+    async def go():
+        for replacement in replacements:
+            scoring = asyncio.ensure_future(d.view(*MODEL_A, PROOF).score(ITEMS))
+            await asyncio.sleep(0)
+            for card in (old, replacement):
+                lease = d.claim(card)
+                await d.result(card["executor_id"], lease["lease_id"], _honest())
+            await scoring
+        assert d.release_beyond(MODEL_A, 2) == []
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("disconnect", [False, True])
+def test_replacement_must_score_a_draw_if_the_old_card_scored_draws(disconnect):
+    from reliquary.corpus.job import DEFAULT_DRAW_JUDGE
+    from tests.unit.test_eval_control_long_trajectories import SAMPLED, _drawn_item
+
+    clock = _Clock()
+    d = _dispatcher(clock)
+    protocols = (AUDIT_PROTOCOL, AUDIT_PROTOCOL_V3)
+    old, new = _rented("old", 100), _rented("new", 200)
+
+    async def score_draw(card):
+        scoring = asyncio.ensure_future(d.view(*MODEL_A, PROOF, "job", DEFAULT_DRAW_JUDGE).score(
+            [_drawn_item(1, SAMPLED)]))
+        await asyncio.sleep(0)
+        lease = d.claim(card, protocols)
+        diag = {"positions": 1, "stochastic": 1, "exact": 1, "max_miss": 0.0, "last_miss": 0.0}
+        score = AuditResult.model_validate({"scores": [{"status": "ok", "draw": diag}]})
+        await d.result(card["executor_id"], lease["lease_id"], score)
+        await scoring
+
+    async def go():
+        await score_draw(old)
+        await _lease(d, clock, 1, executor="new", document=new, protocols=protocols)
+        assert d.release_beyond(MODEL_A, 1) == []
+        await score_draw(new)
+        assert d.release_beyond(MODEL_A, 1) == ["old"]
+        # Keep the incumbent live. The replacement either stays live with stale
+        # draw evidence, or reconnects under the same registration.
+        for _ in range(4):
+            clock.now += 30
+            d.heartbeat("old", old)
+            if not disconnect:
+                d.heartbeat("new", new)
+        await _lease(d, clock, 1, executor="new", document=new, protocols=protocols)
+        assert d.release_beyond(MODEL_A, 1) == []
+        await score_draw(new)
+        assert d.release_beyond(MODEL_A, 1) == ["old"]
+        d.heartbeat("new", new, {"loaded": False})
+        assert d.release_beyond(MODEL_A, 1) == []
 
     asyncio.run(go())
