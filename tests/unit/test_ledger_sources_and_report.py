@@ -367,6 +367,25 @@ def test_the_cli_builds_a_report_from_a_directory_without_network(tmp_path):
     assert json.loads(again.output)["pass"] == report["pass"]
 
 
+def test_report_keeps_unbudgeted_earned_work_after_the_reconciliation_window(tmp_path):
+    folder = tmp_path / "archives" / TASK
+    folder.mkdir(parents=True)
+    settled = cp.period_end(WORK) + 300
+    archive = folder / f"{WORK:010d}-{WORK + 1:010d}.json"
+    archive.write_text(json.dumps(_doc({"5A": 0.01}, settled_at=settled)))
+    os.utime(archive, (settled, settled))
+    out = tmp_path / "out"
+    result = CliRunner().invoke(ledger_app, [
+        "report", "--archives", str(folder.parent), "--prices", "none", "--rate", str(E),
+        "--no-pending", "--no-chain", "--history-days", "1", "--as-of", "2026-12-28T12:05:00", "--out", str(out)])
+    assert result.exit_code == 0, result.output
+    report = json.loads((out / "report-2026-12-28.json").read_text())
+    assert report["pass"]["obligations"] == 0
+    assert report["states"]["due"]["obligations"] == 1
+    row = json.loads((out / "obligations-2026-12-28.jsonl").read_text())
+    assert row["state"] == "due" and row["work_period"] == WORK
+
+
 def test_the_cli_refuses_bad_settings(tmp_path):
     for args in (["--rate", "lots"], ["--prices", "chain"], ["--pay-at", "25:00"], ["--order-budget", "x"]):
         result = CliRunner().invoke(ledger_app, ["report", "--archives", str(tmp_path), "--no-pending",

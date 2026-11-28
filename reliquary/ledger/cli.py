@@ -105,7 +105,7 @@ def report_command(
                                                                      "flagged for a manual decision"),
     order_budget: list[str] = typer.Option([], "--order-budget", help="TASK=ALPHA: a budget for a whole order "
                                                                       "(repeatable)"),
-    history_days: int = typer.Option(16, "--history-days", help="work days read back from the pass day"),
+    history_days: int = typer.Option(16, "--history-days", help="days of settled shares available for chain reconciliation"),
     chain: bool = typer.Option(True, "--chain/--no-chain", help="reconcile with the chain's miner incentive"),
     network: str = typer.Option("archive", "--network", help="the chain endpoint for historical reads"),
     netuid: int = typer.Option(81, "--netuid"),
@@ -176,13 +176,13 @@ async def collect_report(*, now: float, pay_day: date, terms, archives: str, pri
 
     first_work = cp.period_of(day_start(pay_day - timedelta(days=history_days)))
     source = sources.BucketArchives() if archives == "r2" else sources.DirectoryArchives(archives)
-    # Recent work, work settled recently (late parts of older work), and the whole history of any order
-    # with a budget: a budget bounds an order only over all of it.
-    refs = [ref for ref in await source.refs(work_from=first_work, full_tasks=budgets)
+    # This read-only ledger has no payment journal. Every earned obligation still belongs
+    # in its history, even after its pass; the chain comparison alone has a lookback.
+    refs = [ref for ref in await source.refs(work_from=0)
             if ref.settled_at is None or ref.settled_at <= now]
     used = {"archives": archives if archives == "r2" else "directory", "archives_read": len(refs),
-            "first_work_period": first_work, "history_days": history_days, "prices": prices,
-            "full_history_tasks": sorted(budgets)}
+            "first_work_period": 0, "history_days": history_days, "prices": prices,
+            "reconciliation_first_entry": first_work, "full_history_tasks": sorted({ref.task_id for ref in refs})}
 
     ceilings, pay_ceilings, floored = {}, {}, []
     pending_items, pricing = [], {}
@@ -235,7 +235,8 @@ async def collect_report(*, now: float, pay_day: date, terms, archives: str, pri
             used["chain"] = {"network": network, "netuid": netuid, **meta}
             lag = lag_epochs if lag_epochs is not None else (
                 meta["commit_reveal_period"] if meta["commit_reveal"] else 0)
-            reconciliation = reconcile(ledger.shares, epochs, start=start, end=end, lag_epochs=lag,
+            recent_shares = (row for row in ledger.shares if row[1] >= first_work)
+            reconciliation = reconcile(recent_shares, epochs, start=start, end=end, lag_epochs=lag,
                                        tolerance=tolerance, min_alpha=min_alpha, earliest_entry=first_work,
                                        exclude_hotkeys=[collector_hotkey] if collector_hotkey else [])
     finally:
